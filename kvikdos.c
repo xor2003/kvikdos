@@ -434,6 +434,26 @@ static char *find_prog_on_path(const char *prog_filename, const DirState *dir_st
         if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: found prog on drive=%c: %s\n", drive, fnbuf);
         *drive_out = drive;
         return fnbuf;  /* Found executable program file. */
+      } else {
+        char *s, *base = fnbuf;
+        strcpy(fnbuf2, fnbuf);
+        for (s = fnbuf2; *s; ++s) if (*s == '/') base = s + 1;
+        for (s = base; *s; ++s) if ((unsigned char)(*s - 'a') <= 'z' - 'a') *s &= ~32;
+        if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: trying prog case fallback upper: %s\n", fnbuf2);
+        if (stat(fnbuf2, &st) == 0 && S_ISREG(st.st_mode)) {
+          strcpy(fnbuf, fnbuf2);
+          *drive_out = drive;
+          return fnbuf;
+        }
+        strcpy(fnbuf2, fnbuf);
+        for (s = base = fnbuf2; *s; ++s) if (*s == '/') base = s + 1;
+        for (s = base; *s; ++s) if ((unsigned char)(*s - 'A') <= 'Z' - 'A') *s |= 32;
+        if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: trying prog case fallback lower: %s\n", fnbuf2);
+        if (stat(fnbuf2, &st) == 0 && S_ISREG(st.st_mode)) {
+          strcpy(fnbuf, fnbuf2);
+          *drive_out = drive;
+          return fnbuf;
+        }
       }
     }
    end_of_pp:
@@ -2269,9 +2289,18 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
 #endif
       while (*envp0) {
         const char *host_var = *envp0++;
+        const char *eq;
         if (!strchr(host_var, '=')) {
           if (DEBUG) fprintf(stderr, "debug: skipping malformed host env var without '=': %s\n", host_var);
           continue;
+        }
+        eq = strchr(host_var, '=');
+        if (eq && eq - host_var == 4 && strncmp(host_var, "PATH", 4) == 0) {
+          const char *v = eq + 1;
+          /* Don't import Unix PATH as DOS PATH. Keep DOS PATH auto-generated
+           * from executable directory unless user provided a DOS-style PATH.
+           */
+          if (strchr(v, '/')) continue;
         }
         if (strncmp(host_var, "PATH=", 5) == 0) do_set_dos_path = 0;
         /* No attempt is made to deduplicate environment variables by name.
@@ -3356,7 +3385,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                   is_args_ok = 1;
                 }
               }
-              if (!(env && is_dos_filename_high)) {
+              if (!((al == 3 && is_dos_filename_high) || (al == 0 && env && is_dos_filename_high))) {
                 fprintf(stderr, "fatal: bounds check failed (env_ok=%d args_ok=%d, fn_ok=%d) env when loading program=(%s) with args=(%s)\n",
                         env != NULL, is_args_ok, is_dos_filename_high,
                         dos_filename, safe_args);
@@ -3636,10 +3665,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned short*)&regs.rax = 0;  /* Not installed / no service. */
           } else if (*(unsigned short*)&regs.rax == 0x1687) {  /* DPMI. */
             /* Keep it as is, DPMI not installed. */
-#if 0  /* TLINK 5.1 tlink.exe loading dpmi16bi.ovl */
           } else if (*(unsigned short*)&regs.rax == 0xfb42) {
+            *(unsigned short*)&regs.rax = 0;  /* Not installed / no service. */
           } else if (*(unsigned short*)&regs.rax == 0xfb43) {
-#endif
+            *(unsigned short*)&regs.rax = 0;  /* Not installed / no service. */
           } else { fatal_uic:
             fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x\n", int_num, *(const unsigned short*)&regs.rax);
             goto fatal_int;
