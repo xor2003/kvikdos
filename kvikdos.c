@@ -4415,14 +4415,6 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fatal: DPMI not supported: %s\n", cmd_args.dpmi_prog);
     exit(1);
   }
-  if ((cmd_args.emu_params.diag_mask & 1U) && g_diag_file) {
-    fprintf(g_diag_file, "diag: mode=%s case-fallback=%s strict=%d extra-env=%u\n",
-            cmd_args.emu_params.diag_filename ? "file" : "stderr",
-            cmd_args.emu_params.case_fallback_mode == 0 ? "off" :
-            cmd_args.emu_params.case_fallback_mode == 1 ? "prog" : "all",
-            cmd_args.emu_params.strict_mode, cmd_args.extra_env_count);
-    fflush(g_diag_file);
-  }
   { int exit_code;
     const char *ext = get_linux_ext(cmd_args.prog_filename);
     EmuState emu;
