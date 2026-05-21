@@ -41,6 +41,17 @@
 #include <termios.h>
 #include <unistd.h>
 
+static char *xstrdup(const char *s) {
+  size_t n = strlen(s) + 1;
+  char *p = (char*)malloc(n);
+  if (!p) return NULL;
+  memcpy(p, s, n);
+  return p;
+}
+
+static unsigned g_case_fallback_mode = 2;  /* Best default: all. */
+static FILE *g_diag_file = NULL;
+
 #ifdef USE_MINI_KVM  /* For systems with a broken linux/kvm.h. */
 #  include "mini_kvm.h"
 #else
@@ -158,7 +169,7 @@ static char detect_prog_filename_type(const char *prog_filename) {
 /* A relatively small struct, no string buffers. */
 typedef struct DirState {
   char drive;  /* 'A', 'B', 'C', 'D', ... ('A' + DRIVE_COUNT - 1). */
-  char current_dir[DRIVE_COUNT][1];  /* Currently mostly unused. */ /*char current_dir[DRIVE_COUNT][128];*/  /* In DOS syntax. Ends with \, unless empty. If current_dir[2] is FOO\BAR\, then it corresponds to C:\FOO\BAR. */
+  char current_dir[DRIVE_COUNT][64];  /* In DOS syntax. Ends with \, unless empty. If current_dir[2] is FOO\BAR\, then it corresponds to C:\FOO\BAR. */
   const char *linux_mount_dir[DRIVE_COUNT];  /* Linux directory to which the specific drive has been mounted, with '/' suffix (or empty), or NULL. Owned externally. linux_mount_dir[2] == "/tmp/foo/" maps DOS path C:\MY\FILE.TXT to Linux path /tmp/foo/MY/FILE.TXT .  */
   char case_mode[DRIVE_COUNT];  /* CASE_MODE_... indicating how letters in DOS filename characters should be converted to Linux (uppercase or lowercase). CASE_MODE_UPPERCASE (0) is the default. We could also call it case_fold. */
   const char *dos_prog_abs;  /* DOS absolute pathname of the program being run. Externally owned, can be NULL. */
@@ -434,7 +445,7 @@ static char *find_prog_on_path(const char *prog_filename, const DirState *dir_st
         if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: found prog on drive=%c: %s\n", drive, fnbuf);
         *drive_out = drive;
         return fnbuf;  /* Found executable program file. */
-      } else {
+      } else if (g_case_fallback_mode != 0) {
         char *s, *base = fnbuf;
         strcpy(fnbuf2, fnbuf);
         for (s = fnbuf2; *s; ++s) if (*s == '/') base = s + 1;
@@ -476,6 +487,10 @@ typedef struct EmuParams {
   char is_hlt_ok;
   unsigned mem_mb;
   const char *hlt_dump_filename;
+  const char *diag_filename;
+  unsigned diag_mask;
+  unsigned case_fallback_mode;  /* 0=off 1=prog 2=all */
+  char strict_mode;  /* 0=permissive 1=strict */
 } EmuParams;
 
 typedef struct ParsedCmdArgs {
@@ -485,6 +500,8 @@ typedef struct ParsedCmdArgs {
   int tty_in_fd;
   const char* const *args;  /* NULL-terminated list of NUL-terminated strings. Overlaps the program main(...) argv. */
   const char* const *envp0;  /* NULL-terminated list of NUL-terminated strings. Overlaps the program main(...) argv. */
+  const char *extra_env[128];
+  unsigned extra_env_count;
   const char *dpmi_prog;
 } ParsedCmdArgs;
 
@@ -499,25 +516,44 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   const char *dos_path;
   char dos_prog_drive;
   char is_kvm_check;
+  const char *path_dos_flag = NULL;
+  const char *cwd_dos_flag = NULL;
 
   argv0 = argv[0];
   /* Ignoring instances of the --cmd flage, for pts-fast-dosbox compatibility. */
   for (; argv[1] && 0 == strcmp(argv[1], "--cmd"); ++argv) {}
   if (!argv0 || !argv[1] || 0 == strcmp(argv[1], "--help")) {
     fprintf(stderr, "%s%s%s [<flag> ...] <dos-executable-file> [<dos-arg> ...]\n%s"
-                    "Flags:\n"
-                    "--kvm-check: Just check that KVM works, run a fake true.com\n"
-                    "--env=<NAME>=<value>: Adds environment variable.\n"
-                    "--prog=<dos-pathname>: Sets DOS pathname of program.\n"
-                    "--mount=<drive><case><dirname>/: Makes Linux dir visible as <drive> for DOS program.\n"
-                    "    If <case> is :, then mount uppercase. If <case> is -, then mount lowercase.\n"
-                    "--mount=<drive>0: Makes sure that <drive>: is not visible in DOS.\n"
-                    "--drive=<drive>: Sets initial current drive for DOS program.\n"
-                    "--tty-in=<fd>: Selects Linux file descriptor for keyboard input.\n"
-                    "    -3: fake keys; -2: stdin buffered; -1: /dev/tty; 0: stdin etc.\n"
-                    "--mem-mb=<n>: Use n MiB of memory for DOS. Only 1 is supported.\n"
-                    "--hlt-ok: Allow the hlt instruction.\n"
-                    "--hlt-dump=<filename>: Write memory dump upon hlt instruction.\n",
+                    "General:\n"
+                    "  --kvm-check                Check KVM only (runs fake true.com)\n"
+                    "  --strict | --permissive    Interrupt/API handling policy (default: --permissive)\n"
+                    "\n"
+                    "DOS Runtime:\n"
+                    "  --toolchain=<name>         Preset env for msc4|msc5|msc6|masm5|bc2|bcpp1|bc5|ic86\n"
+                    "  --env=<NAME>=<value>       Add DOS environment variable\n"
+                    "  --env-file=<file>          Load DOS env vars (NAME=VALUE lines)\n"
+                    "  --path-dos=<pathlist>      Set DOS PATH directly (e.g. C:\\BIN;C:\\)\n"
+                    "  --prog=<dos-pathname>      Set DOS pathname of running program\n"
+                    "  --cwd-dos=<path>           Set initial DOS current directory (e.g. C:\\BIN)\n"
+                    "\n"
+                    "Mounts:\n"
+                    "  --mount=<drive><case><dirname>/   Mount Linux dir to DOS drive\n"
+                    "  --mount=<drive>0                  Hide DOS drive\n"
+                    "    <case> ':' uppercase, '-' lowercase\n"
+                    "  --drive=<drive>             Set initial DOS drive\n"
+                    "\n"
+                    "Compatibility:\n"
+                    "  --case-fallback=off|prog|all  Case-insensitive program lookup (default: all)\n"
+                    "\n"
+                    "Diagnostics:\n"
+                    "  --diag=compat|exec|int|fs|all|off   Runtime diagnostics (default: compat)\n"
+                    "  --diag-file=<file>                  Write diagnostics to file\n"
+                    "\n"
+                    "I/O and Memory:\n"
+                    "  --tty-in=<fd>               -3 fake, -2 buffered stdin, -1 /dev/tty, >=0 fd\n"
+                    "  --mem-mb=<n>                DOS memory in MiB (currently only 1)\n"
+                    "  --hlt-ok                    Allow hlt instruction\n"
+                    "  --hlt-dump=<filename>       Dump guest memory on hlt\n",
                     pre_msg, argv0, usage_extra, post_msg);
     exit(argv0 && argv[1] ? 0 : 1);
   }
@@ -541,10 +577,15 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
 
   envp = envp0 = ++argv;
   cmd_args.dpmi_prog = NULL;
+  cmd_args.extra_env_count = 0;
   cmd_args.tty_in_fd = -1;
   cmd_args.emu_params.mem_mb = 1;
   cmd_args.emu_params.is_hlt_ok = 0;
   cmd_args.emu_params.hlt_dump_filename = NULL;
+  cmd_args.emu_params.diag_filename = NULL;
+  cmd_args.emu_params.diag_mask = 1;  /* compat */
+  cmd_args.emu_params.case_fallback_mode = 2;  /* all */
+  cmd_args.emu_params.strict_mode = 0;  /* permissive */
   is_kvm_check = 0;
   is_drive_specified = 0;
   while (argv[0]) {
@@ -683,6 +724,127 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
       goto do_mem_mb;
     } else if (0 == strcmp(arg, "--kvm-check")) {
       is_kvm_check = 1;
+    } else if (0 == strcmp(arg, "--permissive")) {
+      cmd_args.emu_params.strict_mode = 0;
+    } else if (0 == strcmp(arg, "--strict")) {
+      cmd_args.emu_params.strict_mode = 1;
+    } else if (0 == strcmp(arg, "--path-dos")) {
+      if (!argv[0]) goto missing_argument;
+      path_dos_flag = *argv++;
+    } else if (0 == strncmp(arg, "--path-dos=", 11)) {
+      path_dos_flag = arg + 11;
+    } else if (0 == strcmp(arg, "--cwd-dos")) {
+      if (!argv[0]) goto missing_argument;
+      cwd_dos_flag = *argv++;
+    } else if (0 == strncmp(arg, "--cwd-dos=", 10)) {
+      cwd_dos_flag = arg + 10;
+    } else if (0 == strcmp(arg, "--env-file")) {
+      FILE *f;
+      char line[4096];
+      if (!argv[0]) goto missing_argument;
+      f = fopen(*argv++, "rb");
+      if (!f) {
+        perror("fatal: cannot open --env-file");
+        exit(1);
+      }
+      while (fgets(line, sizeof(line), f)) {
+        char *p = line, *eq, *e;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '\0' || *p == '\n' || *p == '\r' || *p == '#') continue;
+        for (e = p + strlen(p); e != p && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t'); --e) {}
+        *e = '\0';
+        eq = strchr(p, '=');
+        if (!eq || eq == p) continue;
+        if (cmd_args.extra_env_count >= sizeof(cmd_args.extra_env) / sizeof(cmd_args.extra_env[0])) {
+          fprintf(stderr, "fatal: too many extra env vars\n");
+          exit(1);
+        }
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup(p);
+      }
+      fclose(f);
+    } else if (0 == strncmp(arg, "--env-file=", 11)) {
+      FILE *f = fopen(arg + 11, "rb");
+      char line[4096];
+      if (!f) {
+        perror("fatal: cannot open --env-file");
+        exit(1);
+      }
+      while (fgets(line, sizeof(line), f)) {
+        char *p = line, *eq, *e;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '\0' || *p == '\n' || *p == '\r' || *p == '#') continue;
+        for (e = p + strlen(p); e != p && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t'); --e) {}
+        *e = '\0';
+        eq = strchr(p, '=');
+        if (!eq || eq == p) continue;
+        if (cmd_args.extra_env_count >= sizeof(cmd_args.extra_env) / sizeof(cmd_args.extra_env[0])) {
+          fprintf(stderr, "fatal: too many extra env vars\n");
+          exit(1);
+        }
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup(p);
+      }
+      fclose(f);
+    } else if (0 == strcmp(arg, "--diag")) {
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+      if (strcmp(arg, "off") == 0) cmd_args.emu_params.diag_mask = 0;
+      else if (strcmp(arg, "compat") == 0) cmd_args.emu_params.diag_mask = 1;
+      else if (strcmp(arg, "exec") == 0) cmd_args.emu_params.diag_mask = 2;
+      else if (strcmp(arg, "int") == 0) cmd_args.emu_params.diag_mask = 4;
+      else if (strcmp(arg, "fs") == 0) cmd_args.emu_params.diag_mask = 8;
+      else if (strcmp(arg, "all") == 0) cmd_args.emu_params.diag_mask = ~0U;
+      else { fprintf(stderr, "fatal: bad --diag value: %s\n", arg); exit(1); }
+    } else if (0 == strncmp(arg, "--diag=", 7)) {
+      arg += 7;
+      if (strcmp(arg, "off") == 0) cmd_args.emu_params.diag_mask = 0;
+      else if (strcmp(arg, "compat") == 0) cmd_args.emu_params.diag_mask = 1;
+      else if (strcmp(arg, "exec") == 0) cmd_args.emu_params.diag_mask = 2;
+      else if (strcmp(arg, "int") == 0) cmd_args.emu_params.diag_mask = 4;
+      else if (strcmp(arg, "fs") == 0) cmd_args.emu_params.diag_mask = 8;
+      else if (strcmp(arg, "all") == 0) cmd_args.emu_params.diag_mask = ~0U;
+      else { fprintf(stderr, "fatal: bad --diag value: %s\n", arg); exit(1); }
+    } else if (0 == strcmp(arg, "--diag-file")) {
+      if (!argv[0]) goto missing_argument;
+      cmd_args.emu_params.diag_filename = *argv++;
+    } else if (0 == strncmp(arg, "--diag-file=", 12)) {
+      cmd_args.emu_params.diag_filename = arg + 12;
+    } else if (0 == strcmp(arg, "--case-fallback")) {
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+      if (strcmp(arg, "off") == 0) cmd_args.emu_params.case_fallback_mode = 0;
+      else if (strcmp(arg, "prog") == 0) cmd_args.emu_params.case_fallback_mode = 1;
+      else if (strcmp(arg, "all") == 0) cmd_args.emu_params.case_fallback_mode = 2;
+      else { fprintf(stderr, "fatal: bad --case-fallback value: %s\n", arg); exit(1); }
+    } else if (0 == strncmp(arg, "--case-fallback=", 16)) {
+      arg += 16;
+      if (strcmp(arg, "off") == 0) cmd_args.emu_params.case_fallback_mode = 0;
+      else if (strcmp(arg, "prog") == 0) cmd_args.emu_params.case_fallback_mode = 1;
+      else if (strcmp(arg, "all") == 0) cmd_args.emu_params.case_fallback_mode = 2;
+      else { fprintf(stderr, "fatal: bad --case-fallback value: %s\n", arg); exit(1); }
+    } else if (0 == strcmp(arg, "--toolchain") || 0 == strncmp(arg, "--toolchain=", 12)) {
+      const char *tc;
+      if (arg[11] == '\0') {
+        if (!argv[0]) goto missing_argument;
+        tc = *argv++;
+      } else {
+        tc = arg + 12;
+      }
+      if (cmd_args.extra_env_count + 4 >= sizeof(cmd_args.extra_env) / sizeof(cmd_args.extra_env[0])) {
+        fprintf(stderr, "fatal: too many extra env vars\n");
+        exit(1);
+      }
+      if (strcmp(tc, "msc6") == 0 || strcmp(tc, "bcpp1") == 0 || strcmp(tc, "bc5") == 0) {
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup("PATH=C:\\BIN;C:\\");
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup("LIB=C:\\LIB");
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup("INCLUDE=C:\\INCLUDE");
+      } else if (strcmp(tc, "msc4") == 0 || strcmp(tc, "msc5") == 0 || strcmp(tc, "masm5") == 0 || strcmp(tc, "bc2") == 0 || strcmp(tc, "ic86") == 0) {
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup("PATH=C:\\");
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup("LIB=LIB");
+        cmd_args.extra_env[cmd_args.extra_env_count++] = xstrdup("INCLUDE=INCLUDE");
+      } else {
+        fprintf(stderr, "fatal: unknown --toolchain preset: %s\n", tc);
+        exit(1);
+      }
     } else {
       fprintf(stderr, "fatal: unknown command-line flag: %s\n", arg);
       exit(1);
@@ -706,6 +868,19 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   fprintf(stderr, "GLF (%s)\n", get_linux_filename(".\\aaa\\.."));
   fprintf(stderr, "GLF (%s)\n", get_linux_filename("C:\\foo\\.\\\\\\.\\bar\\.\\..\\.\\bazzzz\\.."));
 #endif
+  if (path_dos_flag) {
+    char *pd;
+    size_t n = strlen(path_dos_flag);
+    pd = (char*)malloc(n + 6);
+    if (!pd) { perror("fatal: malloc"); exit(252); }
+    memcpy(pd, "PATH=", 5);
+    memcpy(pd + 5, path_dos_flag, n + 1);
+    if (cmd_args.extra_env_count >= sizeof(cmd_args.extra_env) / sizeof(cmd_args.extra_env[0])) {
+      fprintf(stderr, "fatal: too many extra env vars\n");
+      exit(1);
+    }
+    cmd_args.extra_env[cmd_args.extra_env_count++] = pd;
+  }
   *envp = NULL;
   /* Remaining arguments in argv will be passed to the DOS program in PSP:0x80. */
   dos_path = getenv_prefix("PATH=", (char const**)envp0, (char const**)envp);
@@ -832,6 +1007,29 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     }
   }
 
+  if (cwd_dos_flag && cwd_dos_flag[0]) {
+    char drive = cmd_args.dir_state.drive;
+    const char *p = cwd_dos_flag;
+    char tmp[DOS_PATH_SIZE];
+    char *q = tmp;
+    if ((p[0] & ~32) - 'A' + 0U < DRIVE_COUNT && p[1] == ':') {
+      drive = p[0] & ~32;
+      p += 2;
+      if (*p == '\\' || *p == '/') ++p;
+      cmd_args.dir_state.drive = drive;
+    } else if (*p == '\\' || *p == '/') {
+      ++p;
+    }
+    while (*p && q + 2 < tmp + sizeof(tmp)) {
+      char c = *p++;
+      if (c == '/') c = '\\';
+      *q++ = (c - 'a' + 0U <= 'z' - 'a' + 0U) ? (c & ~32) : c;
+    }
+    if (q != tmp && q[-1] != '\\') *q++ = '\\';
+    *q = '\0';
+    strncpy(cmd_args.dir_state.current_dir[drive - 'A'], tmp, sizeof(cmd_args.dir_state.current_dir[drive - 'A']) - 1);
+    cmd_args.dir_state.current_dir[drive - 'A'][sizeof(cmd_args.dir_state.current_dir[drive - 'A']) - 1] = '\0';
+  }
   cmd_args.args = (const char* const*)argv;
   cmd_args.envp0 = (const char* const*)envp0;
   *cmd_args_out = cmd_args;
@@ -1901,12 +2099,12 @@ static int run_dos_child_subprocess(const char *dos_filename, const char *dos_ar
     if (!mount) continue;
     if (*mount == '\0') snprintf(mount_arg, sizeof(mount_arg), "--mount=%c%c", 'A' + i, case_c);
     else snprintf(mount_arg, sizeof(mount_arg), "--mount=%c%c%s", 'A' + i, case_c, mount);
-    owned_args[owned_count] = strdup(mount_arg);
+    owned_args[owned_count] = xstrdup(mount_arg);
     if (!owned_args[owned_count]) goto alloc_fail;
     argv_child[argc++] = owned_args[owned_count++];
   }
   snprintf(drive_arg, sizeof(drive_arg), "--drive=%c:", dir_state->drive);
-  owned_args[owned_count] = strdup(drive_arg);
+  owned_args[owned_count] = xstrdup(drive_arg);
   if (!owned_args[owned_count]) goto alloc_fail;
   argv_child[argc++] = owned_args[owned_count++];
 
@@ -2167,7 +2365,7 @@ static char exec_fnbuf[LINUX_PATH_SIZE];  /* Used temporarily by run_dos_prog. *
  * Returns the DOS exit code reported by the program.
  * As a side effect, sets dir_state->dos_prog_abs = NULL, and may change dir_state and tty_state.
  */
-static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char *args_str, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0) {
+static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char *args_str, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0, const char* const *extra_env, unsigned extra_env_count) {
   int img_fd;
   struct kvm_fds kvm_fds;
   void *mem;
@@ -2309,6 +2507,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
          * The user should supply unique names.
          */
         env = add_env(env, env_end, host_var, 1);
+      }
+      { unsigned ei;
+        for (ei = 0; ei < extra_env_count; ++ei) {
+          if (extra_env[ei]) env = add_env(env, env_end, extra_env[ei], 1);
+        }
       }
       if (do_set_dos_path) {  /* Set %PATH% to the directory of dos_prog_abs. Set once. */
         size_t size;
@@ -3695,6 +3898,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else if (*(unsigned short*)&regs.rax == 0xfb43) {
             *(unsigned short*)&regs.rax = 0;  /* Not installed / no service. */
           } else { fatal_uic:
+            if (!emu_params->strict_mode) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
+              goto done_int_call;
+            }
             fprintf(stderr, "fatal: unsupported int 0x%02x ax:%04x\n", int_num, *(const unsigned short*)&regs.rax);
             goto fatal_int;
           }
@@ -3728,6 +3936,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           fprintf(stderr, "fatal: unsupported int 0x%02x ah:%02x cs:%04x ip:%04x\n", int_num, ah, int_cs, int_ip);
           goto fatal;
         }
+       done_int_call:
         /* Return from the interrupt. */
         SET_SREG(cs, int_cs);
         regs.rip = int_ip;
@@ -4129,7 +4338,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
               fprintf(stderr, "Error getting absolute filelename - %s\r\n", p_line);
               exit_code = 1;
             } else {
-              exit_code = run_dos_prog(emu, prog_filename, args_buf, NULL, dir_state, tty_state, emu_params, envp0);
+              exit_code = run_dos_prog(emu, prog_filename, args_buf, NULL, dir_state, tty_state, emu_params, envp0, NULL, 0);
             }
           }
           dir_state->dos_prog_abs = NULL;  /* For security. */
@@ -4159,6 +4368,16 @@ int main(int argc, char **argv) {
       argv, &cmd_args,
       "kvikdos: run DOS programs headless (a very fast DOS emulator)\nUsage: ", "",
       "This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.\n");
+  g_case_fallback_mode = cmd_args.emu_params.case_fallback_mode;
+  if (cmd_args.emu_params.diag_filename) {
+    g_diag_file = fopen(cmd_args.emu_params.diag_filename, "ab");
+    if (!g_diag_file) {
+      perror("fatal: cannot open --diag-file");
+      exit(1);
+    }
+  } else {
+    g_diag_file = stderr;
+  }
   if (0) {  /* Just dump the parsed command-line. */
     /* cmd_args.dir_state.linux_prog is still NULL, use cmd_args.prog_filename instead. */
     printf("linux prog: %s\n", cmd_args.prog_filename);
@@ -4196,6 +4415,14 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fatal: DPMI not supported: %s\n", cmd_args.dpmi_prog);
     exit(1);
   }
+  if ((cmd_args.emu_params.diag_mask & 1U) && g_diag_file) {
+    fprintf(g_diag_file, "diag: mode=%s case-fallback=%s strict=%d extra-env=%u\n",
+            cmd_args.emu_params.diag_filename ? "file" : "stderr",
+            cmd_args.emu_params.case_fallback_mode == 0 ? "off" :
+            cmd_args.emu_params.case_fallback_mode == 1 ? "prog" : "all",
+            cmd_args.emu_params.strict_mode, cmd_args.extra_env_count);
+    fflush(g_diag_file);
+  }
   { int exit_code;
     const char *ext = get_linux_ext(cmd_args.prog_filename);
     EmuState emu;
@@ -4205,7 +4432,7 @@ int main(int argc, char **argv) {
     if (is_same_ascii_nocase(ext, "bat", 4)) {
       exit_code = run_dos_batch(&emu, cmd_args.prog_filename, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0);
     } else {
-      exit_code = run_dos_prog(&emu, cmd_args.prog_filename, NULL, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0);
+      exit_code = run_dos_prog(&emu, cmd_args.prog_filename, NULL, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0, (const char* const*)cmd_args.extra_env, cmd_args.extra_env_count);
     }
     if (DEBUG) fprintf(stderr, "debug: DOS program exited with code: 0x%02x", exit_code);
     return exit_code;
