@@ -217,6 +217,27 @@ About uppercase and lowercase filenames:
 
 Software compatibility, i.e. DOS programs known to work in kvikdos:
 
+Quick start for DOS compilers and assemblers:
+
+* For practical, copy-paste command lines, see TOOLCHAIN.md in this
+  repository.
+
+* Recommended layout rules:
+  * Use 8.3 filenames for source/object/output files (e.g. HELLO.C).
+  * If a toolchain has BIN/LIB/INCLUDE directories, mount the toolchain
+    root as C: and run the executable from C:\BIN\...
+  * Set DOS environment explicitly with --env=LIB=... and
+    --env=INCLUDE=...
+
+* Recently validated under kvikdos (compile, link, run of a tiny HELLO):
+  * Microsoft C 4.0
+  * Microsoft C 5.1
+  * Microsoft C 6ax (from toolchain root, C:\BIN\CL.EXE, LIB=C:\LIB)
+  * Intel iC-86 Compiler 4.5
+  * Borland Turbo C 2.0
+  * Borland Turbo C++ 1.01 (from toolchain root, C:\BIN\TCC.EXE, LIB=C:\LIB)
+  * Microsoft MASM 5.0 (MASM direct, LINK via prompt answers or stdin)
+
 * Turbo Pascal 7.0 compiler tpc.exe. It produces .exe program files
   directly.
 
