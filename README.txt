@@ -146,6 +146,69 @@ How to install kvikdos:
 
   If it displays the dot and the `Hello, World!' message, then it's OK.
 
+Command-line options (structured):
+
+General:
+
+* `--kvm-check' checks KVM only.
+* `--strict' enables strict unsupported-interrupt behavior.
+* `--permissive' enables compatibility fallback behavior (default).
+
+DOS runtime:
+
+* `--toolchain=<name>' applies toolchain presets:
+  `msc4', `msc5', `msc6', `masm5', `bc2', `bcpp1', `bc5', `ic86'.
+* `--env=<NAME>=<value>' adds one DOS environment variable.
+* `--env-file=<file>' loads DOS environment variables from file
+  (`NAME=VALUE' lines).
+* `--path-dos=<pathlist>' sets DOS PATH explicitly.
+* `--prog=<dos-pathname>' sets DOS pathname of the running program.
+* `--cwd-dos=<path>' sets initial DOS current directory.
+
+Mounts:
+
+* `--mount=<drive><case><dirname>/' mounts Linux directory to DOS drive.
+* `--mount=<drive>0' hides DOS drive.
+* `--drive=<drive>' sets initial DOS drive.
+
+Compatibility:
+
+* `--case-fallback=off|prog|all' controls case-insensitive executable
+  lookup fallback. Default: `all'.
+
+Diagnostics:
+
+* `--diag=compat|exec|int|fs|all|off' controls runtime diagnostics.
+  Default: `compat'.
+* `--diag-file=<file>' writes diagnostics to a file.
+
+I/O and memory:
+
+* `--tty-in=<fd>' chooses input source (`-3', `-2', `-1', `>=0').
+* `--mem-mb=<n>' DOS memory size in MiB (currently only `1').
+* `--hlt-ok' and `--hlt-dump=<file>' are low-level debug options.
+
+Best defaults:
+
+* `--permissive'
+* `--case-fallback=all'
+* `--diag=compat'
+* no toolchain preset unless requested
+
+Examples:
+
+* Microsoft C 5.1:
+
+    $ ./kvikdos --toolchain=msc5 /home/xor/inertia_player/dos_compilers/Microsoft\ C\ v5/CL.EXE HELLO.C
+
+* Borland C 2 with explicit DOS PATH and cwd:
+
+    $ ./kvikdos --path-dos=C:\\ --cwd-dos=C:\\ /home/xor/inertia_player/dos_compilers/Borland\ Turbo\ C\ v2/TCC.EXE HELLO.C
+
+* Diagnostics to file:
+
+    $ ./kvikdos --diag=all --diag-file=kvikdos.diag /home/xor/inertia_player/masm/BIN/LINK.EXE
+
 About making Linux files available for DOS programs:
 
 * kvikdos emulates DOS drives A: .. F: by exposing directories on the Linux
