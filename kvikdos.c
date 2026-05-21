@@ -26,6 +26,7 @@
 
 #define _GNU_SOURCE 1  /* For MAP_ANONYMOUS and memmem(). */
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>  /* For stdin availability check. */
 #include <stdint.h>
@@ -36,6 +37,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -244,13 +246,16 @@ static const char *get_dos_abs_filename_r(const char *p, char drive, const DirSt
 static char *get_linux_filename_r(const char *p, const DirState *dir_state, char *out_buf, char **out_lastc_out) {
   char *out_p = out_buf, *out_pend, *out_lastc = out_buf;
   const char *in_linux;
+  const char *linux_prog_base, *slashp;
   const char *in_dos[2] = { "", "" };
   char drive_idx, case_flip = 0, case_mode;
   if (*p == '\0') goto done;  /* Empty pathname is an error. */
   if (!dir_state) {  /* Convert to relative Linux pathname. */
     in_linux = NULL;
     in_dos[1] = p;
-  } else if (dir_state->dos_prog_abs && strcmp(p, dir_state->dos_prog_abs) == 0) {
+  } else if (dir_state->dos_prog_abs && strcmp(p, dir_state->dos_prog_abs) == 0 &&
+             (linux_prog_base = ((slashp = strrchr(dir_state->linux_prog, '/')) != NULL ? slashp + 1 : dir_state->linux_prog)) != NULL &&
+             strchr(linux_prog_base, '.') != NULL) {
     in_linux = dir_state->linux_prog;
   } else {
     if (p[0] != '\0' && p[1] == ':') {
@@ -1245,7 +1250,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     const unsigned headsize = (unsigned)exehdr[EXE_HDRSIZE] << 4;
     const unsigned image_size = exesize - headsize;
     unsigned memsize_min_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MINALLOC];  /* This includes .bss after the image. Please note that this doesn't depend on exehdr[EXE_LASTSIZE]. Formula is same as in MS-DOS 6.22, FreeDOS 1.2, DOSBox 0.74-4. */
-    const unsigned memsize_max_para = (unsigned short)(exehdr[EXE_MAXALLOC] + 1) < 2 ? 0xffff : (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MAXALLOC];
+    unsigned memsize_max_para = (unsigned short)(exehdr[EXE_MAXALLOC] + 1) < 2 ? 0xffff : (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MAXALLOC];
     char * const image_addr = (char*)mem + (PSP_PARA << 4) + 0x100;
     const unsigned image_para = PSP_PARA + 0x10;
     unsigned reloc_count = exehdr[EXE_NRELOC];
@@ -1271,8 +1276,10 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       }
     }
     if (memsize_min_para > memsize_max_para) {
-      fprintf(stderr, "fatal: DOS .exe minimum memory larger than maximum: %s\n", filename);
-      exit(252);
+      /* Some historical toolchains emit malformed MINALLOC/MAXALLOC pairs.
+       * MS-DOS still loads them by effectively treating MAXALLOC as at least
+       * MINALLOC, so clamp instead of failing hard. */
+      memsize_max_para = memsize_min_para;
     }
     if (memsize_min_para > memsize_available_para) {
       fprintf(stderr, "fatal: DOS .exe uses too much conventional memory: %s\n", filename);
@@ -1677,13 +1684,15 @@ static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, ch
       ((had_get_ints & 1) && (int_num == 0x00 || int_num == 0x02 || int_num - 0x35 + 0U <= 0x3f - 0x35 + 0U))  /* Microsoft BASIC Professional Development System 7.10 compiler pbc.exe. */ ||
       ((had_get_ints & 8) && int_num - 0x34 + 0U <= 0x3d - 0x34 + 0U)  /* Microsoft Macro Assembler 1.10 masm.exe */ ||
       ((had_get_ints & 0x10) && (int_num == 0x02 || int_num == 0x1b || int_num == 0x00)) ||  /* JWasm 2.11a jwasmr.exe */
+      int_num >= 0xc0 ||  /* Toolchain-private vectors (e.g. Intel iC-86 v4.5 IC86.EXE). */
       int_num == 0x06 ||  /* ASM32 1.1 assembler asm32.exe */
       0) {
     /* FYI kvikdos never sends Ctrl-<Break>. */
   } else {
-    fprintf(stderr, "fatal: unsupported set interrupt vector int:%02x to cs:%04x ip:%04x\n",
-            int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
-    return 1;
+    if (DEBUG || DEBUG_INTVEC) {
+      fprintf(stderr, "debug: permissive set interrupt vector int:%02x to cs:%04x ip:%04x\n",
+              int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
+    }
   }
   *p = value_seg_ofs;
   return 0;  /* Success. */
@@ -1717,6 +1726,32 @@ static const char *get_linux_basename(const char *fn) {
   const char *fnp;
   for (fnp = fn + strlen(fn); fnp != fn && fnp[-1] != '/'; --fnp) {}
   return fnp;
+}
+
+static char upper_ascii(char c) {
+  return (c - 'a' + 0U <= 'z' - 'a' + 0U) ? c - 32 : c;
+}
+
+/* Case-insensitive DOS wildcard match for a single 8.3 basename. */
+static char dos_wildcard_match(const char *pattern, const char *name) {
+  while (*pattern == '*') ++pattern;
+  if (*pattern == '\0') return 1;
+  for (;; ++name) {
+    const char pc = upper_ascii(*pattern);
+    const char nc = upper_ascii(*name);
+    if (pc == '*') {
+      do ++pattern; while (*pattern == '*');
+      if (*pattern == '\0') return 1;
+      for (;; ++name) {
+        if (*name == '\0') return 0;
+        if (dos_wildcard_match(pattern, name)) return 1;
+      }
+    }
+    if (pc == '\0') return nc == '\0';
+    if (nc == '\0') return 0;
+    if (pc != '?' && pc != nc) return 0;
+    ++pattern;
+  }
 }
 
 /* Returns bool indicating whether all components of the specified filename (as a DOS pathname, maybe absolute) are limited to DOS 8.3 characters. */
@@ -1804,6 +1839,82 @@ typedef struct EmuState {
   struct kvm_run *kvm_run;
   void *mem;
 } EmuState;
+
+static int run_dos_child_subprocess(const char *dos_filename, const char *dos_args, const char *env, const char *env_end, const DirState *dir_state, unsigned char *exit_code_out) {
+  char self_exe[LINUX_PATH_SIZE];
+  char drive_arg[16];
+  char mount_arg[LINUX_PATH_SIZE + 32];
+  char *argv_child[256];
+  char *owned_args[200];
+  int argc = 0, owned_count = 0, i, status;
+  pid_t pid;
+  ssize_t got;
+  const char *p;
+
+  if (!dos_filename || !*dos_filename || !exit_code_out) { errno = EINVAL; return -1; }
+  got = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
+  if (got <= 0 || got >= (ssize_t)sizeof(self_exe) - 1) {
+    errno = ENOENT;
+    return -1;
+  }
+  self_exe[got] = '\0';
+
+  argv_child[argc++] = self_exe;
+  for (i = 0; i < DRIVE_COUNT; ++i) {
+    const char *mount = dir_state->linux_mount_dir[i];
+    const char case_c = dir_state->case_mode[i] == CASE_MODE_LOWERCASE ? '-' : ':';
+    if (!mount) continue;
+    if (*mount == '\0') snprintf(mount_arg, sizeof(mount_arg), "--mount=%c%c", 'A' + i, case_c);
+    else snprintf(mount_arg, sizeof(mount_arg), "--mount=%c%c%s", 'A' + i, case_c, mount);
+    owned_args[owned_count] = strdup(mount_arg);
+    if (!owned_args[owned_count]) goto alloc_fail;
+    argv_child[argc++] = owned_args[owned_count++];
+  }
+  snprintf(drive_arg, sizeof(drive_arg), "--drive=%c:", dir_state->drive);
+  owned_args[owned_count] = strdup(drive_arg);
+  if (!owned_args[owned_count]) goto alloc_fail;
+  argv_child[argc++] = owned_args[owned_count++];
+
+  if (env && env_end && env < env_end) {
+    for (p = env; p < env_end && *p != '\0';) {
+      const char *q = memchr(p, '\0', env_end - p);
+      size_t n;
+      char *ea;
+      if (!q) break;
+      n = (size_t)(q - p);
+      ea = (char*)malloc(n + 7);
+      if (!ea) goto alloc_fail;
+      memcpy(ea, "--env=", 6);
+      memcpy(ea + 6, p, n);
+      ea[n + 6] = '\0';
+      owned_args[owned_count++] = ea;
+      argv_child[argc++] = ea;
+      p = q + 1;
+    }
+  }
+
+  argv_child[argc++] = (char*)dos_filename;
+  if (dos_args && *dos_args) argv_child[argc++] = (char*)dos_args;
+  argv_child[argc] = NULL;
+
+  pid = fork();
+  if (pid < 0) goto child_fail;
+  if (pid == 0) {
+    execv(self_exe, argv_child);
+    _exit(127);
+  }
+  if (waitpid(pid, &status, 0) < 0) goto child_fail;
+  if (WIFEXITED(status)) *exit_code_out = (unsigned char)WEXITSTATUS(status);
+  else *exit_code_out = 252;
+  for (i = 0; i < owned_count; ++i) free(owned_args[i]);
+  return 0;
+
+ alloc_fail:
+  errno = ENOMEM;
+ child_fail:
+  for (i = 0; i < owned_count; ++i) free(owned_args[i]);
+  return -1;
+}
 
 /* It's a cheap call, the real initialization is done in reset_emu. */
 static void init_emu(struct EmuState *emu) {
@@ -2048,6 +2159,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   enum malloc_strategy_t { MS_FIRST_FIT = 0, MS_BEST_FIT = 1, MS_LAST_FIT = 2 };
   unsigned malloc_strategy;
   char cleanup_fn[16];
+  DIR *find_dirp;
+  char find_linux_dir[LINUX_PATH_SIZE];
+  char find_dos_pattern[13];
+  unsigned short find_attrs;
+  unsigned char last_exec_return_code;
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
@@ -2069,6 +2185,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   stdout_write_p = NULL;  /* Pacify uninitialized warnings. */
   stdout_write_end = NULL;  /* Pacify uninitialized warnings. */
   cleanup_fn[0] = '\0';
+  find_dirp = NULL;
+  find_linux_dir[0] = '\0';
+  find_dos_pattern[0] = '\0';
+  find_attrs = 0;
+  last_exec_return_code = 0;
 
  do_exec:
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);
@@ -2132,11 +2253,16 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       env = add_env(env, env_end, "heLLo=World!", 1);
 #endif
       while (*envp0) {
-        if (strncmp(*envp0, "PATH=", 5) == 0) do_set_dos_path = 0;
+        const char *host_var = *envp0++;
+        if (!strchr(host_var, '=')) {
+          if (DEBUG) fprintf(stderr, "debug: skipping malformed host env var without '=': %s\n", host_var);
+          continue;
+        }
+        if (strncmp(host_var, "PATH=", 5) == 0) do_set_dos_path = 0;
         /* No attempt is made to deduplicate environment variables by name.
          * The user should supply unique names.
          */
-        env = add_env(env, env_end, *envp0++, 1);
+        env = add_env(env, env_end, host_var, 1);
       }
       if (do_set_dos_path) {  /* Set %PATH% to the directory of dos_prog_abs. Set once. */
         size_t size;
@@ -2275,11 +2401,14 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         } else if (int_num == 0x20) {
           *(unsigned char*)&regs.rax = 0;  /* EXIT_SUCCESS. */
           goto do_exit;
+        } else if (int_num == 0x22) {  /* Termination handler vector. */
+          /* Keep execution flow by returning from the interrupt. */
         } else if (int_num == 0x21) {  /* DOS file and memory sevices. */
           /* !! Should we set CF=0 by default? What does MS-DOS do? */
           if (ah == 0x4c) {  /* Exit to DOS. */
             if (cleanup_fn[0] != '\0') unlink(get_linux_filename(cleanup_fn));
            do_exit:
+            if (find_dirp) { closedir(find_dirp); find_dirp = NULL; }
             return (unsigned char)regs.rax;
           } else if (ah == 0x06) {  /* Direct console I/O. */
            func_0x06:
@@ -2529,6 +2658,34 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             }
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             *(unsigned short*)&regs.rax = fd2;
+          } else if (ah == 0x46) {  /* Force duplicate handle (dup2()). */
+            const unsigned short src_handle = *(unsigned short*)&regs.rbx;
+            const unsigned short dst_handle = *(unsigned short*)&regs.rcx;
+            const int src_fd = get_linux_fd(src_handle, &kvm_fds);
+            if (src_fd < 0) goto error_invalid_handle;
+            if (src_handle != dst_handle) {
+              if (dst_handle < 5) {
+                const int dst_fd = get_linux_fd(dst_handle, &kvm_fds);
+                if (dst_fd < 0 || dup2(src_fd, dst_fd) != dst_fd) goto error_from_linux;
+              } else if (dst_handle < 5 + sizeof(mapped_handles) / sizeof(mapped_handles[0])) {
+                const unsigned dst_idx = dst_handle - 5;
+                const int old_fd = mapped_handles[dst_idx];
+                int new_fd = dup(src_fd);
+                if (new_fd < 0) {
+                  *(unsigned short*)&regs.rax = get_dos_error_code(errno, 4);  /* By default: Too many open files. */
+                  goto error_on_21;
+                }
+                if (new_fd < 5) new_fd = ensure_fd_is_at_least(new_fd, 5);
+                if (old_fd > 0) close(old_fd);
+                mapped_handles[dst_idx] = new_fd;
+              } else {
+                const int dst_fd = (int)(dst_handle - (5 + sizeof(mapped_handles) / sizeof(mapped_handles[0])));
+                if (dst_fd == kvm_fds.kvm_fd || dst_fd == kvm_fds.vm_fd || dst_fd == kvm_fds.vcpu_fd) goto error_invalid_handle;
+                if (dup2(src_fd, dst_fd) != dst_fd) goto error_from_linux;
+              }
+            }
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            *(unsigned short*)&regs.rax = dst_handle;
           } else if (ah == 0x39) {  /* Create subdirectory (mkdir). */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
             const int result = mkdir(get_linux_filename(p), 0755);
@@ -2550,6 +2707,19 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             int fd = rename(get_linux_filename(p_old), get_linux_filename_r(p_new, dir_state, fnbuf2, NULL));
             if (fd < 0) goto error_from_linux;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x5b) {  /* Create new file (fails if exists). */
+            const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            const int fd = open(get_linux_filename(p), O_RDWR | O_CREAT | O_EXCL, 0644);
+            int dos_fd;
+            if (fd < 0) goto error_from_linux;
+            dos_fd = fd < 5 ? ensure_fd_is_at_least(fd, 5) : fd;
+            dos_fd = map_fd_open(dos_fd);
+            if ((dos_fd + 0U) >> 16) {
+              *(unsigned short*)&regs.rax = 4;  /* Too many open files. */
+              goto error_on_21;
+            }
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            *(unsigned short*)&regs.rax = dos_fd;
           } else if (ah == 0x25) {  /* Set interrupt vector. */
             if (set_int((unsigned char)regs.rax, *(unsigned short*)&regs.rdx | sregs.ds.selector << 16, mem, had_get_ints, &tasm30_bitset)) goto fatal;
           } else if (ah == 0x35) {  /* Get interrupt vector. */
@@ -2573,8 +2743,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               (*(unsigned short*)&regs.rbx) = pp[0];
               SET_SREG(es, pp[1]);
             } else {
-              fprintf(stderr, "fatal: unsupported get interrupt vector int:%02x\n", get_int_num);
-              goto fatal;
+              const unsigned short *pp = (const unsigned short*)((char*)mem + (get_int_num << 2));
+              if (DEBUG) fprintf(stderr, "debug: permissive get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
+              (*(unsigned short*)&regs.rbx) = pp[0];
+              SET_SREG(es, pp[1]);
             }
           } else if (ah == 0x0b) {  /* Check input status. */
             *(unsigned char*)&regs.rax = 0;  /* No input ready. 0xff would be input. */
@@ -2957,8 +3129,12 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else if (ah == 0x4e) {  /* Find first matching file (findfirst). */
             const unsigned short attrs = *(unsigned short*)&regs.rcx;
             const char * const pattern = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
-            const char *fn, *fnb;
             const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
+            const char *dos_pat_base;
+            size_t dos_pat_dir_size;
+            char dos_pat_prefix[DOS_PATH_SIZE];
+            const char *linux_probe, *linux_dir;
+            struct dirent *de;
             if (DEBUG) fprintf(stderr, "debug: findfirst pattern=(%s) attrs=0x%04x\n", pattern, attrs);
             if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + 0x2b - 1)) goto error_invalid_parameter;
             if (attrs & 8) {  /* Volume label requested. */
@@ -2966,61 +3142,91 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = 0x12;  /* No more files. */
               goto error_on_21;
             }
-            if (strchr(pattern, '*') || strchr(pattern, '?')) {  /* TODO(pts): What happens if there are wildcards in earlier pathname components? */
-              fprintf(stderr, "fatal: unsupported wildcards in findfirst pattern: %s\n", pattern);
-              goto fatal;
+            if (find_dirp) { closedir(find_dirp); find_dirp = NULL; }
+            dos_pat_base = get_dos_basename(pattern);
+            if (!is_dos_filename_83(dos_pat_base)) goto no_more_files;
+            dos_pat_dir_size = dos_pat_base - pattern;
+            if (dos_pat_dir_size >= sizeof(dos_pat_prefix) - 2) goto no_more_files;
+            memcpy(dos_pat_prefix, pattern, dos_pat_dir_size);
+            dos_pat_prefix[dos_pat_dir_size] = 'A';  /* Probe filename to resolve parent directory. */
+            dos_pat_prefix[dos_pat_dir_size + 1] = '\0';
+            linux_probe = get_linux_filename(dos_pat_prefix);
+            if (linux_probe[0] == '\0') goto no_more_files;
+            linux_dir = get_linux_basename(linux_probe);
+            memcpy(find_linux_dir, linux_probe, linux_dir - linux_probe);
+            find_linux_dir[linux_dir - linux_probe] = '\0';
+            if (find_linux_dir[0] == '\0') strcpy(find_linux_dir, ".");
+            find_dirp = opendir(find_linux_dir);
+            if (!find_dirp) {
+              if (errno == ENOENT) goto no_more_files;
+              goto error_from_linux;
             }
-            if (!is_dos_filename_83(get_dos_basename(pattern))) goto no_more_files;
-            fn = get_linux_filename(pattern);
-            fnb = get_linux_basename(fn);
-            if (DEBUG) fprintf(stderr, "debug: findfirst fn=(%s) fnb=(%s)\n", fn, fnb);
-            if (strlen(fnb) > 12) {
-              goto no_more_files;  /* is_dos_filename_83 ensures this, but let's double check for security of the strcpy(...) below. */
-            } else {
+            strncpy(find_dos_pattern, dos_pat_base, sizeof(find_dos_pattern) - 1);
+            find_dos_pattern[sizeof(find_dos_pattern) - 1] = '\0';
+            find_attrs = attrs;
+            while ((de = readdir(find_dirp)) != NULL) {
+              char fn[LINUX_PATH_SIZE];
+              const char *fnb = de->d_name;
               char *dta;
               struct stat st;
               struct tm *tm;
-              if (stat(fn, &st) != 0) {
-                if (errno == ENOENT) goto no_more_files;
-                goto error_from_linux;
-              }
-              if (S_ISDIR(st.st_mode) && !(attrs & 0x10)) goto no_more_files;
+              if (!is_dos_filename_83(fnb) || !dos_wildcard_match(find_dos_pattern, fnb)) continue;
+              if (snprintf(fn, sizeof(fn), "%s/%s", find_linux_dir, fnb) <= 0 || strlen(fn) >= sizeof(fn)) continue;
+              if (stat(fn, &st) != 0) continue;
+              if (S_ISDIR(st.st_mode) && !(find_attrs & 0x10)) continue;
               dta = (char*)mem + dta_linear;
               memset(dta, '\0', 0x16);
               tm = localtime(&st.st_mtime);
-              *(unsigned*)dta = FINDFIRST_MAGIC;  /* Just a random value which findnext can identify. */
+              *(unsigned*)dta = FINDFIRST_MAGIC;
               *(unsigned short*)(dta + 0x16) = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;
               *(unsigned short*)(dta + 0x18) = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 1980) << 9;
               *(unsigned*)(dta + 0x1a) = (sizeof(st.st_size) > 4 && st.st_size >> (32 * (sizeof(st.st_size) > 4))) ?
-                  0xffffffffU : st.st_size + (size_t)0;  /* Cap file size at 0xffffffff, no way to return more than 32 bits. */
-              { const char *p = fnb;
-                char *q = dta + 0x1e, c;
-                do {  /* Secure because of the strlen(fnb) check above. */
-                  c = *p++;
-                  *q++ = c - 'a' + 0U <= 'z' - 'a' + 0U ? c - 32 : c;  /* Convert to uppercase. */
-                } while (c != '\0');
-                /*strcpy(dta + 0x1e, fnb);*/  /* Secure because of the strlen(fnb) check above. */
-                /* We use up to 0x1e + 13 == 0x2b bytes in dta. */
-                if (DEBUG) fprintf(stderr, "debug: found linux_file=(%s) dos_file=(%s)\n", fnb, dta + 0x1e);
+                  0xffffffffU : st.st_size + (size_t)0;
+              { const char *p = fnb; char *q = dta + 0x1e, c;
+                do { c = *p++; *q++ = upper_ascii(c); } while (c != '\0');
               }
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+              goto done_findnext;
             }
+            closedir(find_dirp);
+            find_dirp = NULL;
+            goto no_more_files;
+           done_findnext:;
             *(unsigned short*)&regs.rax = 0;  /* Undocumented, but necessary and used as a success indicator by the VAL 1995-05-27 linker val.exe. DOSBox also sets it. */
-            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x4f) {  /* Find next matching file (findnext). */
             const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
             if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + 0x2b - 1)) goto error_invalid_parameter;
             { char * const dta = (char*)mem + dta_linear;
-              if (*(unsigned*)dta != FINDFIRST_MAGIC) goto error_invalid_parameter;
+              struct dirent *de;
+              if (*(unsigned*)dta != FINDFIRST_MAGIC || !find_dirp) goto error_invalid_parameter;
+              while ((de = readdir(find_dirp)) != NULL) {
+                char fn[LINUX_PATH_SIZE];
+                const char *fnb = de->d_name;
+                struct stat st;
+                struct tm *tm;
+                if (!is_dos_filename_83(fnb) || !dos_wildcard_match(find_dos_pattern, fnb)) continue;
+                if (snprintf(fn, sizeof(fn), "%s/%s", find_linux_dir, fnb) <= 0 || strlen(fn) >= sizeof(fn)) continue;
+                if (stat(fn, &st) != 0) continue;
+                if (S_ISDIR(st.st_mode) && !(find_attrs & 0x10)) continue;
+                memset(dta, '\0', 0x16);
+                tm = localtime(&st.st_mtime);
+                *(unsigned*)dta = FINDFIRST_MAGIC;
+                *(unsigned short*)(dta + 0x16) = tm->tm_sec >> 1 | tm->tm_min << 5 | tm->tm_hour << 11;
+                *(unsigned short*)(dta + 0x18) = tm->tm_mday | (tm->tm_mon + 1) << 5 | (tm->tm_year - 1980) << 9;
+                *(unsigned*)(dta + 0x1a) = (sizeof(st.st_size) > 4 && st.st_size >> (32 * (sizeof(st.st_size) > 4))) ?
+                    0xffffffffU : st.st_size + (size_t)0;
+                { const char *p = fnb; char *q = dta + 0x1e, c;
+                  do { c = *p++; *q++ = upper_ascii(c); } while (c != '\0');
+                }
+                *(unsigned short*)&regs.rax = 0;
+                *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+                goto done_findnext2;
+              }
+              closedir(find_dirp);
+              find_dirp = NULL;
               goto no_more_files;
-            }
-          } else if (ah == 0x37) {  /* Get/set switch character (for command-line flags). */
-            const unsigned char al = (unsigned char)regs.rax;
-            if (al == 0x00) {  /* Get. */
-              *(unsigned char*)&regs.rax = 0;  /* Success. */
-              *(unsigned char*)&regs.rdx = '/';
-            } else {
-              fprintf(stderr, "fatal: unsupported subcall for switch character: 0x%02x\n", al);
-              goto fatal;
+             done_findnext2:;
             }
           } else if (ah == 0x51 || ah == 0x62) {  /* Get process ID (PSP) (0x51). Get PSP (0x62). */
             *(unsigned short*)&regs.rbx = PSP_PARA;
@@ -3051,18 +3257,39 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             SET_SREG(es, 0xfff0);
           } else if (ah == 0x29) {  /* Parse filename for FCB. */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rsi);  /* !! Security: check bounds. */
-            if (*p == '\0' || *p == '\r' || *p == '\n') {
-              char *q = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);  /* !! Security: check bounds. */
-              /* al == 1, *p == '\r' in Microsoft Macro Assembler 6.00B driver masm.exe. */
-              /* al == 0, *p == '\n' in Power C 2.2.0 compiler pc.exe. */
-              *(unsigned char*)&regs.rax = 0;  /* No wildchar characters present. */
-              *q++ = '\0';  /* Drive: 0 is default. */
-              memset(q, ' ', 12);  /* Filename (8) and extension (3). */
-              /* Don't update SI. */
-            } else {
-              fprintf(stderr, "fatal: unsupported parsing of filename: %s\n", p);  /* For ml.exe, this filename is completely broken, it starts with \r, also in DOSBox. */
-              goto fatal_int;
+            char *q = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);  /* !! Security: check bounds. */
+            const char *s = p;
+            char *fn = q + 1;
+            unsigned short new_si_ofs;
+            char has_wild = 0;
+            /* Permissive FCB parser for legacy MAKE/MSC tools. */
+            while (*s == ' ' || *s == '\t') ++s;
+            *q = '\0';  /* Drive: 0 (default). */
+            memset(fn, ' ', 11);  /* Name(8)+Ext(3). */
+            if (*s != '\0' && *s != '\r' && *s != '\n') {
+              unsigned i = 0;
+              while (*s != '\0' && *s != '\r' && *s != '\n' && *s != ' ' && *s != '\t' && *s != '.' && i < 8) {
+                if (*s == '*' || *s == '?') has_wild = 1;
+                fn[i++] = upper_ascii(*s++);
+              }
+              if (*s == '.') {
+                unsigned j = 0;
+                ++s;
+                while (*s != '\0' && *s != '\r' && *s != '\n' && *s != ' ' && *s != '\t' && j < 3) {
+                  if (*s == '*' || *s == '?') has_wild = 1;
+                  fn[8 + j++] = upper_ascii(*s++);
+                }
+              }
+              while (*s != '\0' && *s != '\r' && *s != '\n' && *s != ' ' && *s != '\t') ++s;
             }
+            new_si_ofs = (unsigned short)(s - ((char*)mem + ((unsigned)sregs.ds.selector << 4)));
+            *(unsigned short*)&regs.rsi = new_si_ofs;
+            *(unsigned char*)&regs.rax = has_wild ? 1 : 0;  /* AL: wildcard present. */
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x87) {  /* Used by older Microsoft toolchains. */
+            goto nonfatal_unknown_int_21_call;  /* Report unsupported without fatal abort. */
+          } else if (ah == 0x5a) {  /* Create temporary file. */
+            goto nonfatal_unknown_int_21_call;  /* Let caller fall back to another method. */
           } else if (ah == 0x58) {  /* Get/set memory allocation strategy. */
             const unsigned char al = (unsigned char)regs.rax;
             if (al == 0x00) {  /* Get. */
@@ -3089,25 +3316,39 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               const unsigned short env_para = al == 0 ? (((unsigned short*)params)[0] ? ((unsigned short*)params)[0] : ENV_PARA) : psp ? *(const unsigned short*)(psp + 0x2c) : 0;
               char * const env = ((al == 0 && env_para == ENV_PARA) || (env_para >= PSP_PARA + 0x10 && env_para < DOS_ALLOC_PARA_LIMIT)) ? (char*)mem + (env_para << 4) : NULL;
               const char *env_end = env ? env + (((PROGRAM_MCB_PARA - ENV_PARA < DOS_ALLOC_PARA_LIMIT - env_para) ? PROGRAM_MCB_PARA - ENV_PARA : DOS_ALLOC_PARA_LIMIT - env_para) << 4) : NULL;
-              char * const args = al == 0 ?  (char*)mem + (((unsigned short*)params)[2] << 4) + ((unsigned short*)params)[1] + 1  /* (args - 1) is Pascal string with terminating '\r'. */
-                                : psp ? psp + 0x81 : NULL;
-              const unsigned char args_size = args ? (unsigned char)args[-1] : 0;
-              const char is_args_normal = args && (args_size < 0x7f && args[args_size] == '\0'); /* '\0' for al == 0 when Borland C++ 2.0 compiler bcc.exe is running tlink.exe */
-              const char is_args_ok = is_args_normal || (args && args_size == '\n' && args[0] == '\n' && args[1] == '.');  /* Power C 2.2.0 compiler pc.exe. Copy all 128 bytes to new PSP. */
+              char * const args_raw = al == 0 ?  (char*)mem + (((unsigned short*)params)[2] << 4) + ((unsigned short*)params)[1]
+                                    : psp ? psp + 0x80 : NULL;  /* DOS command tail in PSP format at [0x80]=len. */
+              char args_buf[0x80];
+              unsigned char args_size = 0;
+              const char *safe_args = "";
+              char is_args_ok = 0;
               const char is_dos_filename_high = sregs.ds.selector + (*(unsigned short*)&regs.rdx >> 4) >= PSP_PARA;  /* So that dos_filename won't overlap new_env below. */
               char *new_env;
               char new_prog_drive;
-              int reason;
-              if (is_args_normal) args[args_size] = '\0';  /* It was '\r'. */
-              if (!(env && is_args_ok && is_dos_filename_high)) {
-                if (is_args_normal) args[args_size] = '\0';
+              int reason = 0;
+              if (args_raw) {
+                args_size = (unsigned char)args_raw[0];
+                if (args_size < 0x7f && (args_raw[1 + args_size] == '\0' || args_raw[1 + args_size] == '\r' || args_raw[1 + args_size] == '\n')) {  /* PSP-style command tail. */
+                  memcpy(args_buf, args_raw + 1, args_size);
+                  args_buf[args_size] = '\0';
+                  safe_args = args_buf;
+                  is_args_ok = 1;
+                } else {  /* Fallback: direct CR/NUL-terminated string pointer. */
+                  const char *p = args_raw;
+                  while (args_size < 0x7f && p[args_size] != '\0' && p[args_size] != '\r' && p[args_size] != '\n') ++args_size;
+                  memcpy(args_buf, p, args_size);
+                  args_buf[args_size] = '\0';
+                  safe_args = args_buf;
+                  is_args_ok = 1;
+                }
+              }
+              if (!(env && is_dos_filename_high)) {
                 fprintf(stderr, "fatal: bounds check failed (env_ok=%d args_ok=%d, fn_ok=%d) env when loading program=(%s) with args=(%s)\n",
                         env != NULL, is_args_ok, is_dos_filename_high,
-                        dos_filename, is_args_normal ? args : NULL);
-                if (is_args_normal) args[args_size] = '\r';
+                        dos_filename, safe_args);
                 goto fatal_int;
               }
-              if (DEBUG || DEBUG_EXEC) fprintf(stderr, "debug: exec: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, is_args_normal ? args : NULL);
+              if (DEBUG || DEBUG_EXEC) fprintf(stderr, "debug: exec: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, safe_args);
               if (0 && al == 0) {  /* TODO(pts): Why stop? */
                 /* Power C 2.2.0 compiler pc.exe. */
                 fprintf(stderr, "fatal: unsupported exec with al:%02d: %s\n", al, dos_filename);
@@ -3121,12 +3362,22 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                * file). However, kvikdos is not smart enough for that, so it
                * just does an exec() and forgets about the parent process.
                */
-              if ((reason = should_skip_exec_program(dos_filename, is_args_normal ? args : NULL, env, &env_end, had_get_first_mcb)) > 0) {
-                fprintf(stderr, "fatal: unsupported program to load: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, is_args_normal ? args : NULL);
+              reason = (al == 3) ? should_skip_exec_program(dos_filename, safe_args, env, &env_end, had_get_first_mcb) : 0;
+              if (reason > 0) {
+                fprintf(stderr, "fatal: unsupported program to load: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, safe_args);
                 goto fatal_int;
               }
-              if (reason == -1 && is_args_normal && cleanup_fn[0] == '\0' && args[0] == '@' && strlen(args) <= sizeof(cleanup_fn)) {
-                strcpy(cleanup_fn, args + 1);  /* Example args: "@turboc.$ln". */
+              if (al == 0) {
+                if (run_dos_child_subprocess(dos_filename, safe_args, env, env_end, dir_state, &last_exec_return_code) != 0) {
+                  *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x1f);  /* General failure. */
+                  goto error_on_21;
+                }
+                *(unsigned short*)&regs.rax = 0;
+                *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+                continue;
+              }
+              if (reason == -1 && cleanup_fn[0] == '\0' && safe_args[0] == '@' && strlen(safe_args) <= sizeof(cleanup_fn)) {
+                strcpy(cleanup_fn, safe_args + 1);  /* Example args: "@turboc.$ln". */
                 if (DEBUG) fprintf(stderr, "debug: will remove file at exit: %s\n", cleanup_fn);
               }
               dir_state->dos_prog_abs = dos_prog_abs;  /* For loading the overlay from prog_filename, even if not mounted. */
@@ -3144,11 +3395,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               }
               *(char*)env_end = '\0';  /* Hide counter for absolute program pathname. */
               memcpy(new_env = (char*)mem + (ENV_PARA << 4), env, env_end + 2 - env);
-              if (!is_args_normal) {
-                fprintf(stderr, "fatal: bad args when loading: %s\n", dos_filename);
-                goto fatal_int;
-              }
-              strcpy(fnbuf2, args);  /* Large enough to hold 0x7f bytes. */
+              strcpy(fnbuf2, safe_args);  /* Large enough to hold 0x7f bytes. */
               args_str = fnbuf2;
               dos_prog_abs = get_dos_abs_filename_r(prog_filename, new_prog_drive, dir_state, dosfnbuf);
               if (DEBUG) fprintf(stderr, "debug: exec prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dos_prog_abs, new_prog_drive);
@@ -3209,6 +3456,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             } else {
               goto fatal_int;
             }
+          } else if (ah == 0x4d) {  /* Get return code from child process. */
+            *(unsigned short*)&regs.rax = ((unsigned short)last_exec_return_code) << 8;
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x66) {  /* Get/set global code page. */
             const unsigned char al = (unsigned char)regs.rax;
             if (al == 1) {
@@ -3407,10 +3657,14 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         }
       }
      case KVM_EXIT_MMIO:
-      { const char mmio_len = run->mmio.len;
+      { const unsigned mmio_len = run->mmio.len;
         const unsigned addr = (unsigned)run->mmio.phys_addr;
         char highmsg[2];
         /* CS:IP points to the instruction doing the memory operation (not after). */
+        if (!(mmio_len == 1 || mmio_len == 2 || mmio_len == 4 || mmio_len == 8)) {
+          highmsg[0] = '\0';
+          goto bad_memory_access;
+        }
         if (sizeof(run->mmio.phys_addr) > 4 && run->mmio.phys_addr >> (32 * (sizeof(run->mmio.phys_addr) > 4))) {  /* Physical address is larger than 32 bits. */
           highmsg[0] = '+'; highmsg[1] = '\0';
           goto bad_memory_access;
