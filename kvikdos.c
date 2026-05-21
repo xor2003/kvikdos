@@ -2191,6 +2191,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   const char *stdout_write_p;
   const char *stdout_write_end;
   char is_stdout_write_cursor;
+  char dpmi_warned;
   enum malloc_strategy_t { MS_FIRST_FIT = 0, MS_BEST_FIT = 1, MS_LAST_FIT = 2 };
   unsigned malloc_strategy;
   char cleanup_fn[16];
@@ -2219,6 +2220,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   video_byte_written = 0;  /* Pacify uninitialized warnings. */
   stdout_write_p = NULL;  /* Pacify uninitialized warnings. */
   stdout_write_end = NULL;  /* Pacify uninitialized warnings. */
+  dpmi_warned = 0;
   cleanup_fn[0] = '\0';
   find_dirp = NULL;
   find_linux_dir[0] = '\0';
@@ -3406,9 +3408,26 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                * just does an exec() and forgets about the parent process.
                */
               if (al == 3) {
+                char ovl_dos[LINUX_PATH_SIZE];
                 dir_state->dos_prog_abs = dos_prog_abs;  /* Allow loading overlay via mounted alias path. */
                 prog_filename = get_linux_filename_r(dos_filename, dir_state, exec_fnbuf, NULL);
                 dir_state->dos_prog_abs = NULL;  /* For security. */
+                if (prog_filename[0] == '\0' && dos_prog_abs[0] &&
+                    !strchr(dos_filename, ':') && !strchr(dos_filename, '\\') && !strchr(dos_filename, '/')) {
+                  const char *base = dos_prog_abs + strlen(dos_prog_abs);
+                  for (; base != dos_prog_abs + 3 && base[-1] != '\\'; --base) {}
+                  if (base > dos_prog_abs + 3) {
+                    size_t dir_size = base - dos_prog_abs;
+                    size_t fn_size = strlen(dos_filename);
+                    if (dir_size + fn_size + 1 < sizeof(ovl_dos)) {
+                      memcpy(ovl_dos, dos_prog_abs, dir_size);
+                      memcpy(ovl_dos + dir_size, dos_filename, fn_size + 1);
+                      dir_state->dos_prog_abs = dos_prog_abs;
+                      prog_filename = get_linux_filename_r(ovl_dos, dir_state, exec_fnbuf, NULL);
+                      dir_state->dos_prog_abs = NULL;
+                    }
+                  }
+                }
                 if (prog_filename[0] == '\0') {
                   *(unsigned short*)&regs.rax = 2;  /* File not found. */
                   goto error_on_21;
@@ -3664,6 +3683,12 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else if (*(unsigned short*)&regs.rax == 0xed10) {  /* LINK.EXE probe in some MASM/MSC toolchains. */
             *(unsigned short*)&regs.rax = 0;  /* Not installed / no service. */
           } else if (*(unsigned short*)&regs.rax == 0x1687) {  /* DPMI. */
+            if (!dpmi_warned && dos_prog_abs &&
+                (strstr(dos_prog_abs, "BCC.EXE") || strstr(dos_prog_abs, "bcc.exe") ||
+                 strstr(dos_prog_abs, "32RTM.EXE") || strstr(dos_prog_abs, "32rtm.exe"))) {
+              fprintf(stderr, "info: DPMI/protected-mode runtime requested, but kvikdos supports real-mode DOS only.\n");
+              dpmi_warned = 1;
+            }
             /* Keep it as is, DPMI not installed. */
           } else if (*(unsigned short*)&regs.rax == 0xfb42) {
             *(unsigned short*)&regs.rax = 0;  /* Not installed / no service. */
