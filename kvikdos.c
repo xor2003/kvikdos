@@ -1448,6 +1448,57 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   return psp;
 }
 
+/* Implements int 21h/4Bh AL=03 (load overlay): load image to load_para, apply
+ * relocations using reloc_para, and return to caller without executing.
+ */
+static int load_dos_overlay_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, unsigned short load_para, unsigned short reloc_para) {
+  if (header_size >= 24 && (('M' | 'Z' << 8) == *(const unsigned short*)header || ('M' << 8 | 'Z') == *(const unsigned short*)header)) {
+    const unsigned short * const exehdr = (const unsigned short*)header;
+    const unsigned short nblocks = exehdr[EXE_NBLOCKS] & 0x7ff;
+    const unsigned exesize = exehdr[EXE_LASTSIZE] ? ((nblocks - 1) << 9) + exehdr[EXE_LASTSIZE] : nblocks << 9;
+    const unsigned headsize = (unsigned)exehdr[EXE_HDRSIZE] << 4;
+    const unsigned image_size = exesize - headsize;
+    const unsigned image_linear = (unsigned)load_para << 4;
+    unsigned reloc_count = exehdr[EXE_NRELOC];
+    if (exehdr[EXE_LASTSIZE] > 0x200 || exesize <= headsize || image_linear + image_size > DOS_MEM_LIMIT) {
+      errno = ENOMEM;
+      return -1;
+    }
+    if ((unsigned)lseek(img_fd, headsize, SEEK_SET) != headsize) return -1;
+    if ((unsigned)read(img_fd, (char*)mem + image_linear, image_size) != image_size) return -1;
+    if (reloc_count) {
+      unsigned short reloc[1024];
+      if (header_size < 26) { errno = EINVAL; return -1; }
+      if ((unsigned)lseek(img_fd, exehdr[EXE_RELOCPOS], SEEK_SET) != exehdr[EXE_RELOCPOS]) return -1;
+      while (reloc_count != 0) {
+        const unsigned to_read = reloc_count > (sizeof(reloc) >> 2) ? sizeof(reloc) : reloc_count << 2;
+        const unsigned got = read(img_fd, reloc, to_read);
+        unsigned short *r, *rend;
+        if (got != to_read) return -1;
+        reloc_count -= got >> 2;
+        for (r = reloc, rend = r + (got >> 1); r != rend; r += 2) {
+          const unsigned linear = image_linear + ((unsigned)r[1] << 4) + r[0];
+          if (linear + 2 > DOS_MEM_LIMIT) { errno = EINVAL; return -1; }
+          *(unsigned short*)((char*)mem + linear) += reloc_para;
+        }
+      }
+    }
+  } else {
+    const unsigned image_linear = (unsigned)load_para << 4;
+    struct stat st;
+    int got;
+    if (fstat(img_fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || (unsigned long)st.st_size > (unsigned long)(DOS_MEM_LIMIT - image_linear)) {
+      errno = ENOMEM;
+      return -1;
+    }
+    if ((unsigned)lseek(img_fd, 0, SEEK_SET) != 0) return -1;
+    got = read(img_fd, (char*)mem + image_linear, st.st_size);
+    if (got != st.st_size) return -1;
+  }
+  (void)filename;
+  return 0;
+}
+
 static void dump_regs(const char *prefix, const struct kvm_regs *regs, const struct kvm_sregs *sregs) {
 #define R16(name) (*(unsigned short*)&regs->r##name)
 #define S16(name) (sregs->name.selector)  /* 16 bits. */
@@ -1790,42 +1841,6 @@ static const unsigned char scancodes[128] = {
 static const unsigned short fake_keys[3] = {
     0x011b /* <Esc> */, 0x4400 /* <F10> */, 0x1c0d /* <Enter> */ };
 
-/* It's unclear whether running the new program and discarding the current
- * one is the right approach in the general case (especially with al == 3).
- * So we just whitelist a few programs where we do that.
- */
-static char should_skip_exec_program(char const *dos_filename, const char *args, const char *env, const char **env_end_inout, char had_get_first_mcb) {
-  size_t dos_filename_size;
-  char had_ml_env = 0;
-  const char *p, *env_end = *env_end_inout;
-  /* Detect Microsoft Macro Assembler 6.00B driver masm.exe. */
-  dos_filename_size = strlen(dos_filename);
-  for (p = dos_filename + dos_filename_size; p != dos_filename && p[-1] != '\\'; --p) {}
-  if (strcmp(p, "ML.EXE") == 0) {
-    if (!had_get_first_mcb || !args || *args != '\0') return 1;
-    for (p = env; *p != '\0';) {
-      char *q = memchr(p, '\0', env_end - p);
-      if (!q) return 3;  /* env too long. */
-      if (DEBUG) fprintf(stderr, "debug: load env line: (%s)\n", p);
-      if (strncmp(p, "ML= ", 4) == 0) had_ml_env = 1;
-      p = q + 1;
-    }
-    if (!had_ml_env) return 4;
-    if (++p + 4 > env_end) return 5;
-    if (*(const unsigned short*)p != 1) return 6;
-    p += 2;
-    if (p + dos_filename_size >= env_end) return 7;
-    if (strcmp(p, dos_filename) != 0) return 8;
-    *env_end_inout = p - 2;  /* Not: p + dos_filename_size + 1; */
-    return 0;  /* exec() it. */
-  } else if (strcmp(p, "tlink.exe") == 0) {  /* Borland C++ 2.0 compiler bcc.exe executing TLINK 4.0 linker tlink.exe */
-    if (!args || strcmp(args, "@turboc.$ln") != 0) return 11;
-    return -1;  /* exec() it, but delete file "turboc.$ln" later. */
-  } else {
-    return 2;
-  }
-}
-
 typedef struct TtyState {
   int tty_in_fd;
   char is_tty_in_error;
@@ -2141,7 +2156,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   struct kvm_sregs sregs;
   char header[PROGRAM_HEADER_SIZE];
   unsigned header_size;
-  char had_get_ints, had_get_first_mcb;
+  char had_get_ints;
   unsigned char tasm30_bitset;
   const char *dos_prog_abs;  /* Owned externally: either in args or in dosfnbuf or (after exec) within mem. */
   unsigned tick_count;
@@ -2310,7 +2325,6 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
 
   had_get_ints = 0;  /* 1 << 0: int 0x00; 1 << 1: int 0x18; 1 << 2: int 0x06, 1 << 3: Get DOS version, 1 << 4: 0x34. */
   tasm30_bitset = 0;
-  had_get_first_mcb = 0;
   tick_count = 0;
   sphinx_cmm_flags = 0;
   ctrl_break_checking = 0;
@@ -3311,7 +3325,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             if (al == 0 || al == 3) {  /* Microsoft Macro Assembler 6.00B driver masm.exe uses it with al == 3. */
               const char * const params = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rbx);  /* !! Security: check bounds. */
               const unsigned short load_para = al != 0 ? ((unsigned short*)params)[0] : 0;
-              /*const unsigned short relocation_factor = *(unsigned short*)(params + 2);*/
+              const unsigned short relocation_factor = al != 0 ? ((unsigned short*)params)[1] : 0;
               char * const psp = (al != 0 && load_para >= PSP_PARA + 0x10 && load_para < DOS_ALLOC_PARA_LIMIT) ? (char*)mem + ((unsigned)(load_para - 0x10) << 4) : NULL;
               const unsigned short env_para = al == 0 ? (((unsigned short*)params)[0] ? ((unsigned short*)params)[0] : ENV_PARA) : psp ? *(const unsigned short*)(psp + 0x2c) : 0;
               char * const env = ((al == 0 && env_para == ENV_PARA) || (env_para >= PSP_PARA + 0x10 && env_para < DOS_ALLOC_PARA_LIMIT)) ? (char*)mem + (env_para << 4) : NULL;
@@ -3362,8 +3376,39 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                * file). However, kvikdos is not smart enough for that, so it
                * just does an exec() and forgets about the parent process.
                */
-              reason = (al == 3) ? should_skip_exec_program(dos_filename, safe_args, env, &env_end, had_get_first_mcb) : 0;
+              if (al == 3) {
+                dir_state->dos_prog_abs = dos_prog_abs;  /* Allow loading overlay via mounted alias path. */
+                prog_filename = get_linux_filename_r(dos_filename, dir_state, exec_fnbuf, NULL);
+                dir_state->dos_prog_abs = NULL;  /* For security. */
+                if (prog_filename[0] == '\0') {
+                  *(unsigned short*)&regs.rax = 2;  /* File not found. */
+                  goto error_on_21;
+                }
+                if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
+                  *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x02);
+                  goto error_on_21;
+                }
+                header_size = detect_dos_executable_program(img_fd, prog_filename, header);
+                if (load_dos_overlay_program(img_fd, prog_filename, mem, header, header_size, load_para, relocation_factor) != 0) {
+                  close(img_fd);
+                  *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x1f);
+                  goto error_on_21;
+                }
+                close(img_fd);
+                *(unsigned short*)&regs.rax = 0;
+                *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+                goto done_int_21_call;
+              }
+              reason = 0;
               if (reason > 0) {
+                if (al == 3) {
+                  /* Program load probe (without execute): report failure to caller,
+                   * don't terminate parent tool. LINK.EXE may probe optional helpers
+                   * such as DOSXNT.EXE and continue without them.
+                   */
+                  *(unsigned short*)&regs.rax = 2;  /* File not found. */
+                  goto error_on_21;
+                }
                 fprintf(stderr, "fatal: unsupported program to load: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, safe_args);
                 goto fatal_int;
               }
@@ -3374,7 +3419,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 }
                 *(unsigned short*)&regs.rax = 0;
                 *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
-                continue;
+                goto done_int_21_call;
               }
               if (reason == -1 && cleanup_fn[0] == '\0' && safe_args[0] == '@' && strlen(safe_args) <= sizeof(cleanup_fn)) {
                 strcpy(cleanup_fn, safe_args + 1);  /* Example args: "@turboc.$ln". */
@@ -3408,6 +3453,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               fprintf(stderr, "fatal: unsupported loading of program with al:%02x: %s\n", al, dos_filename);
               goto fatal_int;
             }
+         done_int_21_call: ;
           } else if (ah == 0x0a) {  /* Buffered keyboard input. */
            func_0x0a: {
               char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
@@ -3586,6 +3632,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             if (ah < 2 || ah == 0x15) goto fatal_uic;  /* Doesn't follow the standard format. */
             /* ah == 0x43: XMS. */
             *(unsigned char*)&regs.rax = 0;  /* Not installed, OK to install. */
+          } else if (*(unsigned short*)&regs.rax == 0xed10) {  /* LINK.EXE probe in some MASM/MSC toolchains. */
+            *(unsigned short*)&regs.rax = 0;  /* Not installed / no service. */
           } else if (*(unsigned short*)&regs.rax == 0x1687) {  /* DPMI. */
             /* Keep it as is, DPMI not installed. */
 #if 0  /* TLINK 5.1 tlink.exe loading dpmi16bi.ovl */
@@ -3613,6 +3661,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else {
             goto fatal_uic;
           }
+        } else if (int_num == 0x0d) {  /* General protection fault. */
+          /* Allow DOS extender probes to fail softly. */
         } else if (int_num == 0x00) {  /* Division by zero. */
           /* This is called only if the program doesn't override the interrupt vector.
            * Example instructions: `xor ax, ax', `div ax'.
@@ -3680,7 +3730,6 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           run->mmio.data[0] = "01/01/92"[addr - 0xffff5U];  /* System BIOS date, same as default in src/ints/bios.cpp in DOSBox 0.74. */
         } else if (addr == 0xfff7e && !run->mmio.is_write && mmio_len == 2) {  /* Reading the first MCB pointer in INVARS (see int 0x21 call with ah == 0x52). Used by Microsoft Macro Assembler 6.00B driver masm.exe. */
           *(unsigned short*)run->mmio.data = PROGRAM_MCB_PARA;
-          had_get_first_mcb = 1;
         } else if (addr < 0x400 && run->mmio.is_write && addr + mmio_len <= 0x400 && ((mmio_len == 2 && (addr & 1) == 0) || (mmio_len == 4 && (addr & 3) == 0))) {  /* Set interrupt vector directly (not via int 0x21 call with ah == 0x25). */
           /* Microsoft BASIC Professional Development System 7.10 compiler pbc.exe */
           const unsigned char set_int_num = addr >> 2;
