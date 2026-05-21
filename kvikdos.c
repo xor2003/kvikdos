@@ -4082,6 +4082,16 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
   char do_echo = 1;
   char path_override[1024];
   char has_path_override = 0;
+  char goto_label[128];
+  char have_goto = 0;
+  char *batch_env[256];
+  unsigned batch_env_count = 0;
+  unsigned bi;
+  for (bi = 0; envp0 && envp0[bi] && batch_env_count < sizeof(batch_env) / sizeof(batch_env[0]); ++bi) {
+    char *cp = xstrdup(envp0[bi]);
+    if (!cp) { perror("fatal: xstrdup"); exit(252); }
+    batch_env[batch_env_count++] = cp;
+  }
   size_t size;
   const char *dos_prog_abs = dir_state->dos_prog_abs;  /* Of the .bat file. */
   dir_state->dos_prog_abs = NULL;
@@ -4129,6 +4139,50 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
       unsigned cmd_size;
       *q = '\0';  /* Make it ASCIIZ (terminated by \0). */
       if (DEBUG) fprintf(stderr, "debug: batch line: (%s)\n", p_line);
+      if (*p_line == ':') {  /* label */
+        if (have_goto) {
+          const char *ln = p_line + 1;
+          while (*ln == ' ' || *ln == '\t') ++ln;
+          if (is_same_ascii_nocase(ln, goto_label, strlen(goto_label) + 1)) have_goto = 0;
+        }
+        goto done_command;
+      }
+      if (have_goto) goto done_command;
+      { /* %VAR% substitution. */
+        char subst[4096];
+        char *d = subst;
+        const char *s2 = p_line;
+        char *q_orig = q;
+        while (*s2 && d + 2 < subst + sizeof(subst)) {
+          if (*s2 == '%') {
+            const char *e2 = strchr(s2 + 1, '%');
+            if (e2 && e2 > s2 + 1) {
+              char name[128];
+              size_t ns = e2 - (s2 + 1);
+              unsigned ei;
+              if (ns >= sizeof(name)) ns = sizeof(name) - 1;
+              memcpy(name, s2 + 1, ns);
+              name[ns] = '\0';
+              for (ei = 0; ei < ns; ++ei) if (name[ei] - 'a' + 0U <= 'z' - 'a' + 0U) name[ei] &= ~32;
+              for (ei = 0; ei < batch_env_count; ++ei) {
+                const char *ev = batch_env[ei];
+                const char *eq = strchr(ev, '=');
+                if (eq && (size_t)(eq - ev) == ns && memcmp(ev, name, ns) == 0) {
+                  const char *vv = eq + 1;
+                  while (*vv && d + 1 < subst + sizeof(subst)) *d++ = *vv++;
+                  break;
+                }
+              }
+              s2 = e2 + 1;
+              continue;
+            }
+          }
+          *d++ = *s2++;
+        }
+        *d = '\0';
+        strcpy(p_line, subst);
+        if (p_line + strlen(p_line) < q_orig) memset(p_line + strlen(p_line), ' ', q_orig - (p_line + strlen(p_line)));
+      }
       for (; *p_line == ' ' || *p_line == '\t'; ++p_line) {}  /* MS-DOS 6.22 doesn't ignore leading whitespace, at least not before `rem'. */
       if (*p_line == '@') { do_echo_line = 0; ++p_line; }
       if (do_echo_line) {
@@ -4145,10 +4199,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
         fprintf(stderr, "fatal: redirection not supported in DOS .bat batch file: %s\n", prog_filename);
         exit(252);
       }
-      if (strchr(p_line, '%')) {
-        fprintf(stderr, "fatal: percent substitution not supported in DOS .bat batch file: %s\n", prog_filename);
-        exit(252);  /* !! add support */
-      }
+      /* Allow unresolved %...% to pass through as literal text. */
       /* MS-DOS 6.22 terminator characters. */
       for (r = p_line; (c = *r) != '\0' && c != ' ' && c != '\t' && c != '+' && c != '=' && c != '[' && c != ']' && c != '"' && c != '\\' && c != ':' && c != ';' /* && c != '|' && c != '<' && c != '>' */ && c != ',' && c != '.' && c != '/'; ++r) {}
       cmd_size = r - p_line;
@@ -4184,22 +4235,60 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           } else if (0 == memcmp(arg, "off", 4)) {
             do_echo = 0;
           } else {
-            ++r;  /* Skip over a single space, '.', ':' etc. */
-            fwrite(r, 1, endarg - r, stdout);
-            fwrite("\r\n", 1, 2, stdout);
+            fprintf(stdout, "%s\r\n", arg);
           }
         }
         fflush(stdout);
         exit_code = 0;
       } else if (0 == memcmp(p_line, "set", cmd_size)) {
         if (*r != '\0') {
-          fprintf(stderr, "fatal: changing environment variables not supported: %s\n", r);
-          exit(252);  /* !! TODO(pts): Add support, change a copy of envp0. */
+          char *sv = arg;
+          char *name;
+          char *eq = strchr(sv, '=');
+          char *val;
+          unsigned ei;
+          char newev[1024];
+          while (*sv == ' ' || *sv == '\t') ++sv;
+          if (!eq || eq == sv) {
+            fprintf(stderr, "Syntax error - %s\r\n", arg);
+            exit_code = 1;
+            goto done_command;
+          }
+          name = sv;
+          val = eq + 1;
+          *eq = '\0';
+          for (; *sv; ++sv) if (*sv - 'a' + 0U <= 'z' - 'a' + 0U) *sv &= ~32;
+          snprintf(newev, sizeof(newev), "%s=%s", name, val);
+          for (ei = 0; ei < batch_env_count; ++ei) {
+            char *ev = batch_env[ei];
+            char *ee = strchr(ev, '=');
+            if (ee && strcmp(ev, sv) == 0) { /* exact with '=' cut, impossible */ }
+            if (ee && (size_t)(ee - ev) == strlen(name) && memcmp(ev, name, ee - ev) == 0) {
+              free(batch_env[ei]);
+              batch_env[ei] = xstrdup(newev);
+              if (!batch_env[ei]) { perror("fatal: xstrdup"); exit(252); }
+              break;
+            }
+          }
+          if (ei == batch_env_count) {
+            if (batch_env_count >= sizeof(batch_env) / sizeof(batch_env[0])) {
+              fprintf(stderr, "fatal: too many set variables\r\n");
+              exit(252);
+            }
+            batch_env[batch_env_count] = xstrdup(newev);
+            if (!batch_env[batch_env_count]) { perror("fatal: xstrdup"); exit(252); }
+            ++batch_env_count;
+          }
+          if (strcmp(name, "PATH") == 0) {
+            strncpy(path_override, val, sizeof(path_override) - 1);
+            path_override[sizeof(path_override) - 1] = '\0';
+            has_path_override = 1;
+          }
+          *eq = '=';
         } else {
-          const char* const *envp = envp0;
-          if (*envp) {
-            for (; *envp; ++envp) {
-              fprintf(stdout, "%s\r\n", *envp);
+          if (batch_env_count) {
+            for (bi = 0; bi < batch_env_count; ++bi) {
+              fprintf(stdout, "%s\r\n", batch_env[bi]);
             }
           } else {
             fprintf(stdout, "$=\r\n");  /* See run_dos_prog above. */
@@ -4285,6 +4374,23 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           strncpy(path_override, arg, sizeof(path_override) - 1);
           path_override[sizeof(path_override) - 1] = '\0';
           has_path_override = 1;
+          { /* sync PATH in batch env */
+            char pe[sizeof(path_override) + 6];
+            unsigned ei;
+            memcpy(pe, "PATH=", 5);
+            strcpy(pe + 5, path_override);
+            for (ei = 0; ei < batch_env_count; ++ei) {
+              char *eq = strchr(batch_env[ei], '=');
+              if (eq && (size_t)(eq - batch_env[ei]) == 4 && memcmp(batch_env[ei], "PATH", 4) == 0) {
+                free(batch_env[ei]);
+                batch_env[ei] = xstrdup(pe);
+                break;
+              }
+            }
+            if (ei == batch_env_count && batch_env_count < sizeof(batch_env) / sizeof(batch_env[0])) {
+              batch_env[batch_env_count++] = xstrdup(pe);
+            }
+          }
           exit_code = 0;
           goto done_command;
         }
@@ -4302,6 +4408,80 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           }
         }
         fflush(stdout);
+      } else if (0 == memcmp(p_line, "goto", cmd_size)) {
+        const char *gl = arg;
+        while (*gl == ' ' || *gl == '\t') ++gl;
+        if (*gl == ':') ++gl;
+        if (*gl == '\0') {
+          fprintf(stderr, "Label not found - %s\r\n", arg);
+          exit_code = 1;
+        } else {
+          size_t gls = strlen(gl);
+          if (gls >= sizeof(goto_label)) gls = sizeof(goto_label) - 1;
+          memcpy(goto_label, gl, gls);
+          goto_label[gls] = '\0';
+          have_goto = 1;
+          lseek(batch_fd, 0, SEEK_SET);
+          p = p_line = buf;
+          exit_code = 0;
+        }
+      } else if (0 == memcmp(p_line, "shift", cmd_size)) {
+        exit_code = 0;  /* Ignore for now, no %1..%9 support yet. */
+      } else if (0 == memcmp(p_line, "del", cmd_size) || 0 == memcmp(p_line, "erase", cmd_size) || 0 == memcmp(p_line, "delete", cmd_size)) {
+        if (*arg == '\0') {
+          fprintf(stderr, "Required parameter missing\r\n");
+          exit_code = 1;
+        } else {
+          char *a = arg;
+          while (*a) {
+            char *b = a;
+            while (*b && *b != ' ' && *b != '\t') ++b;
+            if (*b) *b++ = '\0';
+            if (*get_linux_filename_r(a, dir_state, fnbuf, NULL) == '\0' || unlink(fnbuf) != 0) exit_code = 1;
+            while (*b == ' ' || *b == '\t') ++b;
+            a = b;
+          }
+        }
+      } else if (0 == memcmp(p_line, "mkdir", cmd_size) || 0 == memcmp(p_line, "md", cmd_size)) {
+        if (*arg == '\0') {
+          fprintf(stderr, "Required parameter missing\r\n");
+          exit_code = 1;
+        } else if (*get_linux_filename_r(arg, dir_state, fnbuf, NULL) == '\0' || mkdir(fnbuf, 0777) != 0) {
+          exit_code = 1;
+        } else {
+          exit_code = 0;
+        }
+      } else if (0 == memcmp(p_line, "copy", cmd_size)) {
+        char *a = arg, *b, *c;
+        int fd1 = -1, fd2 = -1;
+        while (*a == ' ' || *a == '\t') ++a;
+        b = a;
+        while (*b && *b != ' ' && *b != '\t') ++b;
+        if (*b) *b++ = '\0';
+        while (*b == ' ' || *b == '\t') ++b;
+        c = b;
+        while (*c && *c != ' ' && *c != '\t') ++c;
+        *c = '\0';
+        if (*a == '\0' || *b == '\0') {
+          fprintf(stderr, "Required parameter missing\r\n");
+          exit_code = 1;
+        } else if (*get_linux_filename_r(a, dir_state, fnbuf, NULL) == '\0' || *get_linux_filename_r(b, dir_state, fnbuf2, NULL) == '\0') {
+          exit_code = 1;
+        } else if ((fd1 = open(fnbuf, O_RDONLY)) < 0 || (fd2 = open(fnbuf2, O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0) {
+          if (fd1 >= 0) close(fd1);
+          if (fd2 >= 0) close(fd2);
+          exit_code = 1;
+        } else {
+          char cbuf[4096];
+          int n;
+          exit_code = 0;
+          while ((n = read(fd1, cbuf, sizeof(cbuf))) > 0) {
+            if (write(fd2, cbuf, n) != n) { exit_code = 1; break; }
+          }
+          if (n < 0) exit_code = 1;
+          close(fd1);
+          close(fd2);
+        }
       } else if (0 == memcmp(p_line, "pause", cmd_size)) {
         unsigned short dummy_ax;
         /* Ignore arguments arg...endarg, like MS-DOS 6.22 does. */
@@ -4345,28 +4525,81 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
                  memcmp(p_line, "call", cmd_size) == 0 ||
                  memcmp(p_line, "cd", cmd_size) == 0 ||
                  memcmp(p_line, "choice", cmd_size) == 0 ||
-                 memcmp(p_line, "copy", cmd_size) == 0 ||
-                 memcmp(p_line, "del", cmd_size) == 0 ||
-                 memcmp(p_line, "delete", cmd_size) == 0 ||
-                 memcmp(p_line, "erase", cmd_size) == 0 ||
-                 memcmp(p_line, "goto", cmd_size) == 0 ||
                  memcmp(p_line, "help", cmd_size) == 0 ||
-                 memcmp(p_line, "if", cmd_size) == 0 ||
+                 0 ||
                  memcmp(p_line, "loadhigh", cmd_size) == 0 ||
                  memcmp(p_line, "lh", cmd_size) == 0 ||
-                 memcmp(p_line, "mkdir", cmd_size) == 0 ||
-                 memcmp(p_line, "md", cmd_size) == 0 ||
                  memcmp(p_line, "rmdir", cmd_size) == 0 ||
                  memcmp(p_line, "rd", cmd_size) == 0 ||
                  memcmp(p_line, "rem", cmd_size) == 0 ||
                  memcmp(p_line, "rename", cmd_size) == 0 ||
                  memcmp(p_line, "ren", cmd_size) == 0 ||
-                 memcmp(p_line, "shift", cmd_size) == 0 ||
                  memcmp(p_line, "subst", cmd_size) == 0) {
         *r = '\0';
         fprintf(stderr, "fatal: DOS command not supported: %s\n", p_line);
         exit(252);
         /**r = c;*/
+      } else if (0 == memcmp(p_line, "if", cmd_size)) {
+        char cond_ok = 0, is_not = 0;
+        char *tail = arg;
+        while (*tail == ' ' || *tail == '\t') ++tail;
+        if ((tail[0] == 'n' || tail[0] == 'N') && (tail[1] == 'o' || tail[1] == 'O') && (tail[2] == 't' || tail[2] == 'T') && (tail[3] == ' ' || tail[3] == '\t')) {
+          is_not = 1;
+          tail += 4;
+          while (*tail == ' ' || *tail == '\t') ++tail;
+        }
+        if ((tail[0] == 'e' || tail[0] == 'E') && (tail[1] == 'r' || tail[1] == 'R') && (tail[2] == 'r' || tail[2] == 'R') &&
+            (tail[3] == 'o' || tail[3] == 'O') && (tail[4] == 'r' || tail[4] == 'R') && (tail[5] == 'l' || tail[5] == 'L') &&
+            (tail[6] == 'e' || tail[6] == 'E') && (tail[7] == 'v' || tail[7] == 'V') && (tail[8] == 'e' || tail[8] == 'E') &&
+            (tail[9] == 'l' || tail[9] == 'L') && (tail[10] == ' ' || tail[10] == '\t')) {
+          unsigned n = 0;
+          char *pnum = tail + 10;
+          while (*pnum == ' ' || *pnum == '\t') ++pnum;
+          while (*pnum >= '0' && *pnum <= '9') { n = n * 10 + (*pnum++ - '0'); }
+          while (*pnum == ' ' || *pnum == '\t') ++pnum;
+          cond_ok = exit_code >= n;
+          tail = pnum;
+        } else if ((tail[0] == 'e' || tail[0] == 'E') && (tail[1] == 'x' || tail[1] == 'X') && (tail[2] == 'i' || tail[2] == 'I') && (tail[3] == 's' || tail[3] == 'S') && (tail[4] == 't' || tail[4] == 'T') && (tail[5] == ' ' || tail[5] == '\t')) {
+          char fn[260];
+          char *pf = tail + 5;
+          struct stat st;
+          size_t fi = 0;
+          while (*pf == ' ' || *pf == '\t') ++pf;
+          while (*pf && *pf != ' ' && *pf != '\t' && fi + 1 < sizeof(fn)) fn[fi++] = *pf++;
+          fn[fi] = '\0';
+          while (*pf == ' ' || *pf == '\t') ++pf;
+          cond_ok = fn[0] && *get_linux_filename_r(fn, dir_state, fnbuf, NULL) && stat(fnbuf, &st) == 0;
+          tail = pf;
+        } else {
+          char *eqeq = strstr(tail, "==");
+          if (eqeq) {
+            char lhs[256], rhs[256];
+            char *pc = tail;
+            size_t li = 0, ri = 0;
+            while (pc < eqeq && (*pc == ' ' || *pc == '\t')) ++pc;
+            if (*pc == '"') ++pc;
+            while (pc < eqeq && *pc != '"' && li + 1 < sizeof(lhs)) lhs[li++] = *pc++;
+            lhs[li] = '\0';
+            pc = eqeq + 2;
+            while (*pc == ' ' || *pc == '\t') ++pc;
+            if (*pc == '"') ++pc;
+            while (*pc && *pc != '"' && *pc != ' ' && *pc != '\t' && ri + 1 < sizeof(rhs)) rhs[ri++] = *pc++;
+            rhs[ri] = '\0';
+            if (*pc == '"') ++pc;
+            while (*pc == ' ' || *pc == '\t') ++pc;
+            cond_ok = strcmp(lhs, rhs) == 0;
+            tail = pc;
+          }
+        }
+        if (is_not) cond_ok = !cond_ok;
+        if (cond_ok && *tail) {
+          memmove(p_line, tail, strlen(tail) + 1);
+          q = p_line + strlen(p_line);
+          *q = '\0';
+          goto next_line;
+        }
+        exit_code = cond_ok ? 0 : 1;
+        goto done_command;
       } else {  /* Run .com or .exe program. */
         char *args_str = p_line, args_buf[0x80], c2;
         const char* prog_filename;
@@ -4400,14 +4633,19 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
               fprintf(stderr, "Error getting absolute filelename - %s\r\n", p_line);
               exit_code = 1;
             } else {
-              const char *batch_extra_env[1];
+              const char *batch_extra_env[300];
               unsigned batch_extra_env_count = 0;
               char batch_path_env[1024 + 5];
+              unsigned ei;
               if (has_path_override) {
                 memcpy(batch_path_env, "PATH=", 5);
                 strncpy(batch_path_env + 5, path_override, sizeof(batch_path_env) - 6);
                 batch_path_env[sizeof(batch_path_env) - 1] = '\0';
                 batch_extra_env[batch_extra_env_count++] = batch_path_env;
+              }
+              for (ei = 0; ei < batch_env_count && batch_extra_env_count < sizeof(batch_extra_env) / sizeof(batch_extra_env[0]); ++ei) {
+                if (strncmp(batch_env[ei], "PATH=", 5) == 0 && has_path_override) continue;
+                batch_extra_env[batch_extra_env_count++] = batch_env[ei];
               }
               exit_code = run_dos_prog(emu, prog_filename, args_buf, NULL, dir_state, tty_state, emu_params, envp0, batch_extra_env, batch_extra_env_count);
             }
