@@ -2348,7 +2348,25 @@ static int open_dos_file(const char *dos_filename, const char *dos_prog_abs, int
     }
     goto after_open;
   }
-  if ((fd = open(linux_filename, flags, 0644)) < 0) return -1;
+  if ((fd = open(linux_filename, flags, 0644)) < 0) {
+    if (g_case_fallback_mode != 0) {
+      struct stat st;
+      char *s, *base = fnbuf2;
+      strcpy(fnbuf2, linux_filename);
+      for (s = fnbuf2; *s; ++s) if (*s == '/') base = s + 1;
+      for (s = base; *s; ++s) if ((unsigned char)(*s - 'a') <= 'z' - 'a') *s &= ~32;
+      if (stat(fnbuf2, &st) == 0 && ((flags & O_CREAT) || S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))) {
+        if ((fd = open(fnbuf2, flags, 0644)) >= 0) goto after_open;
+      }
+      strcpy(fnbuf2, linux_filename);
+      for (s = fnbuf2, base = fnbuf2; *s; ++s) if (*s == '/') base = s + 1;
+      for (s = base; *s; ++s) if ((unsigned char)(*s - 'A') <= 'Z' - 'A') *s |= 32;
+      if (stat(fnbuf2, &st) == 0 && ((flags & O_CREAT) || S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))) {
+        if ((fd = open(fnbuf2, flags, 0644)) >= 0) goto after_open;
+      }
+    }
+    return -1;
+  }
  after_open:
   return fd;
 }
@@ -4062,6 +4080,8 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
   int batch_fd, got;
   char buf[4096], *p = buf, *p_line = buf, *q;
   char do_echo = 1;
+  char path_override[1024];
+  char has_path_override = 0;
   size_t size;
   const char *dos_prog_abs = dir_state->dos_prog_abs;  /* Of the .bat file. */
   dir_state->dos_prog_abs = NULL;
@@ -4216,28 +4236,70 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           break;
         }
       } else if (0 == memcmp(p_line, "cd", cmd_size)) {
-        if (*r != '\0') {
-          fprintf(stderr, "fatal: changing current directory not supported: %s\n", r);
-          exit(252);  /* !! TODO(pts): Add support, change a copy of envp0. */
-        } else {
+        if (*r == '\0') {
           const char *current_dir = dir_state->current_dir[dir_state->drive - 'A'];
           fprintf(stdout, "%c:%s\r\n", dir_state->drive, *current_dir == '\0' ? "\\" : current_dir);
           fflush(stdout);
           exit_code = 0;
+        } else {
+          char tmp[DOS_PATH_SIZE];
+          char *t = tmp;
+          const char *s = arg;
+          char drive = dir_state->drive;
+          struct stat st;
+          if ((s[0] & ~32) - 'A' + 0U < DRIVE_COUNT && s[1] == ':') {
+            drive = s[0] & ~32;
+            s += 2;
+            if (*s == '\\' || *s == '/') ++s;
+          } else if (*s == '\\' || *s == '/') {
+            ++s;
+          }
+          while (*s && t + 2 < tmp + sizeof(tmp)) {
+            char c3 = *s++;
+            if (c3 == '/') c3 = '\\';
+            *t++ = (c3 - 'a' + 0U <= 'z' - 'a' + 0U) ? (c3 & ~32) : c3;
+          }
+          if (t != tmp && t[-1] != '\\') *t++ = '\\';
+          *t = '\0';
+          if (tmp[0] == '\0') strcpy(tmp, "\\");
+          {
+            char dos_abs[DOS_PATH_SIZE + 4];
+            snprintf(dos_abs, sizeof(dos_abs), "%c:%s", drive, tmp);
+            if (*get_linux_filename_r(dos_abs, dir_state, fnbuf, NULL) == '\0' || stat(fnbuf, &st) != 0 || !S_ISDIR(st.st_mode)) {
+              fprintf(stderr, "Invalid directory - %s\r\n", arg);
+              exit_code = 1;
+            } else {
+              strncpy(dir_state->current_dir[drive - 'A'], tmp, sizeof(dir_state->current_dir[drive - 'A']) - 1);
+              dir_state->current_dir[drive - 'A'][sizeof(dir_state->current_dir[drive - 'A']) - 1] = '\0';
+              dir_state->drive = drive;
+              exit_code = 0;
+            }
+          }
         }
       } else if (0 == memcmp(p_line, "path", cmd_size)) {
         const char* const *envp;
         if (*r != '\0') {
-          fprintf(stderr, "fatal: changing environment variables (PATH) not supported: %s\n", r);
-          exit(252);  /* !! TODO(pts): Add support, change a copy of envp0. */
+          while (*arg == ' ' || *arg == '\t') ++arg;
+          if (*arg == '=') ++arg;
+          while (*arg == ' ' || *arg == '\t') ++arg;
+          strncpy(path_override, arg, sizeof(path_override) - 1);
+          path_override[sizeof(path_override) - 1] = '\0';
+          has_path_override = 1;
+          exit_code = 0;
+          goto done_command;
         }
-        for (envp = envp0; *envp && strncmp(*envp, "PATH=", 5) != 0; ++envp) {}
-        if (*envp) {
-          fprintf(stdout, "%s\r\n", *envp);
+        if (has_path_override) {
+          fprintf(stdout, "PATH=%s\r\n", path_override);
           exit_code = 0;
         } else {
-          fprintf(stdout, "No Path\r\n\r\n");  /* MS-DOS 6.22. */
-          exit_code = 1;
+          for (envp = envp0; *envp && strncmp(*envp, "PATH=", 5) != 0; ++envp) {}
+          if (*envp) {
+            fprintf(stdout, "%s\r\n", *envp);
+            exit_code = 0;
+          } else {
+            fprintf(stdout, "No Path\r\n\r\n");  /* MS-DOS 6.22. */
+            exit_code = 1;
+          }
         }
         fflush(stdout);
       } else if (0 == memcmp(p_line, "pause", cmd_size)) {
@@ -4323,7 +4385,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           *args_str = '\0';  /* So that p_line becomes terminated by '\0'. */
           for (envp = envp0; *envp && strncmp(*envp, "PATH=", 5) != 0; ++envp) {}
           dir_state->dos_prog_abs = dos_prog_abs;  /* Of the .bat file. */
-          prog_filename = find_prog_on_path(p_line, dir_state, *envp ? *envp + 5 : NULL, &prog_drive);
+          prog_filename = find_prog_on_path(p_line, dir_state, has_path_override ? path_override : (*envp ? *envp + 5 : NULL), &prog_drive);
           if (!prog_filename) {
             /* DOSBox 0.74-4 prints "Illegal command: %s.\r\n" to stdout, we print our error to stderr. */
             /* MS-DOS 6.22 prints this to stderr: "Bad command or file name\r\n". */
@@ -4338,7 +4400,16 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
               fprintf(stderr, "Error getting absolute filelename - %s\r\n", p_line);
               exit_code = 1;
             } else {
-              exit_code = run_dos_prog(emu, prog_filename, args_buf, NULL, dir_state, tty_state, emu_params, envp0, NULL, 0);
+              const char *batch_extra_env[1];
+              unsigned batch_extra_env_count = 0;
+              char batch_path_env[1024 + 5];
+              if (has_path_override) {
+                memcpy(batch_path_env, "PATH=", 5);
+                strncpy(batch_path_env + 5, path_override, sizeof(batch_path_env) - 6);
+                batch_path_env[sizeof(batch_path_env) - 1] = '\0';
+                batch_extra_env[batch_extra_env_count++] = batch_path_env;
+              }
+              exit_code = run_dos_prog(emu, prog_filename, args_buf, NULL, dir_state, tty_state, emu_params, envp0, batch_extra_env, batch_extra_env_count);
             }
           }
           dir_state->dos_prog_abs = NULL;  /* For security. */
