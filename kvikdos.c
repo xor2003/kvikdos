@@ -2455,26 +2455,58 @@ static int open_dos_file(const char *dos_filename, const char *dos_prog_abs, int
 
 static char exec_fnbuf[LINUX_PATH_SIZE];  /* Used temporarily by run_dos_prog. */
 
-static int is_windows_host_executable(const char *path) {
+enum mz_subformat_t { MZ_SUBFMT_NONE = 0, MZ_SUBFMT_PE, MZ_SUBFMT_NE, MZ_SUBFMT_LE, MZ_SUBFMT_LX };
+
+static enum mz_subformat_t detect_mz_subformat(const char *path) {
   int fd;
   unsigned char mz[64];
   unsigned char sig4[4];
   unsigned char sig2[2];
   unsigned long off;
   ssize_t got;
-  if (!path) return 0;
+  if (!path) return MZ_SUBFMT_NONE;
   fd = open(path, O_RDONLY);
-  if (fd < 0) return 0;
+  if (fd < 0) return MZ_SUBFMT_NONE;
   got = read(fd, mz, sizeof(mz));
-  if (got < 0 || got < 0x40 || mz[0] != 'M' || mz[1] != 'Z') { close(fd); return 0; }
+  if (got < 0 || got < 0x40 || mz[0] != 'M' || mz[1] != 'Z') { close(fd); return MZ_SUBFMT_NONE; }
   off = (unsigned long)mz[0x3c] | ((unsigned long)mz[0x3d] << 8) | ((unsigned long)mz[0x3e] << 16) | ((unsigned long)mz[0x3f] << 24);
-  if ((long)off < 0 || lseek(fd, (off_t)off, SEEK_SET) < 0) { close(fd); return 0; }
+  if ((long)off < 0 || lseek(fd, (off_t)off, SEEK_SET) < 0) { close(fd); return MZ_SUBFMT_NONE; }
   got = read(fd, sig4, sizeof(sig4));
-  if (got == 4 && sig4[0] == 'P' && sig4[1] == 'E' && sig4[2] == 0 && sig4[3] == 0) { close(fd); return 1; }
-  if (lseek(fd, (off_t)off, SEEK_SET) < 0) { close(fd); return 0; }
+  if (got == 4 && sig4[0] == 'P' && sig4[1] == 'E' && sig4[2] == 0 && sig4[3] == 0) { close(fd); return MZ_SUBFMT_PE; }
+  if (lseek(fd, (off_t)off, SEEK_SET) < 0) { close(fd); return MZ_SUBFMT_NONE; }
   got = read(fd, sig2, sizeof(sig2));
   close(fd);
-  return got == 2 && ((sig2[0] == 'N' && sig2[1] == 'E') || (sig2[0] == 'L' && sig2[1] == 'E') || (sig2[0] == 'L' && sig2[1] == 'X'));
+  if (got == 2 && sig2[0] == 'N' && sig2[1] == 'E') return MZ_SUBFMT_NE;
+  if (got == 2 && sig2[0] == 'L' && sig2[1] == 'E') return MZ_SUBFMT_LE;
+  if (got == 2 && sig2[0] == 'L' && sig2[1] == 'X') return MZ_SUBFMT_LX;
+  return MZ_SUBFMT_NONE;
+}
+
+static int file_contains_text(const char *path, const char *needle) {
+  int fd;
+  struct stat st;
+  char *buf;
+  size_t size, nlen;
+  ssize_t got;
+  int found = 0;
+  fd = open(path, O_RDONLY);
+  if (fd < 0) return 0;
+  if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return 0; }
+  size = st.st_size > (1 << 20) ? (1 << 20) : (size_t)st.st_size;  /* Scan up to 1 MiB. */
+  nlen = strlen(needle);
+  if (nlen == 0 || nlen > size) { close(fd); return 0; }
+  buf = (char*)malloc(size);
+  if (!buf) { close(fd); return 0; }
+  got = read(fd, buf, size);
+  close(fd);
+  if (got > 0 && (size_t)got >= nlen && memmem(buf, (size_t)got, needle, nlen) != NULL) found = 1;
+  free(buf);
+  return found;
+}
+
+static int is_probable_borland_dual_mode_ne(const char *path) {
+  return file_contains_text(path, "DPMI error (") &&
+         (file_contains_text(path, "TLINK") || file_contains_text(path, "RTM"));
 }
 
 static int run_with_wine(const char *prog_filename, const char *const *args) {
@@ -2504,6 +2536,32 @@ static int run_with_wine(const char *prog_filename, const char *const *args) {
   }
   if (WIFEXITED(status)) return WEXITSTATUS(status);
   return 1;
+}
+
+static int has_wine_in_path(void) {
+  const char *path = getenv("PATH");
+  const char *p, *q;
+  char buf[LINUX_PATH_SIZE];
+  size_t n;
+  if (!path || !*path) return 0;
+  for (p = path;; p = q + 1) {
+    q = strchr(p, ':');
+    if (!q) q = p + strlen(p);
+    n = (size_t)(q - p);
+    if (n == 0) {
+      if (sizeof(buf) > 5) {
+        memcpy(buf, "./wine", 7);
+        if (access(buf, X_OK) == 0) return 1;
+      }
+    } else if (n + 1 + 4 + 1 <= sizeof(buf)) {
+      memcpy(buf, p, n);
+      buf[n++] = '/';
+      memcpy(buf + n, "wine", 5);
+      if (access(buf, X_OK) == 0) return 1;
+    }
+    if (*q == '\0') break;
+  }
+  return 0;
 }
 
 static int is_linux_native_executable(const char *path) {
@@ -5822,9 +5880,17 @@ int main(int argc, char **argv) {
   if (is_linux_native_executable(cmd_args.prog_filename)) {
     return run_native_execvp(cmd_args.prog_filename, cmd_args.args);
   }
-  if (is_windows_host_executable(cmd_args.prog_filename)) {
-    fprintf(stderr, "info: detected Windows executable (PE/NE/LE/LX), delegating to wine: %s\n", cmd_args.prog_filename);
+  {
+    const enum mz_subformat_t subfmt = detect_mz_subformat(cmd_args.prog_filename);
+    if (subfmt == MZ_SUBFMT_PE || ((subfmt == MZ_SUBFMT_NE || subfmt == MZ_SUBFMT_LE || subfmt == MZ_SUBFMT_LX) &&
+                                   !is_probable_borland_dual_mode_ne(cmd_args.prog_filename))) {
+    if (!has_wine_in_path()) {
+        fprintf(stderr, "error: detected Windows executable, but 'wine' is not in PATH: %s\n", cmd_args.prog_filename);
+      return 1;
+    }
+      fprintf(stderr, "info: detected Windows executable, delegating to wine: %s\n", cmd_args.prog_filename);
     return run_with_wine(cmd_args.prog_filename, cmd_args.args);
+    }
   }
   { int exit_code;
     const char *ext = get_linux_ext(cmd_args.prog_filename);
