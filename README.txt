@@ -209,6 +209,16 @@ Examples:
 
     $ ./kvikdos --diag=all --diag-file=kvikdos.diag /home/xor/inertia_player/masm/BIN/LINK.EXE
 
+Batch regression tests:
+
+* Run all local tests:
+
+    $ make test
+
+* Current batch suite (`tests/test_batch.sh`) covers commands/patterns used
+  by DOS compiler scripts: `set`, `%VAR%`, `%1..%9`, `shift`, `call`,
+  `if` (`==`, `not`, `errorlevel`, `exist`), `goto`, `mkdir`, `copy`, `del`.
+
 About making Linux files available for DOS programs:
 
 * kvikdos emulates DOS drives A: .. F: by exposing directories on the Linux
