@@ -46,9 +46,9 @@ Limitations:
   (last 768 bytes), BIOS Data Area, helper code, the user code written for
   Linux.
 
-  kvikdos doesn't support memory types UMB (up to 384 KiB more), HMA (63
-  KiB more), XMS (up to hundreds of megabytes more) or EMS (also up to
-  hundres of megabytes, overlapping with XMS).
+  kvikdos has partial compatibility support for UMB/XMS/EMS probes and
+  common allocator APIs used by DOS toolchains, but it is not a full
+  memory-manager implementation (no full DPMI/VCPI stack).
 
   If your DOS programs need mre memory, use udosrun or DOSBox instead.
 
@@ -71,6 +71,12 @@ Limitations:
   tools (e.g. compilers and assemblers) released in the 1980s and 1990s
   already work, see the compatibility list below. To get good chances for
   running any random DOS program, use udosrun or DOSBox instead.
+
+* If the target file is Linux-native (ELF or shebang script), kvikdos
+  executes it natively with Linux `fork+execvp` instead of DOS emulation.
+
+* If the target file is a Windows executable format (PE/NE/LE/LX), kvikdos
+  delegates execution to `wine` automatically.
 
 Features and advantages:
 
@@ -218,6 +224,27 @@ Batch regression tests:
 * Current batch suite (`tests/test_batch.sh`) covers commands/patterns used
   by DOS compiler scripts: `set`, `%VAR%`, `%1..%9`, `shift`, `call`,
   `if` (`==`, `not`, `errorlevel`, `exist`), `goto`, `mkdir`, `copy`, `del`.
+
+Static analysis and runtime checks:
+
+* cppcheck:
+
+    $ cppcheck --enable=warning,style,performance,portability --std=c89 --force kvikdos.c
+
+* clang static analyzer:
+
+    $ clang --analyze -Xanalyzer -analyzer-output=text -std=c89 -Wall -Wextra kvikdos.c
+
+* ASan+UBSan build and compiler smoke:
+
+    $ gcc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-strict-aliasing -o kvikdos_asan kvikdos.c
+    $ /home/xor/kvikdos/kvikdos_asan /home/xor/inertia_player/dos_compilers/Microsoft\ C\ v5/CL.EXE /c HELLO0.C
+    $ /home/xor/kvikdos/kvikdos_asan /home/xor/inertia_player/dos_compilers/Microsoft\ MASM\ v5/BIN/MASM.EXE HELLO.ASM,HELLO.OBJ,NUL.LST,NUL.CRF
+
+* Valgrind smoke:
+
+    $ valgrind --tool=memcheck --leak-check=full --error-exitcode=101 ./kvikdos /home/xor/inertia_player/dos_compilers/Microsoft\ C\ v5/CL.EXE /c HELLO0.C
+    $ valgrind --tool=memcheck --leak-check=full --error-exitcode=101 ./kvikdos /home/xor/inertia_player/dos_compilers/Microsoft\ MASM\ v5/BIN/MASM.EXE HELLO.ASM,HELLO.OBJ,NUL.LST,NUL.CRF
 
 About making Linux files available for DOS programs:
 

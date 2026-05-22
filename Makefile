@@ -1,4 +1,4 @@
-.PHONY: all clean run test test-batch
+.PHONY: all clean run test test-batch test-mem
 .SUFFIXES:
 MAKEFLAGS += -r
 
@@ -18,10 +18,13 @@ clean:
 run: kvikdos guest.com
 	./kvikdos guest.com hello world
 
-test: test-batch
+test: test-batch test-mem
 
 test-batch: kvikdos
 	./tests/test_batch.sh ./kvikdos
+
+test-mem: kvikdos
+	./tests/test_mem_services.sh ./kvikdos
 
 %.com: %.nasm
 	nasm -O0 -f bin -o $@ $<

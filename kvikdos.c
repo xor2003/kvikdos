@@ -971,8 +971,8 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
       }
       cmd_args.prog_filename = find_prog_on_path(prog_name_arg, &cmd_args.dir_state, dos_path, &dos_prog_drive);  /* Return value is fnbuf or NULL. */
       if (!cmd_args.prog_filename) {
-        fprintf(stderr, "fatal: DOS command not found on %c:\\ or %%PATH%%: %s\n", cmd_args.dir_state.drive, prog_name_arg);
-        exit(252);
+        fprintf(stderr, "error: DOS command not found on %c:\\ or %%PATH%%: %s\n", cmd_args.dir_state.drive, prog_name_arg);
+        exit(1);
       }
       if (*cmd_args.prog_filename == '\0') {
         fprintf(stderr, "fatal: invalid <dos-executable-file> DOS program name: %s\n", prog_name_arg);
@@ -994,6 +994,9 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     cmd_args.dir_state.dos_prog_abs = get_dos_abs_filename_r(cmd_args.prog_filename, dos_prog_drive, &cmd_args.dir_state, dosfnbuf);
     if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", cmd_args.prog_filename, cmd_args.dir_state.dos_prog_abs, dos_prog_drive);
   }
+  if (!is_drive_specified && prog_filename_type == PFT_LINUX && dos_prog_drive >= 'A' && dos_prog_drive <= 'Z') {
+    cmd_args.dir_state.drive = dos_prog_drive;  /* Resolve relative filenames in the executable directory mount by default. */
+  }
   if (prog_filename_type == PFT_LINUX && cmd_args.dir_state.case_mode['C' - 'A'] == CASE_MODE_UNSPECIFIED && cmd_args.dir_state.linux_mount_dir['C' - 'A']) {
     const char *mount_c = cmd_args.dir_state.linux_mount_dir['C' - 'A'];
     const char *q;
@@ -1004,6 +1007,30 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
       cmd_args.dir_state.case_mode['C' - 'A'] = (*q == '\0') ? CASE_MODE_UPPERCASE : CASE_MODE_LOWERCASE;
     } else {  /* Set case mode from the basename only. */
       cmd_args.dir_state.case_mode['C' - 'A'] = get_case_mode_from_last_component(cmd_args.prog_filename);
+    }
+  }
+
+  if (!cwd_dos_flag && cmd_args.dir_state.dos_prog_abs && cmd_args.dir_state.dos_prog_abs[0] &&
+      (cmd_args.dir_state.dos_prog_abs[0] & ~32) - 'A' + 0U < DRIVE_COUNT &&
+      cmd_args.dir_state.dos_prog_abs[1] == ':' && cmd_args.dir_state.dos_prog_abs[2] == '\\') {
+    /* Default DOS CWD to the executable directory, so relative file args resolve like in DOSBox.
+     * Example: `kvikdos C:\\TOOLS\\UNP.EXE t unp.exe` should search in C:\\TOOLS\\.
+     */
+    char drive = cmd_args.dir_state.dos_prog_abs[0] & ~32;
+    const char *base = cmd_args.dir_state.dos_prog_abs + strlen(cmd_args.dir_state.dos_prog_abs);
+    const char *p = cmd_args.dir_state.dos_prog_abs + 3;
+    char tmp[DOS_PATH_SIZE];
+    size_t n;
+    for (; base > p && base[-1] != '\\' && base[-1] != '/'; --base) {}
+    if (base > p) {
+      n = (size_t)(base - p);
+      if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+      memcpy(tmp, p, n);
+      if (n > 0 && tmp[n - 1] != '\\') tmp[n++] = '\\';
+      tmp[n] = '\0';
+      strncpy(cmd_args.dir_state.current_dir[drive - 'A'], tmp, sizeof(cmd_args.dir_state.current_dir[drive - 'A']) - 1);
+      cmd_args.dir_state.current_dir[drive - 'A'][sizeof(cmd_args.dir_state.current_dir[drive - 'A']) - 1] = '\0';
+      cmd_args.dir_state.drive = drive;
     }
   }
 
@@ -2373,6 +2400,37 @@ static int open_dos_file(const char *dos_filename, const char *dos_prog_abs, int
     goto after_open;
   }
   if ((fd = open(linux_filename, flags, 0644)) < 0) {
+    if (flags3 == O_RDONLY && dos_prog_abs && dos_prog_abs[0] &&
+        strchr(dos_filename, ':') == NULL && strchr(dos_filename, '\\') == NULL && strchr(dos_filename, '/') == NULL) {
+      /* Fallback: resolve bare filename in program directory as well.
+       * Needed by tools that expect argv-relative files next to the executable.
+       */
+      const char *base = dos_prog_abs + strlen(dos_prog_abs);
+      char ovl_dos[260];
+      size_t dir_size;
+      for (; base != dos_prog_abs + 3 && base[-1] != '\\' && base[-1] != '/'; --base) {}
+      dir_size = (size_t)(base - dos_prog_abs);
+      if (dir_size > 3 && dir_size + strlen(dos_filename) + 1 < sizeof(ovl_dos)) {
+        struct stat st;
+        char *s, *base2;
+        memcpy(ovl_dos, dos_prog_abs, dir_size);
+        strcpy(ovl_dos + dir_size, dos_filename);
+        dir_state->dos_prog_abs = dos_prog_abs;
+        linux_filename = get_linux_filename_r(ovl_dos, dir_state, fnbuf2, &linux_lastc);
+        dir_state->dos_prog_abs = NULL;
+        if ((fd = open(linux_filename, flags, 0644)) >= 0) goto after_open;
+        if (g_case_fallback_mode != 0) {
+          strcpy(fnbuf, linux_filename);
+          for (s = fnbuf, base2 = fnbuf; *s; ++s) if (*s == '/') base2 = s + 1;
+          for (s = base2; *s; ++s) if ((unsigned char)(*s - 'a') <= 'z' - 'a') *s &= ~32;
+          if (stat(fnbuf, &st) == 0 && S_ISREG(st.st_mode) && (fd = open(fnbuf, flags, 0644)) >= 0) goto after_open;
+          strcpy(fnbuf, linux_filename);
+          for (s = fnbuf, base2 = fnbuf; *s; ++s) if (*s == '/') base2 = s + 1;
+          for (s = base2; *s; ++s) if ((unsigned char)(*s - 'A') <= 'Z' - 'A') *s |= 32;
+          if (stat(fnbuf, &st) == 0 && S_ISREG(st.st_mode) && (fd = open(fnbuf, flags, 0644)) >= 0) goto after_open;
+        }
+      }
+    }
     if (g_case_fallback_mode != 0) {
       struct stat st;
       char *s, *base = fnbuf2;
@@ -2396,6 +2454,99 @@ static int open_dos_file(const char *dos_filename, const char *dos_prog_abs, int
 }
 
 static char exec_fnbuf[LINUX_PATH_SIZE];  /* Used temporarily by run_dos_prog. */
+
+static int is_windows_host_executable(const char *path) {
+  int fd;
+  unsigned char mz[64];
+  unsigned char sig4[4];
+  unsigned char sig2[2];
+  unsigned long off;
+  ssize_t got;
+  if (!path) return 0;
+  fd = open(path, O_RDONLY);
+  if (fd < 0) return 0;
+  got = read(fd, mz, sizeof(mz));
+  if (got < 0 || got < 0x40 || mz[0] != 'M' || mz[1] != 'Z') { close(fd); return 0; }
+  off = (unsigned long)mz[0x3c] | ((unsigned long)mz[0x3d] << 8) | ((unsigned long)mz[0x3e] << 16) | ((unsigned long)mz[0x3f] << 24);
+  if ((long)off < 0 || lseek(fd, (off_t)off, SEEK_SET) < 0) { close(fd); return 0; }
+  got = read(fd, sig4, sizeof(sig4));
+  if (got == 4 && sig4[0] == 'P' && sig4[1] == 'E' && sig4[2] == 0 && sig4[3] == 0) { close(fd); return 1; }
+  if (lseek(fd, (off_t)off, SEEK_SET) < 0) { close(fd); return 0; }
+  got = read(fd, sig2, sizeof(sig2));
+  close(fd);
+  return got == 2 && ((sig2[0] == 'N' && sig2[1] == 'E') || (sig2[0] == 'L' && sig2[1] == 'E') || (sig2[0] == 'L' && sig2[1] == 'X'));
+}
+
+static int run_with_wine(const char *prog_filename, const char *const *args) {
+  const char *argv_child[512];
+  unsigned argc = 0;
+  int status;
+  pid_t pid;
+  argv_child[argc++] = "wine";
+  argv_child[argc++] = prog_filename;
+  if (args) {
+    while (*args && argc + 1 < (sizeof(argv_child) / sizeof(argv_child[0]))) argv_child[argc++] = *args++;
+  }
+  argv_child[argc] = NULL;
+  pid = fork();
+  if (pid < 0) {
+    perror("error: fork for wine failed");
+    return 1;
+  }
+  if (pid == 0) {
+    execvp("wine", (char * const*)argv_child);
+    perror("error: failed to execute wine");
+    _exit(127);
+  }
+  if (waitpid(pid, &status, 0) < 0) {
+    perror("error: waitpid for wine failed");
+    return 1;
+  }
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  return 1;
+}
+
+static int is_linux_native_executable(const char *path) {
+  int fd;
+  unsigned char h[4];
+  ssize_t got;
+  if (!path) return 0;
+  fd = open(path, O_RDONLY);
+  if (fd < 0) return 0;
+  got = read(fd, h, sizeof(h));
+  close(fd);
+  if (got >= 4 && h[0] == 0x7f && h[1] == 'E' && h[2] == 'L' && h[3] == 'F') return 1;
+  if (got >= 2 && h[0] == '#' && h[1] == '!') return 1;
+  return 0;
+}
+
+static int run_native_execvp(const char *prog_filename, const char *const *args) {
+  const char *argv_child[512];
+  unsigned argc = 0;
+  int status;
+  pid_t pid;
+  argv_child[argc++] = prog_filename;
+  if (args) {
+    while (*args && argc + 1 < (sizeof(argv_child) / sizeof(argv_child[0]))) argv_child[argc++] = *args++;
+  }
+  argv_child[argc] = NULL;
+  pid = fork();
+  if (pid < 0) {
+    perror("error: fork failed");
+    return 1;
+  }
+  if (pid == 0) {
+    execvp(prog_filename, (char * const*)argv_child);
+    perror("error: failed to execute native program");
+    _exit(127);
+  }
+  if (waitpid(pid, &status, 0) < 0) {
+    perror("error: waitpid failed");
+    return 1;
+  }
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  return 1;
+}
 
 /* Runs a DOS .com or .exe program in `emu'. Cannot run DOS .bat batch files.
  * Must be preceded by init_emu(emu).
@@ -2432,6 +2583,16 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   const char *stdout_write_end;
   char is_stdout_write_cursor;
   char dpmi_warned;
+  enum { XMS_HANDLE_COUNT = 64 };
+  void *xms_blocks[XMS_HANDLE_COUNT];
+  unsigned long xms_block_sizes[XMS_HANDLE_COUNT];  /* Bytes. */
+  unsigned short xms_lock_counts[XMS_HANDLE_COUNT];
+  unsigned short xms_free_kb, xms_total_kb;
+  char umb_link_state;
+  enum { EMS_HANDLE_COUNT = 64 };
+  unsigned short ems_pages_by_handle[EMS_HANDLE_COUNT];
+  unsigned short ems_page_map[4];
+  unsigned short ems_free_pages, ems_total_pages;
   enum malloc_strategy_t { MS_FIRST_FIT = 0, MS_BEST_FIT = 1, MS_LAST_FIT = 2 };
   unsigned malloc_strategy;
   char cleanup_fn[16];
@@ -2440,6 +2601,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   char find_dos_pattern[13];
   unsigned short find_attrs;
   unsigned char last_exec_return_code;
+  unsigned hlt_spin_count;
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
@@ -2461,12 +2623,21 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   stdout_write_p = NULL;  /* Pacify uninitialized warnings. */
   stdout_write_end = NULL;  /* Pacify uninitialized warnings. */
   dpmi_warned = 0;
+  memset(xms_blocks, 0, sizeof(xms_blocks));
+  memset(xms_block_sizes, 0, sizeof(xms_block_sizes));
+  memset(xms_lock_counts, 0, sizeof(xms_lock_counts));
+  xms_total_kb = xms_free_kb = 16 * 1024;  /* Minimal practical XMS pool for toolchains. */
+  umb_link_state = 0;
+  memset(ems_pages_by_handle, 0, sizeof(ems_pages_by_handle));
+  ems_page_map[0] = ems_page_map[1] = ems_page_map[2] = ems_page_map[3] = 0xffff;
+  ems_total_pages = ems_free_pages = 256;  /* 4 MiB EMS in 16 KiB pages. */
   cleanup_fn[0] = '\0';
   find_dirp = NULL;
   find_linux_dir[0] = '\0';
   find_dos_pattern[0] = '\0';
   find_attrs = 0;
   last_exec_return_code = 0;
+  hlt_spin_count = 0;
 
  do_exec:
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);
@@ -2482,6 +2653,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   { unsigned u;
     for (u = 0; u < 0x100; ++u) { ((unsigned*)mem)[u] = MAGIC_INT_VALUE(u); }
     memset((char*)mem + (INT_HLT_PARA << 4), 0xf4, 0x100);  /* 256 hlt instructions, one for each int. TODO(pts): Is hlt+iret faster? */
+    ((unsigned char*)mem)[(INT_HLT_PARA << 4) + 0x200] = 0xcd;  /* int 0x43 */
+    ((unsigned char*)mem)[(INT_HLT_PARA << 4) + 0x201] = 0x43;
+    ((unsigned char*)mem)[(INT_HLT_PARA << 4) + 0x202] = 0xcb;  /* retf */
   }
   /* !! Initialize more BIOS data area until 0x534, move magic interrupt table later.
    * https://stanislavs.org/helppc/bios_data_area.html
@@ -2643,11 +2817,16 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
     }
     if (DEBUG) dump_regs("debug", &regs, &sregs);
 
+    if (run->exit_reason != KVM_EXIT_HLT) hlt_spin_count = 0;
     switch (run->exit_reason) {
      case KVM_EXIT_IO:
       { char *p = (char*)run + run->io.data_offset;
         if (run->io.port == 0x40 && run->io.size == 1 && run->io.direction == 0) {
           *p = port_0x40_tick++;  /* Simulate some timer ticks. */
+          break;
+        } else if (!emu_params->strict_mode) {
+          if (run->io.direction == 0) memset(p, 0, run->io.size * run->io.count);  /* IN: return 0. */
+          /* OUT: ignore in permissive mode. */
           break;
         } else {
           fprintf(stderr, "fatal: IO port: port=0x%02x data=%08x size=%d direction=%s\n", run->io.port, *(const unsigned*)p, run->io.size, run->io.direction ? "out" : "in");
@@ -3729,7 +3908,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           } else if (ah == 0x58) {  /* Get/set memory allocation strategy. */
             const unsigned char al = (unsigned char)regs.rax;
             if (al == 0x00) {  /* Get. */
-              *(unsigned short*)&regs.rax = 1;  /* Best fit. */
+              *(unsigned short*)&regs.rax = (unsigned short)malloc_strategy;
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             } else if (al == 0x01) {  /* Set. */
               /* Programs compiled by Borland C++ 5.02 compiler bcc.exe set it with BX == MS_LAST_FIT, and return ``Out of memory'' if not implemented correctly. */
@@ -3738,6 +3917,22 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
               malloc_strategy = *(unsigned short*)&regs.rbx;
               if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: set malloc strategy=%u\n", malloc_strategy);
+            } else if (al == 0x02) {  /* Get UMB link state. */
+              *(unsigned short*)&regs.rax = (unsigned short)(unsigned char)umb_link_state;
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            } else if (al == 0x03) {  /* Set UMB link state. */
+              const unsigned short bx = *(unsigned short*)&regs.rbx;
+              if (bx > 1) goto error_invalid_parameter;
+              umb_link_state = (char)bx;
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            } else if (al == 0x04) {  /* Get strategy + UMB link state. */
+              *(unsigned short*)&regs.rbx = (unsigned short)(malloc_strategy | ((unsigned)(unsigned char)umb_link_state << 7));
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            } else if (al == 0x05) {  /* Set strategy + UMB link state. */
+              const unsigned short bx = *(unsigned short*)&regs.rbx;
+              malloc_strategy = bx & 0x3f;
+              umb_link_state = !!(bx & 0x80);
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             } else {
               goto error_invalid_parameter;
             }
@@ -3771,6 +3966,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                   is_args_ok = 1;
                 } else {  /* Fallback: direct CR/NUL-terminated string pointer. */
                   const char *p = args_raw;
+                  args_size = 0;
                   while (args_size < 0x7f && p[args_size] != '\0' && p[args_size] != '\r' && p[args_size] != '\n') ++args_size;
                   memcpy(args_buf, p, args_size);
                   args_buf[args_size] = '\0';
@@ -4092,10 +4288,17 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           *(unsigned short*)&regs.rax = *(const unsigned short*)((const char*)mem + 0x410);
         } else if (int_num == 0x2f) {  /* Installation checks. */
           const unsigned char al = (unsigned char)regs.rax;
+          const unsigned short ax = (unsigned short)regs.rax;
           if (al == 0x00) {  /* Installation check. */
             if (ah < 2 || ah == 0x15) goto fatal_uic;  /* Doesn't follow the standard format. */
-            /* ah == 0x43: XMS. */
-            *(unsigned char*)&regs.rax = 0;  /* Not installed, OK to install. */
+            if (ah == 0x43) {
+              *(unsigned char*)&regs.rax = 0x80;  /* XMS installed. */
+            } else {
+              *(unsigned char*)&regs.rax = 0;  /* Not installed, OK to install. */
+            }
+          } else if (ax == 0x4310) {  /* Get XMS entry point ES:BX. */
+            SET_SREG(es, INT_HLT_PARA);
+            *(unsigned short*)&regs.rbx = 0x0200;  /* Far-callable XMS stub: int 43h; retf. */
           } else if (*(unsigned short*)&regs.rax == 0x1100 || *(unsigned short*)&regs.rax == 0x111e) {  /* Redirector/network install checks. */
             *(unsigned short*)&regs.rax = 0;  /* Not installed. */
           } else if (*(unsigned short*)&regs.rax == 0x1600 || *(unsigned short*)&regs.rax == 0x160a) {  /* Windows enhanced mode / Windows version probes. */
@@ -4134,11 +4337,183 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             goto fatal_uic;
           }
         } else if (int_num == 0x67) {  /* Various. */
-          const unsigned short ax = (unsigned short)regs.rax;
-          if (ax == 0xde00) {  /* VCPI installation check. http://mirror.cs.msu.ru/oldlinux.org/Linux.old/docs/interrupts/int-html/rb-7491.htm */
+          const unsigned char al = (unsigned char)regs.rax;
+          if ((unsigned short)regs.rax == 0xde00) {  /* VCPI installation check. */
             /* Doing nothing means it's not installed. */
+          } else if (ah == 0x40) {  /* Get EMM status. */
+            ((unsigned char*)&regs.rax)[1] = 0;  /* AH=0 success. */
+          } else if (ah == 0x41) {  /* Get page frame segment. */
+            ((unsigned char*)&regs.rax)[1] = 0;  /* AH=0 success. */
+            *(unsigned short*)&regs.rbx = 0xe000;  /* Conventional EMS page frame. */
+          } else if (ah == 0x42) {  /* Get number of pages. */
+            ((unsigned char*)&regs.rax)[1] = 0;  /* AH=0 success. */
+            *(unsigned short*)&regs.rbx = ems_free_pages;
+            *(unsigned short*)&regs.rdx = ems_total_pages;
+          } else if (ah == 0x43) {  /* Allocate pages. */
+            unsigned short req = *(unsigned short*)&regs.rbx, hi;
+            if (!req || req > ems_free_pages) {
+              ((unsigned char*)&regs.rax)[1] = 0x88;  /* Insufficient pages. */
+            } else {
+              for (hi = 1; hi < EMS_HANDLE_COUNT; ++hi) if (ems_pages_by_handle[hi] == 0) break;
+              if (hi >= EMS_HANDLE_COUNT) {
+                ((unsigned char*)&regs.rax)[1] = 0x85;  /* No handles. */
+              } else {
+                ems_pages_by_handle[hi] = req;
+                ems_free_pages -= req;
+                *(unsigned short*)&regs.rdx = hi;
+                ((unsigned char*)&regs.rax)[1] = 0;
+              }
+            }
+          } else if (ah == 0x44) {  /* Map page. */
+            unsigned short logical = *(unsigned short*)&regs.rbx;
+            unsigned short phys = *(unsigned short*)&regs.rdx;
+            unsigned short handle = *(unsigned short*)&regs.rsi;
+            if (phys >= 4 || handle >= EMS_HANDLE_COUNT || ems_pages_by_handle[handle] == 0 || logical >= ems_pages_by_handle[handle]) {
+              ((unsigned char*)&regs.rax)[1] = 0x83;  /* Invalid handle/page. */
+            } else {
+              ems_page_map[phys] = logical;
+              ((unsigned char*)&regs.rax)[1] = 0;
+            }
+          } else if (ah == 0x45) {  /* Release handle. */
+            unsigned short handle = *(unsigned short*)&regs.rdx;
+            if (handle == 0 || handle >= EMS_HANDLE_COUNT || ems_pages_by_handle[handle] == 0) {
+              ((unsigned char*)&regs.rax)[1] = 0x83;
+            } else {
+              ems_free_pages += ems_pages_by_handle[handle];
+              ems_pages_by_handle[handle] = 0;
+              ((unsigned char*)&regs.rax)[1] = 0;
+            }
+          } else if (ah == 0x46) {  /* Get EMM version. */
+            ((unsigned char*)&regs.rax)[1] = 0;  /* AH=0 success. */
+            ((unsigned char*)&regs.rax)[0] = 0x40;  /* AL=4.0 */
+          } else if (ah == 0x4b) {  /* Get number of handles/pages. */
+            unsigned short used_handles = 0, h;
+            for (h = 1; h < EMS_HANDLE_COUNT; ++h) if (ems_pages_by_handle[h]) ++used_handles;
+            ((unsigned char*)&regs.rax)[1] = 0;
+            *(unsigned short*)&regs.rbx = EMS_HANDLE_COUNT - 1 - used_handles;  /* free handles */
+            *(unsigned short*)&regs.rcx = ems_total_pages - ems_free_pages;  /* allocated pages */
+            *(unsigned short*)&regs.rdx = ems_total_pages;
+          } else if (ah == 0x4c) {  /* Get pages for one handle. */
+            unsigned short handle = *(unsigned short*)&regs.rdx;
+            if (handle == 0 || handle >= EMS_HANDLE_COUNT || ems_pages_by_handle[handle] == 0) {
+              ((unsigned char*)&regs.rax)[1] = 0x83;
+            } else {
+              ((unsigned char*)&regs.rax)[1] = 0;
+              *(unsigned short*)&regs.rbx = ems_pages_by_handle[handle];
+            }
+          } else if (ah == 0x58 && al == 0x00) {  /* Allocate standard pages / trivial success for probes. */
+            ((unsigned char*)&regs.rax)[1] = 0;
           } else {
             goto fatal_uic;
+          }
+        } else if (int_num == 0x43) {  /* XMS entry point pseudo interrupt (from INT 2F AX=4310 ES:BX). */
+          if (ah == 0x00) {  /* Get XMS version. */
+            *(unsigned short*)&regs.rax = 1;
+            *(unsigned short*)&regs.rbx = 0x0300;  /* XMS version 3.00. */
+            *(unsigned short*)&regs.rdx = 0;  /* No HMA handle. */
+          } else if (ah == 0x08) {  /* Query free extended memory. */
+            *(unsigned short*)&regs.rax = 1;
+            *(unsigned short*)&regs.rdx = xms_free_kb;  /* Largest free block in KiB. */
+            *(unsigned short*)&regs.rbx = xms_total_kb;  /* Total free in KiB. */
+          } else if (ah == 0x09) {  /* Allocate EMB. */
+            unsigned short kb = *(unsigned short*)&regs.rdx, hi;
+            unsigned long bytes = (unsigned long)kb << 10;
+            if (!kb || kb > xms_free_kb) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xa0;  /* Out of space. */
+            } else {
+              for (hi = 1; hi < XMS_HANDLE_COUNT; ++hi) if (xms_blocks[hi] == NULL) break;
+              if (hi >= XMS_HANDLE_COUNT || !(xms_blocks[hi] = malloc(bytes))) {
+                *(unsigned short*)&regs.rax = 0;
+                *(unsigned char*)&regs.rbx = 0xa1;  /* No handles / alloc failure. */
+              } else {
+                memset(xms_blocks[hi], 0, bytes);
+                xms_block_sizes[hi] = bytes;
+                xms_lock_counts[hi] = 0;
+                xms_free_kb -= kb;
+                *(unsigned short*)&regs.rdx = hi;
+                *(unsigned short*)&regs.rax = 1;
+                *(unsigned char*)&regs.rbx = 0;
+              }
+            }
+          } else if (ah == 0x0a) {  /* Free EMB. */
+            unsigned short hi = *(unsigned short*)&regs.rdx;
+            if (hi == 0 || hi >= XMS_HANDLE_COUNT || xms_blocks[hi] == NULL) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xa2;  /* Invalid handle. */
+            } else {
+              free(xms_blocks[hi]);
+              xms_free_kb += (unsigned short)(xms_block_sizes[hi] >> 10);
+              xms_blocks[hi] = NULL;
+              xms_block_sizes[hi] = 0;
+              xms_lock_counts[hi] = 0;
+              *(unsigned short*)&regs.rax = 1;
+              *(unsigned char*)&regs.rbx = 0;
+            }
+          } else if (ah == 0x0b) {  /* Move EMB. */
+            const char *m = (const char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rsi);
+            unsigned long len = *(const unsigned long*)(const void*)(m + 0);
+            unsigned short sh = *(const unsigned short*)(const void*)(m + 4);
+            unsigned long so = *(const unsigned long*)(const void*)(m + 6);
+            unsigned short dh = *(const unsigned short*)(const void*)(m + 10);
+            unsigned long doff = *(const unsigned long*)(const void*)(m + 12);
+            char *sp, *dp;
+            if (len == 0) {
+              *(unsigned short*)&regs.rax = 1;
+              *(unsigned char*)&regs.rbx = 0;
+              goto done_int_call;
+            }
+            if (sh == 0) sp = (char*)mem + so;
+            else if (sh < XMS_HANDLE_COUNT && xms_blocks[sh] && so + len <= xms_block_sizes[sh]) sp = (char*)xms_blocks[sh] + so;
+            else sp = NULL;
+            if (dh == 0) dp = (char*)mem + doff;
+            else if (dh < XMS_HANDLE_COUNT && xms_blocks[dh] && doff + len <= xms_block_sizes[dh]) dp = (char*)xms_blocks[dh] + doff;
+            else dp = NULL;
+            if (!sp || !dp || sp < (char*)mem || dp < (char*)mem || (sh == 0 && so + len > DOS_MEM_LIMIT) || (dh == 0 && doff + len > DOS_MEM_LIMIT)) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xa3;  /* Invalid source/dest. */
+            } else {
+              memmove(dp, sp, (size_t)len);
+              *(unsigned short*)&regs.rax = 1;
+              *(unsigned char*)&regs.rbx = 0;
+            }
+          } else if (ah == 0x0c) {  /* Lock EMB. */
+            unsigned short hi = *(unsigned short*)&regs.rdx;
+            if (hi == 0 || hi >= XMS_HANDLE_COUNT || xms_blocks[hi] == NULL) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xa2;
+            } else {
+              unsigned long addr = (unsigned long)(size_t)xms_blocks[hi];
+              if (xms_lock_counts[hi] != 0xffff) ++xms_lock_counts[hi];
+              *(unsigned short*)&regs.rbx = (unsigned short)addr;
+              *(unsigned short*)&regs.rdx = (unsigned short)(addr >> 16);
+              *(unsigned short*)&regs.rax = 1;
+            }
+          } else if (ah == 0x0d) {  /* Unlock EMB. */
+            unsigned short hi = *(unsigned short*)&regs.rdx;
+            if (hi == 0 || hi >= XMS_HANDLE_COUNT || xms_blocks[hi] == NULL || xms_lock_counts[hi] == 0) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xaa;  /* Not locked. */
+            } else {
+              --xms_lock_counts[hi];
+              *(unsigned short*)&regs.rax = 1;
+              *(unsigned char*)&regs.rbx = 0;
+            }
+          } else if (ah == 0x0e) {  /* Get EMB handle information. */
+            unsigned short hi = *(unsigned short*)&regs.rdx, free_handles = 0, i;
+            if (hi == 0 || hi >= XMS_HANDLE_COUNT || xms_blocks[hi] == NULL) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xa2;
+            } else {
+              for (i = 1; i < XMS_HANDLE_COUNT; ++i) if (xms_blocks[i] == NULL) ++free_handles;
+              *(unsigned short*)&regs.rax = 1;
+              ((unsigned char*)&regs.rbx)[1] = (unsigned char)xms_lock_counts[hi];  /* BH lock count. */
+              *(unsigned short*)&regs.rdx = (unsigned short)(xms_block_sizes[hi] >> 10);  /* Size in KiB. */
+              *(unsigned char*)&regs.rbx = free_handles > 255 ? 255 : (unsigned char)free_handles;  /* BL free handles. */
+            }
+          } else {
+            *(unsigned short*)&regs.rax = 0;
+            *(unsigned char*)&regs.rbx = 0x80;  /* Function not implemented. */
           }
         } else if (int_num == 0x0d) {  /* General protection fault. */
           /* Allow DOS extender probes to fail softly. */
@@ -4177,14 +4552,25 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             fprintf(stderr, "error: error opening --hlt-dump=... file for writing: %s\n", emu_params->hlt_dump_filename);
           }
         }
-        if (emu_params->is_hlt_ok && sregs.cs.selector >= PSP_PARA && (*(unsigned short*)&regs.rflags & (1 << 9))) {  /* IF == 1. */
+        if (sregs.cs.selector >= PSP_PARA && (emu_params->is_hlt_ok || !emu_params->strict_mode)) {
           /* The 8253 timer chip increments the counter in each 1 / 1193182s
            * causing IRQ0 at each 65536th increment. kvikdos doesn't implement
            * any of this, but now we wait that approximate amount for `hlt' to
            * wake up.
            */
-          /* This is not precise enough: poll(&pollfd0, 0, 55);. */
-          usleep(54925);  /* 54925 =~= 1000000.0 / (1193182.0 / 65536). */
+          if (*(unsigned short*)&regs.rflags & (1 << 9)) {  /* IF == 1. */
+            if (++hlt_spin_count >= 400) {
+              fprintf(stderr, "error: guest stalled in HLT loop, aborting in permissive mode.\n");
+              return 1;
+            }
+            usleep(54925);  /* 54925 =~= 1000000.0 / (1193182.0 / 65536). */
+          } else {
+            if (++hlt_spin_count >= 2000) {
+              fprintf(stderr, "error: guest stalled in HLT loop (IF=0), aborting in permissive mode.\n");
+              return 1;
+            }
+            usleep(1000);  /* Prevent busy loop if guest issues tight hlt with IF=0. */
+          }
           break;
         } else {
           fprintf(stderr, "fatal: unexpected hlt\n");
@@ -4209,6 +4595,12 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           /* Microsoft BASIC Professional Development System 7.10 linker pblink.exe. It overwrites length and program name with program name and args. */
           /* This emulation is a little bit slow (because of the ioctl(... KVM_RUN ...) overhead), but it's called only less than 75 times at startup. */
           memcpy((char*)mem + addr, run->mmio.data, mmio_len);
+        } else if (addr - 0xf0000U < 0x10000U) {  /* BIOS ROM area probes (F000:0000..FFFF:FFFF). */
+          if (run->mmio.is_write) {
+            /* Ignore writes to ROM area. */
+          } else {
+            memset(run->mmio.data, 0xff, mmio_len);  /* Typical ROM default value for unmodeled bytes. */
+          }
         } else if (addr == 0xffffe && !run->mmio.is_write && mmio_len == 1) {  /* BASIC programs compiled by Microsoft BASIC Professional Development System 7.10 compiler pbc.exe */
           run->mmio.data[0] = 0xfc;  /* Machine ID is regular OC (0xfc). Same as default in src/ints/bios.cpp in DOSBox 0.74. */
         } else if (addr - 0xffff5U < 8U && !run->mmio.is_write && mmio_len == 1) {  /* JWasm 2.11a jwasmr.exe */
@@ -4248,6 +4640,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         } else {
           highmsg[0] = '\0';
          bad_memory_access:
+          if (!emu_params->strict_mode) {
+            if (!run->mmio.is_write) memset(run->mmio.data, 0, mmio_len);
+            break;
+          }
           fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x%s value=%08x%08x size=%d is_write=%d\n", addr, highmsg, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], mmio_len, run->mmio.is_write);
           goto fatal;
         }
@@ -5422,6 +5818,13 @@ int main(int argc, char **argv) {
   if (cmd_args.dpmi_prog) {  /* pts-fast-dosbox does support it, kvikdos doesn't. */
     fprintf(stderr, "fatal: DPMI not supported: %s\n", cmd_args.dpmi_prog);
     exit(1);
+  }
+  if (is_linux_native_executable(cmd_args.prog_filename)) {
+    return run_native_execvp(cmd_args.prog_filename, cmd_args.args);
+  }
+  if (is_windows_host_executable(cmd_args.prog_filename)) {
+    fprintf(stderr, "info: detected Windows executable (PE/NE/LE/LX), delegating to wine: %s\n", cmd_args.prog_filename);
+    return run_with_wine(cmd_args.prog_filename, cmd_args.args);
   }
   { int exit_code;
     const char *ext = get_linux_ext(cmd_args.prog_filename);
