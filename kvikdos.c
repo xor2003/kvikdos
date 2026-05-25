@@ -264,7 +264,7 @@ static char *get_linux_filename_r(const char *p, const DirState *dir_state, char
   if (!dir_state) {  /* Convert to relative Linux pathname. */
     in_linux = NULL;
     in_dos[1] = p;
-  } else if (dir_state->dos_prog_abs && strcmp(p, dir_state->dos_prog_abs) == 0 &&
+  } else if (dir_state->linux_prog && dir_state->dos_prog_abs && strcmp(p, dir_state->dos_prog_abs) == 0 &&
              (linux_prog_base = ((slashp = strrchr(dir_state->linux_prog, '/')) != NULL ? slashp + 1 : dir_state->linux_prog)) != NULL &&
              strchr(linux_prog_base, '.') != NULL) {
     in_linux = dir_state->linux_prog;
