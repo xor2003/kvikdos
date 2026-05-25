@@ -2509,6 +2509,54 @@ static int is_probable_borland_dual_mode_ne(const char *path) {
          (file_contains_text(path, "TLINK") || file_contains_text(path, "RTM"));
 }
 
+/* Heuristic: tiny DOS stubs in Windows NE/LE/LX binaries often only print
+ * "This program requires ..." and exit. Real dual-mode DOS tools (e.g. some
+ * linkers) have substantial DOS code and should not be delegated to Wine.
+ */
+static int is_probable_windows_message_stub(const char *path) {
+  int fd;
+  unsigned char h[64];
+  unsigned char *buf = NULL;
+  size_t stub_size, max_scan;
+  ssize_t got;
+  int is_stub = 0;
+  unsigned long e_lfanew, e_cparhdr;
+
+  fd = open(path, O_RDONLY);
+  if (fd < 0) return 0;
+  got = read(fd, h, sizeof(h));
+  if (got < (ssize_t)sizeof(h) || h[0] != 'M' || h[1] != 'Z') goto done;
+
+  e_lfanew = (unsigned long)h[0x3c] | ((unsigned long)h[0x3d] << 8) |
+             ((unsigned long)h[0x3e] << 16) | ((unsigned long)h[0x3f] << 24);
+  e_cparhdr = (unsigned long)h[0x08] | ((unsigned long)h[0x09] << 8);
+  if (e_lfanew < 0x40) goto done;
+  if (e_lfanew <= (e_cparhdr << 4)) goto done;
+  stub_size = (size_t)(e_lfanew - (e_cparhdr << 4));
+  if (stub_size == 0) goto done;
+
+  /* Most message stubs are tiny; anything larger is likely meaningful DOS. */
+  if (stub_size > 1024) goto done;
+
+  max_scan = stub_size > 4096 ? 4096 : stub_size;
+  buf = (unsigned char*)malloc(max_scan);
+  if (!buf) goto done;
+  if (lseek(fd, (off_t)(e_cparhdr << 4), SEEK_SET) < 0) goto done;
+  got = read(fd, buf, max_scan);
+  if (got <= 0) goto done;
+
+  if (memmem(buf, (size_t)got, "This program", 12) ||
+      memmem(buf, (size_t)got, "requires Microsoft", 18) ||
+      memmem(buf, (size_t)got, "cannot be run in DOS mode", 25)) {
+    is_stub = 1;
+  }
+
+ done:
+  if (buf) free(buf);
+  close(fd);
+  return is_stub;
+}
+
 static int run_with_wine(const char *prog_filename, const char *const *args) {
   const char *argv_child[512];
   unsigned argc = 0;
@@ -5882,8 +5930,10 @@ int main(int argc, char **argv) {
   }
   {
     const enum mz_subformat_t subfmt = detect_mz_subformat(cmd_args.prog_filename);
-    if (subfmt == MZ_SUBFMT_PE || ((subfmt == MZ_SUBFMT_NE || subfmt == MZ_SUBFMT_LE || subfmt == MZ_SUBFMT_LX) &&
-                                   !is_probable_borland_dual_mode_ne(cmd_args.prog_filename))) {
+    if (subfmt == MZ_SUBFMT_PE ||
+        ((subfmt == MZ_SUBFMT_NE || subfmt == MZ_SUBFMT_LE || subfmt == MZ_SUBFMT_LX) &&
+         !is_probable_borland_dual_mode_ne(cmd_args.prog_filename) &&
+         is_probable_windows_message_stub(cmd_args.prog_filename))) {
     if (!has_wine_in_path()) {
         fprintf(stderr, "error: detected Windows executable, but 'wine' is not in PATH: %s\n", cmd_args.prog_filename);
       return 1;
