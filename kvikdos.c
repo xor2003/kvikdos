@@ -5755,7 +5755,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
         const char* const *envp;
         char prog_drive;
         size_t size;
-        for (; (c2 = *args_str) != '\0' && c2 != ' ' && c2 != '\t' && c2 != '=' && c2 != ',' && c2 != '/'; ++args_str) {}  /* MS-DOS 6.22. */
+        for (; (c2 = *args_str) != '\0' && c2 != ' ' && c2 != '\t' && c2 != '=' && c2 != ','; ++args_str) {}  /* MS-DOS 6.22. */
         if (args_str == p_line) {
           fprintf(stderr, "Empty DOS program name to run\r\n");
           exit_code = 1;
