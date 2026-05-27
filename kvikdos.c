@@ -134,6 +134,104 @@ static char is_same_ascii_nocase(const char *a, const char *b, unsigned size) {
   return 1;
 }
 
+
+/* Resolve pathname components case-insensitively.
+ * If keep_last_case is nonzero, the last component is kept as-is (useful for O_CREAT).
+ * Returns 1 on success and writes out_path, 0 on failure.
+ */
+static int resolve_case_fallback_path(const char *in_path, char *out_path, size_t out_size, int keep_last_case) {
+  const int is_abs = in_path[0] == '/';
+  const char *p = in_path + is_abs;
+  char comp[256];
+  if (!in_path[0] || out_size < 2) return 0;
+  out_path[0] = is_abs ? '/' : '\0';
+  out_path[is_abs ? 1 : 0] = '\0';
+  while (*p) {
+    const char *q, *r;
+    size_t clen, olen;
+    int is_last;
+    DIR *dd;
+    struct dirent *de;
+    char picked[256];
+    int found = 0;
+    const char *scan_dir;
+    while (*p == '/') ++p;
+    if (!*p) break;
+    q = p;
+    while (*q && *q != '/') ++q;
+    clen = (size_t)(q - p);
+    if (clen == 0 || clen >= sizeof(comp)) return 0;
+    memcpy(comp, p, clen);
+    comp[clen] = '\0';
+    r = q;
+    while (*r == '/') ++r;
+    is_last = *r == '\0';
+    if (!(keep_last_case && is_last)) {
+      scan_dir = out_path[0] ? out_path : ".";
+      dd = opendir(scan_dir);
+      if (!dd) return 0;
+      while ((de = readdir(dd)) != NULL) {
+        size_t dlen = strlen(de->d_name);
+        if (dlen == clen && is_same_ascii_nocase(de->d_name, comp, (unsigned)clen)) {
+          memcpy(picked, de->d_name, dlen + 1);
+          found = 1;
+          break;
+        }
+      }
+      closedir(dd);
+      if (!found) return 0;
+    } else {
+      memcpy(picked, comp, clen + 1);
+    }
+    olen = strlen(out_path);
+    if (olen && out_path[olen - 1] != '/') {
+      if (olen + 1 >= out_size) return 0;
+      out_path[olen++] = '/';
+      out_path[olen] = '\0';
+    }
+    if (olen + strlen(picked) >= out_size) return 0;
+    strcpy(out_path + olen, picked);
+    p = q;
+  }
+  return out_path[0] != '\0';
+}
+
+static int open_with_case_fallback(const char *linux_filename, int flags, mode_t mode) {
+  char resolved[1024];
+  int fd = open(linux_filename, flags, mode);
+  if (fd >= 0) return fd;
+  if (errno == ENOENT && g_case_fallback_mode == 2 && linux_filename[0] &&
+      resolve_case_fallback_path(linux_filename, resolved, sizeof(resolved), (flags & O_CREAT) != 0)) {
+    fd = open(resolved, flags, mode);
+  }
+  return fd;
+}
+
+static int stat_with_case_fallback(const char *linux_filename, struct stat *st, int keep_last_case) {
+  char resolved[1024];
+  if (stat(linux_filename, st) == 0) return 0;
+  if (errno == ENOENT && g_case_fallback_mode == 2 && linux_filename[0] &&
+      resolve_case_fallback_path(linux_filename, resolved, sizeof(resolved), keep_last_case)) {
+    return stat(resolved, st);
+  }
+  return -1;
+}
+
+static DIR *opendir_with_case_fallback(const char *linux_dir, char *resolved_out, size_t resolved_out_size) {
+  if (resolved_out_size) resolved_out[0] = '\0';
+  DIR *dd = opendir(linux_dir);
+  if (dd) {
+    if (resolved_out_size) {
+      strncpy(resolved_out, linux_dir, resolved_out_size - 1);
+      resolved_out[resolved_out_size - 1] = '\0';
+    }
+    return dd;
+  }
+  if (errno != ENOENT || g_case_fallback_mode != 2 || !linux_dir[0]) return NULL;
+  if (!resolve_case_fallback_path(linux_dir, resolved_out, resolved_out_size, 0)) return NULL;
+  return opendir(resolved_out);
+}
+
 /* Example name_prefix: "PATH=". */
 static const char *getenv_prefix(const char *name_prefix, const char **env, const char **env_end) {
   const size_t name_prefix_size = strlen(name_prefix);
@@ -2399,7 +2497,7 @@ static int open_dos_file(const char *dos_filename, const char *dos_prog_abs, int
     }
     goto after_open;
   }
-  if ((fd = open(linux_filename, flags, 0644)) < 0) {
+  if ((fd = open_with_case_fallback(linux_filename, flags, 0644)) < 0) {
     if (flags3 == O_RDONLY && dos_prog_abs && dos_prog_abs[0] &&
         strchr(dos_filename, ':') == NULL && strchr(dos_filename, '\\') == NULL && strchr(dos_filename, '/') == NULL) {
       /* Fallback: resolve bare filename in program directory as well.
@@ -2411,40 +2509,12 @@ static int open_dos_file(const char *dos_filename, const char *dos_prog_abs, int
       for (; base != dos_prog_abs + 3 && base[-1] != '\\' && base[-1] != '/'; --base) {}
       dir_size = (size_t)(base - dos_prog_abs);
       if (dir_size > 3 && dir_size + strlen(dos_filename) + 1 < sizeof(ovl_dos)) {
-        struct stat st;
-        char *s, *base2;
         memcpy(ovl_dos, dos_prog_abs, dir_size);
         strcpy(ovl_dos + dir_size, dos_filename);
         dir_state->dos_prog_abs = dos_prog_abs;
         linux_filename = get_linux_filename_r(ovl_dos, dir_state, fnbuf2, &linux_lastc);
         dir_state->dos_prog_abs = NULL;
-        if ((fd = open(linux_filename, flags, 0644)) >= 0) goto after_open;
-        if (g_case_fallback_mode != 0) {
-          strcpy(fnbuf, linux_filename);
-          for (s = fnbuf, base2 = fnbuf; *s; ++s) if (*s == '/') base2 = s + 1;
-          for (s = base2; *s; ++s) if ((unsigned char)(*s - 'a') <= 'z' - 'a') *s &= ~32;
-          if (stat(fnbuf, &st) == 0 && S_ISREG(st.st_mode) && (fd = open(fnbuf, flags, 0644)) >= 0) goto after_open;
-          strcpy(fnbuf, linux_filename);
-          for (s = fnbuf, base2 = fnbuf; *s; ++s) if (*s == '/') base2 = s + 1;
-          for (s = base2; *s; ++s) if ((unsigned char)(*s - 'A') <= 'Z' - 'A') *s |= 32;
-          if (stat(fnbuf, &st) == 0 && S_ISREG(st.st_mode) && (fd = open(fnbuf, flags, 0644)) >= 0) goto after_open;
-        }
-      }
-    }
-    if (g_case_fallback_mode != 0) {
-      struct stat st;
-      char *s, *base = fnbuf2;
-      strcpy(fnbuf2, linux_filename);
-      for (s = fnbuf2; *s; ++s) if (*s == '/') base = s + 1;
-      for (s = base; *s; ++s) if ((unsigned char)(*s - 'a') <= 'z' - 'a') *s &= ~32;
-      if (stat(fnbuf2, &st) == 0 && ((flags & O_CREAT) || S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))) {
-        if ((fd = open(fnbuf2, flags, 0644)) >= 0) goto after_open;
-      }
-      strcpy(fnbuf2, linux_filename);
-      for (s = fnbuf2, base = fnbuf2; *s; ++s) if (*s == '/') base = s + 1;
-      for (s = base; *s; ++s) if ((unsigned char)(*s - 'A') <= 'Z' - 'A') *s |= 32;
-      if (stat(fnbuf2, &st) == 0 && ((flags & O_CREAT) || S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))) {
-        if ((fd = open(fnbuf2, flags, 0644)) >= 0) goto after_open;
+        if ((fd = open_with_case_fallback(linux_filename, flags, 0644)) >= 0) goto after_open;
       }
     }
     return -1;
@@ -3170,20 +3240,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               }
               goto after_open;
             }
-            if ((fd = open(linux_filename, flags, 0644)) < 0) {
-              if (errno == ENOENT && g_case_fallback_mode == 2 && linux_filename[0]) {
-                char *s, *base;
-                strcpy(fnbuf2, linux_filename);
-                for (s = fnbuf2, base = fnbuf2; *s; ++s) if (*s == '/') base = s + 1;
-                for (s = base; *s; ++s) if ((unsigned char)(*s - 'a') <= 'z' - 'a') *s &= ~32;
-                fd = open(fnbuf2, flags, 0644);
-                if (fd < 0 && errno == ENOENT) {
-                  strcpy(fnbuf2, linux_filename);
-                  for (s = fnbuf2, base = fnbuf2; *s; ++s) if (*s == '/') base = s + 1;
-                  for (s = base; *s; ++s) if ((unsigned char)(*s - 'A') <= 'Z' - 'A') *s |= 32;
-                  fd = open(fnbuf2, flags, 0644);
-                }
-              }
+            if ((fd = open_with_case_fallback(linux_filename, flags, 0644)) < 0) {
               if (fd < 0) { error_from_linux:
               *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x1f);  /* By default: General failure. */
               goto error_on_21;
@@ -3217,6 +3274,12 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             dir_state->dos_prog_abs = NULL;
             if (is_same_ascii_nocase(linux_lastc, "nul", 3) && (linux_lastc[3] == '.' || linux_lastc[3] == '\0')) strcpy(fnbuf, "/dev/null");
             exists = stat(linux_filename, &st) == 0;
+            if (!exists && errno == ENOENT && g_case_fallback_mode == 2 && linux_filename[0] &&
+                resolve_case_fallback_path(linux_filename, fnbuf2, sizeof(fnbuf2), 0) &&
+                stat(fnbuf2, &st) == 0) {
+              linux_filename = fnbuf2;
+              exists = 1;
+            }
             if (action == 2) {  /* Create new, fail if exists. */
               if (exists) { *(unsigned short*)&regs.rax = 0x50; goto error_on_21; }  /* File exists. */
               flags |= O_CREAT | O_EXCL;
@@ -3231,7 +3294,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               if (!exists) { *(unsigned short*)&regs.rax = 2; goto error_on_21; }
               action_taken = 1;
             }
-            fd = open(linux_filename, flags, 0644);
+            fd = open_with_case_fallback(linux_filename, flags, 0644);
             if (fd < 0) goto error_from_linux;
             if (fd < 5) fd = ensure_fd_is_at_least(fd, 5);
             fd = map_fd_open(fd);
@@ -5056,7 +5119,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           dup2(pipe_fd, 1);
         }
         if (has_redir_in) {
-          if (*get_linux_filename_r(redir_in, dir_state, fnbuf, NULL) == '\0' || (fd = open(fnbuf, O_RDONLY)) < 0) {
+          if (*get_linux_filename_r(redir_in, dir_state, fnbuf, NULL) == '\0' || (fd = open_with_case_fallback(fnbuf, O_RDONLY, 0666)) < 0) {
             fprintf(stderr, "File not found - %s\r\n", redir_in);
             exit_code = 1;
             goto done_command;
@@ -5067,7 +5130,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
         }
         if (has_redir_out) {
           int flags = O_WRONLY | O_CREAT | (append_out ? O_APPEND : O_TRUNC);
-          if (*get_linux_filename_r(redir_out, dir_state, fnbuf, NULL) == '\0' || (fd = open(fnbuf, flags, 0666)) < 0) {
+          if (*get_linux_filename_r(redir_out, dir_state, fnbuf, NULL) == '\0' || (fd = open_with_case_fallback(fnbuf, flags, 0666)) < 0) {
             fprintf(stderr, "Access denied - %s\r\n", redir_out);
             exit_code = 1;
             goto done_command;
@@ -5078,7 +5141,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
         }
         if (has_redir_err) {
           int flags = O_WRONLY | O_CREAT | (append_err ? O_APPEND : O_TRUNC);
-          if (*get_linux_filename_r(redir_err, dir_state, fnbuf, NULL) == '\0' || (fd = open(fnbuf, flags, 0666)) < 0) {
+          if (*get_linux_filename_r(redir_err, dir_state, fnbuf, NULL) == '\0' || (fd = open_with_case_fallback(fnbuf, flags, 0666)) < 0) {
             fprintf(stderr, "Access denied - %s\r\n", redir_err);
             exit_code = 1;
             goto done_command;
@@ -5416,15 +5479,18 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
               const char *pat_base = get_dos_basename(a);
               size_t pat_dir_size = pat_base - a;
               char dos_dir[DOS_PATH_SIZE + 4], linux_dir[LINUX_PATH_SIZE];
+              const char *scan_dir;
               DIR *dd;
               struct dirent *de;
               if (pat_dir_size >= sizeof(dos_dir)) pat_dir_size = sizeof(dos_dir) - 1;
               memcpy(dos_dir, a, pat_dir_size);
               dos_dir[pat_dir_size] = '\0';
               if (dos_dir[0] == '\0') strcpy(dos_dir, ".");
-              if (*get_linux_filename_r(dos_dir, dir_state, linux_dir, NULL) == '\0' || !(dd = opendir(linux_dir))) {
+              scan_dir = linux_dir;
+              if (*get_linux_filename_r(dos_dir, dir_state, linux_dir, NULL) == '\0' || !(dd = opendir_with_case_fallback(linux_dir, fnbuf2, sizeof(fnbuf2)))) {
                 exit_code = 1;
               } else {
+                if (fnbuf2[0] != '\0') scan_dir = fnbuf2;
                 int removed = 0;
                 while ((de = readdir(dd)) != NULL) {
                   char full[LINUX_PATH_SIZE];
@@ -5433,9 +5499,9 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
                   size_t dlen;
                   if (nm[0] == '.') continue;
                   if (!dos_wildcard_match(pat_base, nm)) continue;
-                  dlen = strlen(linux_dir);
+                  dlen = strlen(scan_dir);
                   if (dlen + 1 + strlen(nm) + 1 >= sizeof(full)) continue;
-                  memcpy(full, linux_dir, dlen);
+                  memcpy(full, scan_dir, dlen);
                   if (dlen && full[dlen - 1] != '/') full[dlen++] = '/';
                   strcpy(full + dlen, nm);
                   if (stat(full, &st) == 0 && S_ISREG(st.st_mode) && unlink(full) == 0) removed = 1;
@@ -5484,31 +5550,33 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
             memcpy(dos_dir, a, pat_dir_size);
             dos_dir[pat_dir_size] = '\0';
             if (dos_dir[0] == '\0') strcpy(dos_dir, ".");
-            if (*get_linux_filename_r(dos_dir, dir_state, linux_src_dir, NULL) == '\0' ||
+              const char *src_scan_dir = linux_src_dir;
+              if (*get_linux_filename_r(dos_dir, dir_state, linux_src_dir, NULL) == '\0' ||
                 *get_linux_filename_r(b, dir_state, fnbuf2, NULL) == '\0' ||
-                stat(fnbuf2, &dst_st) != 0 || !S_ISDIR(dst_st.st_mode) ||
-                (dd = opendir(linux_src_dir)) == NULL) {
-              exit_code = 1;
-            } else {
-              while ((de = readdir(dd)) != NULL) {
+                stat_with_case_fallback(fnbuf2, &dst_st, 0) != 0 || !S_ISDIR(dst_st.st_mode) ||
+                (dd = opendir_with_case_fallback(linux_src_dir, exec_fnbuf, sizeof(exec_fnbuf))) == NULL) {
+                exit_code = 1;
+              } else {
+                if (exec_fnbuf[0] != '\0') src_scan_dir = exec_fnbuf;
+                while ((de = readdir(dd)) != NULL) {
                 char src_full[LINUX_PATH_SIZE], dst_full[LINUX_PATH_SIZE];
                 const char *nm = de->d_name;
                 struct stat st;
                 size_t sdl, ddl;
                 if (nm[0] == '.') continue;
                 if (!dos_wildcard_match(pat_base, nm)) continue;
-                sdl = strlen(linux_src_dir);
+                sdl = strlen(src_scan_dir);
                 ddl = strlen(fnbuf2);
                 if (sdl + 1 + strlen(nm) + 1 >= sizeof(src_full) || ddl + 1 + strlen(nm) + 1 >= sizeof(dst_full)) continue;
-                memcpy(src_full, linux_src_dir, sdl);
+                memcpy(src_full, src_scan_dir, sdl);
                 if (sdl && src_full[sdl - 1] != '/') src_full[sdl++] = '/';
                 strcpy(src_full + sdl, nm);
-                if (stat(src_full, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+                if (stat_with_case_fallback(src_full, &st, 0) != 0 || !S_ISREG(st.st_mode)) continue;
                 memcpy(dst_full, fnbuf2, ddl);
                 if (ddl && dst_full[ddl - 1] != '/') dst_full[ddl++] = '/';
                 strcpy(dst_full + ddl, nm);
-                fd1 = open(src_full, O_RDONLY);
-                fd2 = open(dst_full, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                fd1 = open_with_case_fallback(src_full, O_RDONLY, 0666);
+                fd2 = open_with_case_fallback(dst_full, O_WRONLY | O_CREAT | O_TRUNC, 0666);
                 if (fd1 < 0 || fd2 < 0) {
                   if (fd1 >= 0) close(fd1);
                   if (fd2 >= 0) close(fd2);
@@ -5533,7 +5601,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
             }
           } else if (*get_linux_filename_r(a, dir_state, fnbuf, NULL) == '\0' || *get_linux_filename_r(b, dir_state, fnbuf2, NULL) == '\0') {
             exit_code = 1;
-          } else if ((fd1 = open(fnbuf, O_RDONLY)) < 0 || (fd2 = open(fnbuf2, O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0) {
+          } else if ((fd1 = open_with_case_fallback(fnbuf, O_RDONLY, 0666)) < 0 || (fd2 = open_with_case_fallback(fnbuf2, O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0) {
             if (fd1 >= 0) close(fd1);
             if (fd2 >= 0) close(fd2);
             exit_code = 1;
@@ -5570,6 +5638,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           const char *pat_base = get_dos_basename(arg);
           size_t pat_dir_size = pat_base - arg;
           char dos_dir[DOS_PATH_SIZE + 4], linux_dir[LINUX_PATH_SIZE];
+          const char *scan_dir;
           DIR *dd = NULL;
           struct dirent *de;
           int any = 0;
@@ -5577,10 +5646,12 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           memcpy(dos_dir, arg, pat_dir_size);
           dos_dir[pat_dir_size] = '\0';
           if (dos_dir[0] == '\0') strcpy(dos_dir, ".");
-          if (*get_linux_filename_r(dos_dir, dir_state, linux_dir, NULL) == '\0' || (dd = opendir(linux_dir)) == NULL) {
+          scan_dir = linux_dir;
+          if (*get_linux_filename_r(dos_dir, dir_state, linux_dir, NULL) == '\0' || (dd = opendir_with_case_fallback(linux_dir, fnbuf2, sizeof(fnbuf2))) == NULL) {
             fprintf(stderr, "File not found - %s\r\n", arg);
             exit_code = 1;
           } else {
+            if (fnbuf2[0] != '\0') scan_dir = fnbuf2;
             exit_code = 0;
             while ((de = readdir(dd)) != NULL) {
               char full[LINUX_PATH_SIZE];
@@ -5590,13 +5661,13 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
               char fbuf[4096], *ep;
               if (de->d_name[0] == '.') continue;
               if (!dos_wildcard_match(pat_base, de->d_name)) continue;
-              dlen = strlen(linux_dir);
+              dlen = strlen(scan_dir);
               if (dlen + 1 + strlen(de->d_name) + 1 >= sizeof(full)) continue;
-              memcpy(full, linux_dir, dlen);
+              memcpy(full, scan_dir, dlen);
               if (dlen && full[dlen - 1] != '/') full[dlen++] = '/';
               strcpy(full + dlen, de->d_name);
-              if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) continue;
-              fd = open(full, O_RDONLY);
+              if (stat_with_case_fallback(full, &st, 0) != 0 || !S_ISREG(st.st_mode)) continue;
+              fd = open_with_case_fallback(full, O_RDONLY, 0666);
               if (fd < 0) { exit_code = 1; continue; }
               any = 1;
               while ((got = read(fd, fbuf, sizeof(fbuf))) > 0) {
