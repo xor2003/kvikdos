@@ -241,6 +241,27 @@ static const char *getenv_prefix(const char *name_prefix, const char **env, cons
   return NULL;
 }
 
+/* Example name_prefix: "PATH=". Scans NUL-separated DOS env block. */
+static const char *getenv_prefix_block_nocase(const char *name_prefix, const char *env, const char *env_end) {
+  size_t i, nps;
+  if (!env || !env_end || env >= env_end) return NULL;
+  nps = strlen(name_prefix);
+  while (env < env_end && *env) {
+    const char *eq = strchr(env, '=');
+    const char *next = env + strlen(env) + 1;
+    if (!eq || eq >= env_end) break;
+    if ((size_t)(eq - env + 1) == nps) {
+      for (i = 0; i < nps; ++i) {
+        char a = env[i], b = name_prefix[i];
+        if ((a | 32) != (b | 32)) break;
+      }
+      if (i == nps) return eq + 1;
+    }
+    env = next;
+  }
+  return NULL;
+}
+
 /* p is a Linux pathname. */
 static char get_case_mode_from_last_component(const char *p) {
   const char *q = p + strlen(p);
@@ -2786,7 +2807,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
 
   if (!prog_filename) {
     img_fd = -1;
-  } else if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
+  } else if ((img_fd = open_with_case_fallback(prog_filename, O_RDONLY, 0666)) < 0) {
     fprintf(stderr, "fatal: cannot open DOS executable program: %s: %s\n", prog_filename, strerror(errno));
     exit(252);
   }
@@ -4188,7 +4209,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                   *(unsigned short*)&regs.rax = 2;  /* File not found. */
                   goto error_on_21;
                 }
-                if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
+                if ((img_fd = open_with_case_fallback(prog_filename, O_RDONLY, 0666)) < 0) {
                   *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x02);
                   goto error_on_21;
                 }
@@ -4217,7 +4238,37 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 goto fatal_int;
               }
               if (al == 0) {
-                if (run_dos_child_subprocess(dos_filename, safe_args, env, env_end, dir_state, &last_exec_return_code) != 0) {
+                const char *dos_exec_name = dos_filename;
+                char dos_exec_buf[DOS_PATH_SIZE + 4];
+                if (!strchr(dos_filename, ':') && !strchr(dos_filename, '\\') && !strchr(dos_filename, '/')) {
+                  char path_copy[1024];
+                  const char *dos_path_env = getenv_prefix_block_nocase("PATH=", env, env_end);
+                  const char *resolved_prog;
+                  char resolved_drive = '\0';
+                  path_copy[0] = '\0';
+                  if (dos_path_env) {
+                    strncpy(path_copy, dos_path_env, sizeof(path_copy) - 1);
+                    path_copy[sizeof(path_copy) - 1] = '\0';
+                  }
+                  resolved_prog = find_prog_on_path(dos_filename, dir_state, path_copy[0] ? path_copy : NULL, &resolved_drive);
+                  if (resolved_prog && resolved_prog[0]) {
+                    const char *resolved_dos = get_dos_abs_filename_r(resolved_prog, resolved_drive, dir_state, dos_exec_buf);
+                    if (resolved_dos[0]) dos_exec_name = resolved_dos;
+                  } else if (dos_prog_abs[0]) {
+                    const char *base = dos_prog_abs + strlen(dos_prog_abs);
+                    const char *tail = dos_filename;
+                    size_t dir_size, tail_size;
+                    for (; base > dos_prog_abs + 3 && base[-1] != '\\'; --base) {}
+                    dir_size = (size_t)(base - dos_prog_abs);
+                    tail_size = strlen(tail);
+                    if (dir_size && dir_size + tail_size + 1 < sizeof(dos_exec_buf)) {
+                      memcpy(dos_exec_buf, dos_prog_abs, dir_size);
+                      memcpy(dos_exec_buf + dir_size, tail, tail_size + 1);
+                      dos_exec_name = dos_exec_buf;
+                    }
+                  }
+                }
+                if (run_dos_child_subprocess(dos_exec_name, safe_args, env, env_end, dir_state, &last_exec_return_code) != 0) {
                   *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x1f);  /* General failure. */
                   goto error_on_21;
                 }
@@ -4237,7 +4288,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 fprintf(stderr, "fatal: bad program filename for loading: %s\n", dos_filename);
                 goto fatal_int;
               }
-              if ((img_fd = open(prog_filename, O_RDONLY)) < 0) {
+              if ((img_fd = open_with_case_fallback(prog_filename, O_RDONLY, 0666)) < 0) {
                 /*goto error_from_linux;*/  /* We don't know how to report the error properly here (it's not a normal int 0x21 call. */
                 fprintf(stderr, "fatal: cannot open DOS executable program for loading: %s: %s\n", prog_filename, strerror(errno));
                 goto fatal_int;
