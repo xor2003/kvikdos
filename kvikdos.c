@@ -688,6 +688,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     }
     cmd_args.dir_state.drive = 'C';
     cmd_args.dir_state.dos_prog_abs = NULL;
+    cmd_args.dir_state.linux_prog = NULL;
     cmd_args.dir_state.linux_mount_dir['C' - 'A'] = placeholder_for_default;
     cmd_args.dir_state.linux_mount_dir['D' - 'A'] = placeholder_for_default;
     cmd_args.dir_state.linux_mount_dir['E' - 'A'] = placeholder_for_default;
@@ -1105,7 +1106,6 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
   prog_name_arg = NULL;  /* Make sure we don't use it later, we've already modified it for cmd_args.dir_state.linux_mount_dir['E' - 'A']. */
 
   if (!cmd_args.dir_state.linux_mount_dir[cmd_args.dir_state.drive - 'A']) {
-    /*cmd_args.dir_state.drive = 'C';*/
     fprintf(stderr, "fatal: no mount point for default drive (specify --mount=...): %c:\n", cmd_args.dir_state.drive);
     exit(1);
   }
@@ -1705,11 +1705,11 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
           exepack_stub_plus_reloc_size >= 258 && exepack_stub_plus_reloc_size <= exepack_max_size) {
         char *after_packhdr = (char*)packhdr + exehdr[EXE_IP];
         const char *c = (const char*)memmem(after_packhdr, exepack_stub_plus_reloc_size, "\xcd\x21\xb8\xff\x4c\xcd\x21", 7);
-        if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%d exepack_stub_plus_reloc_size=%d\n", exehdr[EXE_IP], exepack_max_size, exepack_stub_plus_reloc_size);
+        if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%u exepack_stub_plus_reloc_size=%u\n", exehdr[EXE_IP], exepack_max_size, exepack_stub_plus_reloc_size);
         if (c) {
           const unsigned exepack_stub_size = (unsigned)(c + 7 + 22 - after_packhdr);
           if (exepack_stub_size >= 258 && exepack_stub_size <= 290) {
-            if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%d exepack_stub_plus_reloc_size=%d exepack_stub_size=%d\n", exehdr[EXE_IP], exepack_max_size, exepack_stub_plus_reloc_size, exepack_stub_size);
+            if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%u exepack_stub_plus_reloc_size=%u exepack_stub_size=%u\n", exehdr[EXE_IP], exepack_max_size, exepack_stub_plus_reloc_size, exepack_stub_size);
             /* Fix A20 bug (failure as ``Packed file is corrupt'' because ES
              * wraps around 0x10000) by replacing the stub.
              */
@@ -4240,6 +4240,21 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               if (al == 0) {
                 const char *dos_exec_name = dos_filename;
                 char dos_exec_buf[DOS_PATH_SIZE + 4];
+                if ((dos_filename[0] & ~32) - 'A' + 0U < DRIVE_COUNT && dos_filename[1] == ':' &&
+                    (dos_filename[2] == '\\' || dos_filename[2] == '/')) {
+                  char req_drive = dos_filename[0] & ~32;
+                  if (!dir_state->linux_mount_dir[req_drive - 'A']) {
+                    char cur_drive = dir_state->drive;
+                    if ((cur_drive - 'A' + 0U) < DRIVE_COUNT && dir_state->linux_mount_dir[cur_drive - 'A']) {
+                      size_t tail_size = strlen(dos_filename + 2);
+                      if (tail_size + 2 < sizeof(dos_exec_buf)) {
+                        dos_exec_buf[0] = cur_drive;
+                        memcpy(dos_exec_buf + 1, dos_filename + 1, tail_size + 1);
+                        dos_exec_name = dos_exec_buf;
+                      }
+                    }
+                  }
+                }
                 if (!strchr(dos_filename, ':') && !strchr(dos_filename, '\\') && !strchr(dos_filename, '/')) {
                   char path_copy[1024];
                   const char *dos_path_env = getenv_prefix_block_nocase("PATH=", env, env_end);
@@ -4864,14 +4879,14 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             if (!run->mmio.is_write) memset(run->mmio.data, 0, mmio_len);
             break;
           }
-          fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x%s value=%08x%08x size=%d is_write=%d\n", addr, highmsg, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], mmio_len, run->mmio.is_write);
+          fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x%s value=%08x%08x size=%u is_write=%u\n", addr, highmsg, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], mmio_len, run->mmio.is_write);
           goto fatal;
         }
       }
       ongoing_set_int = 0;  /* No set_int operation ongoing. */
       break;  /* Just continue at following cs:ip. */
      case KVM_EXIT_INTERNAL_ERROR:
-      fprintf(stderr, "fatal: KVM internal error suberror=%d\n", (unsigned)run->internal.suberror);
+      fprintf(stderr, "fatal: KVM internal error suberror=%u\n", (unsigned)run->internal.suberror);
       /* We get this for an int call if we don't map
        * (KVM_SET_USER_MEMORY_REGION) or initialize the interrupt table
        * properly. However, we can't continue the emulation, because KVM_RUN
@@ -4880,7 +4895,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       /* if (run->internal.suberror == KVM_INTERNAL_ERROR_DELIVERY_EV && p[0] == (char)0xcd) {...} */
       goto fatal;
      default:
-      fprintf(stderr, "fatal: unexpected KVM exit: reason=%d\n", run->exit_reason);
+      fprintf(stderr, "fatal: unexpected KVM exit: reason=%u\n", run->exit_reason);
       goto fatal;
     }
   }
@@ -4980,6 +4995,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           char has_redir_in = 0, has_redir_out = 0, has_redir_err = 0, append_out = 0, append_err = 0;
           char redir_in[DOS_PATH_SIZE + 4], redir_out[DOS_PATH_SIZE + 4], redir_err[DOS_PATH_SIZE + 4];
           char cleaned[4096];
+          redir_in[0] = redir_out[0] = redir_err[0] = '\0';
           if (*q == '\x1a') batch_eof = 1;
 	      *q = '\0';  /* Make it ASCIIZ (terminated by \0). */
 	      if (DEBUG) fprintf(stderr, "debug: batch line: (%s)\n", p_line);
@@ -5041,8 +5057,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
       for (; *p_line == ' ' || *p_line == '\t'; ++p_line) {}  /* MS-DOS 6.22 doesn't ignore leading whitespace, at least not before `rem'. */
       if (*p_line == '@') { do_echo_line = 0; ++p_line; }
       if (do_echo_line) {
-        const char *current_dir = dir_state->current_dir[dir_state->drive - 'A'];
-        fprintf(stdout, "\r\n%c:%s>%s\r\n", dir_state->drive, *current_dir == '\0' ? "\\" : current_dir, p_line);
+        fprintf(stdout, "%s\r\n", p_line);
         fflush(stdout);
       }
       for (r = p_line; ((c = *r) + 0U > 31U && c != '\x7f') || c == ' ' || c == '\t'; ++r) {}
@@ -5991,6 +6006,15 @@ static void init_tty_state(TtyState *tty_state, int tty_in_fd) {
   tty_state->next_fake_key = fake_keys;
 }
 
+static void free_extra_env_args(ParsedCmdArgs *cmd_args) {
+  unsigned i;
+  for (i = 0; i < cmd_args->extra_env_count; ++i) {
+    free((void*)cmd_args->extra_env[i]);
+    cmd_args->extra_env[i] = NULL;
+  }
+  cmd_args->extra_env_count = 0;
+}
+
 /* --- */
 
 int main(int argc, char **argv) {
@@ -6039,16 +6063,19 @@ int main(int argc, char **argv) {
       printf("end of envs\n");
     }
     printf("tty_in_fd: %d\n", cmd_args.tty_in_fd);
-    printf("mem_mb: %d\n", cmd_args.emu_params.mem_mb);
+    printf("mem_mb: %u\n", cmd_args.emu_params.mem_mb);
     printf("is_hlt_ok: %d\n", cmd_args.emu_params.is_hlt_ok);
     return 0;
   }
   if (cmd_args.dpmi_prog) {  /* pts-fast-dosbox does support it, kvikdos doesn't. */
     fprintf(stderr, "fatal: DPMI not supported: %s\n", cmd_args.dpmi_prog);
+    free_extra_env_args(&cmd_args);
     exit(1);
   }
   if (is_linux_native_executable(cmd_args.prog_filename)) {
-    return run_native_execvp(cmd_args.prog_filename, cmd_args.args);
+    int rc = run_native_execvp(cmd_args.prog_filename, cmd_args.args);
+    free_extra_env_args(&cmd_args);
+    return rc;
   }
   {
     const enum mz_subformat_t subfmt = detect_mz_subformat(cmd_args.prog_filename);
@@ -6058,10 +6085,15 @@ int main(int argc, char **argv) {
          is_probable_windows_message_stub(cmd_args.prog_filename))) {
     if (!has_wine_in_path()) {
         fprintf(stderr, "error: detected Windows executable, but 'wine' is not in PATH: %s\n", cmd_args.prog_filename);
+        free_extra_env_args(&cmd_args);
       return 1;
     }
       fprintf(stderr, "info: detected Windows executable, delegating to wine: %s\n", cmd_args.prog_filename);
-    return run_with_wine(cmd_args.prog_filename, cmd_args.args);
+      {
+        int rc = run_with_wine(cmd_args.prog_filename, cmd_args.args);
+        free_extra_env_args(&cmd_args);
+        return rc;
+      }
     }
   }
   { int exit_code;
@@ -6076,6 +6108,7 @@ int main(int argc, char **argv) {
       exit_code = run_dos_prog(&emu, cmd_args.prog_filename, NULL, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0, (const char* const*)cmd_args.extra_env, cmd_args.extra_env_count);
     }
     if (DEBUG) fprintf(stderr, "debug: DOS program exited with code: 0x%02x", exit_code);
+    free_extra_env_args(&cmd_args);
     return exit_code;
   }
 }
