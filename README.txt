@@ -246,6 +246,29 @@ Static analysis and runtime checks:
     $ valgrind --tool=memcheck --leak-check=full --error-exitcode=101 ./kvikdos /home/xor/inertia_player/dos_compilers/Microsoft\ C\ v5/CL.EXE /c HELLO0.C
     $ valgrind --tool=memcheck --leak-check=full --error-exitcode=101 ./kvikdos /home/xor/inertia_player/dos_compilers/Microsoft\ MASM\ v5/BIN/MASM.EXE HELLO.ASM,HELLO.OBJ,NUL.LST,NUL.CRF
 
+Readability and stability improvement roadmap (recommended):
+
+* Priority 1 (safety):
+  * Initialize all state structs (`DirState`, `ParsedCmdArgs`, runtime locals)
+    before first use; avoid partial-init patterns.
+  * Keep parser regression tests for option combinations (`--prog`, mounts,
+    drive/cwd/path interactions) and assert "no crash" behavior.
+  * Prefer bounded copy helpers (`copy_cstr0`) over ad-hoc `strncpy` usage.
+
+* Priority 2 (clarity):
+  * Split large functions (`parse_args`, `run_dos_prog`, `run_dos_batch`)
+    into smaller helpers by responsibility:
+    argument parsing, DOS path translation, int21 dispatch, batch command eval.
+  * Replace ambiguous locals (`p`, `q`, `r`) with intent names in new code
+    (`requested_drive`, `active_drive`, `resolved_prog`).
+  * Keep compatibility fallbacks local and commented at point of use.
+
+* Priority 3 (analysis depth):
+  * Add a fast static target in CI: `cppcheck` + `clang --analyze`.
+  * Add sanitizer targets (ASan+UBSan) and valgrind jobs as separate steps.
+  * Add negative tests for malformed paths/env/flags to verify deterministic
+    error messages and exit codes.
+
 About making Linux files available for DOS programs:
 
 * kvikdos emulates DOS drives A: .. F: by exposing directories on the Linux

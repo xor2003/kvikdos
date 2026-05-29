@@ -22,6 +22,22 @@
  * * DOSBox 0.74-4
  *   (https://github.com/svn2github/dosbox/blob/acd380bcde72db74f3b476253899016f686bc0ef/src/dos/dos_execute.cpp)
  * * MS-DOS 6.22 (source code not available).
+ *
+ * Code Quality Requirements (project policy):
+ * * Initialize all fields of structs and all local variables before first use.
+ *   Uninitialized reads are treated as correctness bugs, not style issues.
+ * * For parser state (CLI/env/path), prefer explicit defaults over implicit behavior.
+ * * Keep compatibility fallbacks narrow and documented next to the code path.
+ * * New CLI flags and parser branches must include at least one regression test
+ *   that exercises the option combination and asserts "no crash".
+ * * Keep diagnostics actionable: print the failing DOS path/drive and return a
+ *   deterministic DOS-compatible error when possible.
+ *
+ * Recommended ongoing improvements:
+ * * Add a dedicated parser matrix test (flag combinations) to CI.
+ * * Run ASan/UBSan and valgrind in separate jobs, plus cppcheck/clang-analyzer.
+ * * Prefer clearer variable names in new code paths (e.g. requested_drive,
+ *   active_drive) and add short intent comments for compatibility logic.
  */
 
 #define _GNU_SOURCE 1  /* For MAP_ANONYMOUS and memmem(). */
@@ -48,6 +64,17 @@ static char *xstrdup(const char *s) {
   memcpy(p, s, n);
   return p;
 }
+
+/* Bounded C-string copy with guaranteed NUL termination. */
+static void copy_cstr0(char *dst, size_t dst_size, const char *src) {
+  size_t n;
+  if (dst_size == 0) return;
+  n = strlen(src);
+  if (n >= dst_size) n = dst_size - 1;
+  memcpy(dst, src, n);
+  dst[n] = '\0';
+}
+
 
 static unsigned g_case_fallback_mode = 2;  /* Best default: all. */
 static FILE *g_diag_file = NULL;
@@ -218,8 +245,9 @@ static int stat_with_case_fallback(const char *linux_filename, struct stat *st, 
 }
 
 static DIR *opendir_with_case_fallback(const char *linux_dir, char *resolved_out, size_t resolved_out_size) {
+  DIR *dd;
   if (resolved_out_size) resolved_out[0] = '\0';
-  DIR *dd = opendir(linux_dir);
+  dd = opendir(linux_dir);
   if (dd) {
     if (resolved_out_size) {
       strncpy(resolved_out, linux_dir, resolved_out_size - 1);
@@ -624,6 +652,32 @@ typedef struct ParsedCmdArgs {
   const char *dpmi_prog;
 } ParsedCmdArgs;
 
+static void init_parsed_cmd_args(ParsedCmdArgs *cmd_args, char *placeholder_for_default) {
+  unsigned u;
+  memset(cmd_args, 0, sizeof(*cmd_args));
+  for (u = 0; u < DRIVE_COUNT; ++u) {
+    cmd_args->dir_state.current_dir[u][0] = '\0';
+    cmd_args->dir_state.linux_mount_dir[u] = NULL;
+  }
+  cmd_args->dir_state.drive = 'C';
+  cmd_args->dir_state.dos_prog_abs = NULL;
+  cmd_args->dir_state.linux_prog = NULL;
+  cmd_args->dir_state.linux_mount_dir['C' - 'A'] = placeholder_for_default;
+  cmd_args->dir_state.linux_mount_dir['D' - 'A'] = placeholder_for_default;
+  cmd_args->dir_state.linux_mount_dir['E' - 'A'] = placeholder_for_default;
+  memset(cmd_args->dir_state.case_mode, CASE_MODE_UNSPECIFIED, DRIVE_COUNT);
+  cmd_args->dpmi_prog = NULL;
+  cmd_args->extra_env_count = 0;
+  cmd_args->tty_in_fd = -1;
+  cmd_args->emu_params.mem_mb = 1;
+  cmd_args->emu_params.is_hlt_ok = 0;
+  cmd_args->emu_params.hlt_dump_filename = NULL;
+  cmd_args->emu_params.diag_filename = NULL;
+  cmd_args->emu_params.diag_mask = 1;  /* compat */
+  cmd_args->emu_params.case_fallback_mode = 2;  /* all */
+  cmd_args->emu_params.strict_mode = 0;  /* permissive */
+}
+
 static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const char *pre_msg, const char *usage_extra, const char *post_msg) {
   char *placeholder_for_default = (char*)pre_msg;
   ParsedCmdArgs cmd_args;
@@ -681,31 +735,10 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     exit(0);
   }
 
-  { unsigned u;
-    for (u = 0; u < DRIVE_COUNT; ++u) {
-      cmd_args.dir_state.current_dir[u][0] = '\0';
-      cmd_args.dir_state.linux_mount_dir[u] = NULL;
-    }
-    cmd_args.dir_state.drive = 'C';
-    cmd_args.dir_state.dos_prog_abs = NULL;
-    cmd_args.dir_state.linux_prog = NULL;
-    cmd_args.dir_state.linux_mount_dir['C' - 'A'] = placeholder_for_default;
-    cmd_args.dir_state.linux_mount_dir['D' - 'A'] = placeholder_for_default;
-    cmd_args.dir_state.linux_mount_dir['E' - 'A'] = placeholder_for_default;
-    memset(cmd_args.dir_state.case_mode, CASE_MODE_UNSPECIFIED, DRIVE_COUNT);
-  }
-
+  init_parsed_cmd_args(&cmd_args, placeholder_for_default);
+  /* Used by get_linux_filename_r() alias check; must be initialized in parse-only paths. */
+  cmd_args.dir_state.linux_prog = NULL;
   envp = envp0 = ++argv;
-  cmd_args.dpmi_prog = NULL;
-  cmd_args.extra_env_count = 0;
-  cmd_args.tty_in_fd = -1;
-  cmd_args.emu_params.mem_mb = 1;
-  cmd_args.emu_params.is_hlt_ok = 0;
-  cmd_args.emu_params.hlt_dump_filename = NULL;
-  cmd_args.emu_params.diag_filename = NULL;
-  cmd_args.emu_params.diag_mask = 1;  /* compat */
-  cmd_args.emu_params.case_fallback_mode = 2;  /* all */
-  cmd_args.emu_params.strict_mode = 0;  /* permissive */
   is_kvm_check = 0;
   is_drive_specified = 0;
   while (argv[0]) {
@@ -1147,8 +1180,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
       memcpy(tmp, p, n);
       if (n > 0 && tmp[n - 1] != '\\') tmp[n++] = '\\';
       tmp[n] = '\0';
-      strncpy(cmd_args.dir_state.current_dir[drive - 'A'], tmp, sizeof(cmd_args.dir_state.current_dir[drive - 'A']) - 1);
-      cmd_args.dir_state.current_dir[drive - 'A'][sizeof(cmd_args.dir_state.current_dir[drive - 'A']) - 1] = '\0';
+      copy_cstr0(cmd_args.dir_state.current_dir[drive - 'A'], sizeof(cmd_args.dir_state.current_dir[drive - 'A']), tmp);
       cmd_args.dir_state.drive = drive;
     }
   }
@@ -1173,8 +1205,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     }
     if (q != tmp && q[-1] != '\\') *q++ = '\\';
     *q = '\0';
-    strncpy(cmd_args.dir_state.current_dir[drive - 'A'], tmp, sizeof(cmd_args.dir_state.current_dir[drive - 'A']) - 1);
-    cmd_args.dir_state.current_dir[drive - 'A'][sizeof(cmd_args.dir_state.current_dir[drive - 'A']) - 1] = '\0';
+    copy_cstr0(cmd_args.dir_state.current_dir[drive - 'A'], sizeof(cmd_args.dir_state.current_dir[drive - 'A']), tmp);
   }
   cmd_args.args = (const char* const*)argv;
   cmd_args.envp0 = (const char* const*)envp0;
@@ -4242,14 +4273,17 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 char dos_exec_buf[DOS_PATH_SIZE + 4];
                 if ((dos_filename[0] & ~32) - 'A' + 0U < DRIVE_COUNT && dos_filename[1] == ':' &&
                     (dos_filename[2] == '\\' || dos_filename[2] == '/')) {
-                  char req_drive = dos_filename[0] & ~32;
-                  if (!dir_state->linux_mount_dir[req_drive - 'A']) {
-                    char cur_drive = dir_state->drive;
-                    if ((cur_drive - 'A' + 0U) < DRIVE_COUNT && dir_state->linux_mount_dir[cur_drive - 'A']) {
-                      size_t tail_size = strlen(dos_filename + 2);
-                      if (tail_size + 2 < sizeof(dos_exec_buf)) {
-                        dos_exec_buf[0] = cur_drive;
-                        memcpy(dos_exec_buf + 1, dos_filename + 1, tail_size + 1);
+                  char requested_drive = dos_filename[0] & ~32;
+                  if (!dir_state->linux_mount_dir[requested_drive - 'A']) {
+                    char active_drive = dir_state->drive;
+                    if ((active_drive - 'A' + 0U) < DRIVE_COUNT && dir_state->linux_mount_dir[active_drive - 'A']) {
+                      size_t abs_tail_size = strlen(dos_filename + 2);
+                      /* Some toolchains probe absolute paths on an unmapped drive.
+                       * Retry same absolute tail on the active mounted drive.
+                       */
+                      if (abs_tail_size + 2 < sizeof(dos_exec_buf)) {
+                        dos_exec_buf[0] = active_drive;
+                        memcpy(dos_exec_buf + 1, dos_filename + 1, abs_tail_size + 1);
                         dos_exec_name = dos_exec_buf;
                       }
                     }
@@ -4929,13 +4963,14 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
   unsigned setlocal_depth = 0;
   unsigned bi;
   char batch_eof = 0;
+  size_t size;
+  const char *dos_prog_abs;
   for (bi = 0; envp0 && envp0[bi] && batch_env_count < sizeof(batch_env) / sizeof(batch_env[0]); ++bi) {
     char *cp = xstrdup(envp0[bi]);
     if (!cp) { perror("fatal: xstrdup"); exit(252); }
     batch_env[batch_env_count++] = cp;
   }
-  size_t size;
-  const char *dos_prog_abs = dir_state->dos_prog_abs;  /* Of the .bat file. */
+  dos_prog_abs = dir_state->dos_prog_abs;  /* Of the .bat file. */
   dir_state->dos_prog_abs = NULL;
   for (ai = 0; ai < 10; ++ai) batch_args[ai] = "";
   if (args) {
@@ -5449,8 +5484,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
               fprintf(stderr, "Invalid directory - %s\r\n", arg);
               exit_code = 1;
             } else {
-              strncpy(dir_state->current_dir[drive - 'A'], tmp, sizeof(dir_state->current_dir[drive - 'A']) - 1);
-              dir_state->current_dir[drive - 'A'][sizeof(dir_state->current_dir[drive - 'A']) - 1] = '\0';
+              copy_cstr0(dir_state->current_dir[drive - 'A'], sizeof(dir_state->current_dir[drive - 'A']), tmp);
               dir_state->drive = drive;
               exit_code = 0;
             }
@@ -5540,42 +5574,45 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           while (*a) {
             char *b = a;
             while (*b && *b != ' ' && *b != '\t') ++b;
-            if (*b) *b++ = '\0';
-            if (strchr(a, '*') || strchr(a, '?')) {
-              const char *pat_base = get_dos_basename(a);
-              size_t pat_dir_size = pat_base - a;
-              char dos_dir[DOS_PATH_SIZE + 4], linux_dir[LINUX_PATH_SIZE];
-              const char *scan_dir;
-              DIR *dd;
-              struct dirent *de;
-              if (pat_dir_size >= sizeof(dos_dir)) pat_dir_size = sizeof(dos_dir) - 1;
-              memcpy(dos_dir, a, pat_dir_size);
-              dos_dir[pat_dir_size] = '\0';
-              if (dos_dir[0] == '\0') strcpy(dos_dir, ".");
-              scan_dir = linux_dir;
-              if (*get_linux_filename_r(dos_dir, dir_state, linux_dir, NULL) == '\0' || !(dd = opendir_with_case_fallback(linux_dir, fnbuf2, sizeof(fnbuf2)))) {
-                exit_code = 1;
-              } else {
-                if (fnbuf2[0] != '\0') scan_dir = fnbuf2;
-                int removed = 0;
-                while ((de = readdir(dd)) != NULL) {
-                  char full[LINUX_PATH_SIZE];
-                  const char *nm = de->d_name;
-                  struct stat st;
-                  size_t dlen;
-                  if (nm[0] == '.') continue;
-                  if (!dos_wildcard_match(pat_base, nm)) continue;
-                  dlen = strlen(scan_dir);
-                  if (dlen + 1 + strlen(nm) + 1 >= sizeof(full)) continue;
-                  memcpy(full, scan_dir, dlen);
-                  if (dlen && full[dlen - 1] != '/') full[dlen++] = '/';
-                  strcpy(full + dlen, nm);
-                  if (stat(full, &st) == 0 && S_ISREG(st.st_mode) && unlink(full) == 0) removed = 1;
-                }
-                closedir(dd);
-                if (!removed) exit_code = 1;
-              }
-            } else if (*get_linux_filename_r(a, dir_state, fnbuf, NULL) == '\0' || unlink(fnbuf) != 0) exit_code = 1;
+	            if (*b) *b++ = '\0';
+	            if (strchr(a, '*') || strchr(a, '?')) {
+	              const char *pat_base = get_dos_basename(a);
+	              size_t pat_dir_size = pat_base - a;
+	              char dos_dir[DOS_PATH_SIZE + 4], linux_dir[LINUX_PATH_SIZE];
+	              const char *scan_dir;
+	              DIR *dd;
+	              struct dirent *de;
+	              int removed;
+	              if (pat_dir_size >= sizeof(dos_dir)) pat_dir_size = sizeof(dos_dir) - 1;
+	              memcpy(dos_dir, a, pat_dir_size);
+	              dos_dir[pat_dir_size] = '\0';
+	              if (dos_dir[0] == '\0') strcpy(dos_dir, ".");
+	              scan_dir = linux_dir;
+	              if (*get_linux_filename_r(dos_dir, dir_state, linux_dir, NULL) == '\0' || !(dd = opendir_with_case_fallback(linux_dir, fnbuf2, sizeof(fnbuf2)))) {
+	                exit_code = 1;
+	              } else {
+	                if (fnbuf2[0] != '\0') scan_dir = fnbuf2;
+	                removed = 0;
+	                while ((de = readdir(dd)) != NULL) {
+	                  char full[LINUX_PATH_SIZE];
+	                  const char *nm = de->d_name;
+	                  struct stat st;
+	                  size_t dlen;
+	                  if (nm[0] == '.') continue;
+	                  if (!dos_wildcard_match(pat_base, nm)) continue;
+	                  dlen = strlen(scan_dir);
+	                  if (dlen + 1 + strlen(nm) + 1 >= sizeof(full)) continue;
+	                  memcpy(full, scan_dir, dlen);
+	                  if (dlen && full[dlen - 1] != '/') full[dlen++] = '/';
+	                  strcpy(full + dlen, nm);
+	                  if (stat(full, &st) == 0 && S_ISREG(st.st_mode) && unlink(full) == 0) removed = 1;
+	                }
+	                closedir(dd);
+	                if (!removed) exit_code = 1;
+	              }
+	            } else if (*get_linux_filename_r(a, dir_state, fnbuf, NULL) == '\0' || unlink(fnbuf) != 0) {
+	              exit_code = 1;
+	            }
             while (*b == ' ' || *b == '\t') ++b;
             a = b;
           }
@@ -5605,18 +5642,18 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           exit_code = 1;
         } else {
           if (strchr(a, '*') || strchr(a, '?')) {
-            const char *pat_base = get_dos_basename(a);
-            size_t pat_dir_size = pat_base - a;
-            char dos_dir[DOS_PATH_SIZE + 4], linux_src_dir[LINUX_PATH_SIZE];
-            DIR *dd = NULL;
-            struct dirent *de;
-            struct stat dst_st;
-            int copied = 0;
+              const char *pat_base = get_dos_basename(a);
+              size_t pat_dir_size = pat_base - a;
+              char dos_dir[DOS_PATH_SIZE + 4], linux_src_dir[LINUX_PATH_SIZE];
+              const char *src_scan_dir = linux_src_dir;
+              DIR *dd = NULL;
+              struct dirent *de;
+              struct stat dst_st;
+              int copied = 0;
             if (pat_dir_size >= sizeof(dos_dir)) pat_dir_size = sizeof(dos_dir) - 1;
             memcpy(dos_dir, a, pat_dir_size);
             dos_dir[pat_dir_size] = '\0';
-            if (dos_dir[0] == '\0') strcpy(dos_dir, ".");
-              const char *src_scan_dir = linux_src_dir;
+              if (dos_dir[0] == '\0') strcpy(dos_dir, ".");
               if (*get_linux_filename_r(dos_dir, dir_state, linux_src_dir, NULL) == '\0' ||
                 *get_linux_filename_r(b, dir_state, fnbuf2, NULL) == '\0' ||
                 stat_with_case_fallback(fnbuf2, &dst_st, 0) != 0 || !S_ISDIR(dst_st.st_mode) ||
