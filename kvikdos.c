@@ -269,6 +269,23 @@ static const char *getenv_prefix(const char *name_prefix, const char **env, cons
   return NULL;
 }
 
+/* Example name_prefix: "PATH=". Scans NULL-terminated envp with case-insensitive key compare. */
+static const char *getenv_prefix_nocase0(const char *name_prefix, const char *const *env) {
+  size_t i, nps;
+  if (!env) return NULL;
+  nps = strlen(name_prefix);
+  for (; *env; ++env) {
+    const char *s = *env;
+    if (!s) continue;
+    for (i = 0; i < nps; ++i) {
+      char a = s[i], b = name_prefix[i];
+      if (a == '\0' || ((a | 32) != (b | 32))) break;
+    }
+    if (i == nps) return s + nps;
+  }
+  return NULL;
+}
+
 /* Example name_prefix: "PATH=". Scans NUL-separated DOS env block. */
 static const char *getenv_prefix_block_nocase(const char *name_prefix, const char *env, const char *env_end) {
   size_t i, nps;
@@ -2679,7 +2696,7 @@ static int is_probable_windows_message_stub(const char *path) {
   return is_stub;
 }
 
-static int run_with_wine(const char *prog_filename, const char *const *args) {
+static int run_with_wine(const char *prog_filename, const char *const *args, const char *linux_cwd) {
   const char *argv_child[512];
   unsigned argc = 0;
   int status;
@@ -2696,6 +2713,10 @@ static int run_with_wine(const char *prog_filename, const char *const *args) {
     return 1;
   }
   if (pid == 0) {
+    if (linux_cwd && *linux_cwd && chdir(linux_cwd) != 0) {
+      perror("error: failed to chdir for wine");
+      _exit(127);
+    }
     execvp("wine", (char * const*)argv_child);
     perror("error: failed to execute wine");
     _exit(127);
@@ -4944,7 +4965,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   return 0;  /* Not reached. This is just to pacity owcc. */
 }
 
-static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0) {
+static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filename, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0, const char* const *extra_env, unsigned extra_env_count) {
   unsigned char exit_code = 0;
   int batch_fd, got;
   char buf[4096], *p = buf, *p_line = buf, *q;
@@ -4970,6 +4991,12 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
     if (!cp) { perror("fatal: xstrdup"); exit(252); }
     batch_env[batch_env_count++] = cp;
   }
+  for (bi = 0; extra_env && bi < extra_env_count && batch_env_count < sizeof(batch_env) / sizeof(batch_env[0]); ++bi) {
+    char *cp = xstrdup(extra_env[bi]);
+    if (!cp) { perror("fatal: xstrdup"); exit(252); }
+    batch_env[batch_env_count++] = cp;
+  }
+  if (batch_env_count < sizeof(batch_env) / sizeof(batch_env[0])) batch_env[batch_env_count] = NULL;
   dos_prog_abs = dir_state->dos_prog_abs;  /* Of the .bat file. */
   dir_state->dos_prog_abs = NULL;
   for (ai = 0; ai < 10; ++ai) batch_args[ai] = "";
@@ -5393,7 +5420,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           if (tfd < 0) { exit_code = 1; break; }
           (void)!write(tfd, exp, strlen(exp));
           close(tfd);
-          exit_code = run_dos_batch(emu, tmpbat, NULL, dir_state, tty_state, emu_params, envp0);
+          exit_code = run_dos_batch(emu, tmpbat, NULL, dir_state, tty_state, emu_params, envp0, (const char* const*)batch_env, batch_env_count);
           unlink(tmpbat);
         }
       } else if (0 == memcmp(p_line, "setlocal", cmd_size)) {
@@ -5461,13 +5488,18 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           char *t = tmp;
           const char *s = arg;
           char drive = dir_state->drive;
+          char is_root_abs = 0;
           struct stat st;
           if ((s[0] & ~32) - 'A' + 0U < DRIVE_COUNT && s[1] == ':') {
             drive = s[0] & ~32;
             s += 2;
-            if (*s == '\\' || *s == '/') ++s;
+            if (*s == '\\' || *s == '/') { ++s; is_root_abs = 1; }
           } else if (*s == '\\' || *s == '/') {
             ++s;
+            is_root_abs = 1;
+          }
+          if (is_root_abs && t + 1 < tmp + sizeof(tmp)) {
+            *t++ = '\\';
           }
           while (*s && t + 2 < tmp + sizeof(tmp)) {
             char c3 = *s++;
@@ -5491,7 +5523,6 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           }
         }
       } else if (0 == memcmp(p_line, "path", cmd_size)) {
-        const char* const *envp;
         if (*r != '\0') {
           while (*arg == ' ' || *arg == '\t') ++arg;
           if (*arg == '=') ++arg;
@@ -5506,7 +5537,11 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
             strcpy(pe + 5, path_override);
             for (ei = 0; ei < batch_env_count; ++ei) {
               char *eq = strchr(batch_env[ei], '=');
-              if (eq && (size_t)(eq - batch_env[ei]) == 4 && memcmp(batch_env[ei], "PATH", 4) == 0) {
+              if (eq && (size_t)(eq - batch_env[ei]) == 4 &&
+                  ((batch_env[ei][0] | 32) == 'p') &&
+                  ((batch_env[ei][1] | 32) == 'a') &&
+                  ((batch_env[ei][2] | 32) == 't') &&
+                  ((batch_env[ei][3] | 32) == 'h')) {
                 free(batch_env[ei]);
                 batch_env[ei] = xstrdup(pe);
                 break;
@@ -5515,6 +5550,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
             if (ei == batch_env_count && batch_env_count < sizeof(batch_env) / sizeof(batch_env[0])) {
               batch_env[batch_env_count++] = xstrdup(pe);
             }
+            if (batch_env_count < sizeof(batch_env) / sizeof(batch_env[0])) batch_env[batch_env_count] = NULL;
           }
           exit_code = 0;
           goto done_command;
@@ -5523,13 +5559,15 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           fprintf(stdout, "PATH=%s\r\n", path_override);
           exit_code = 0;
         } else {
-          for (envp = envp0; *envp && strncmp(*envp, "PATH=", 5) != 0; ++envp) {}
-          if (*envp) {
-            fprintf(stdout, "%s\r\n", *envp);
-            exit_code = 0;
-          } else {
-            fprintf(stdout, "No Path\r\n\r\n");  /* MS-DOS 6.22. */
-            exit_code = 1;
+          {
+            const char *path_value = getenv_prefix_nocase0("PATH=", (const char* const*)batch_env);
+            if (path_value) {
+              fprintf(stdout, "PATH=%s\r\n", path_value);
+              exit_code = 0;
+            } else {
+              fprintf(stdout, "No Path\r\n\r\n");  /* MS-DOS 6.22. */
+              exit_code = 1;
+            }
           }
         }
         fflush(stdout);
@@ -5926,7 +5964,6 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
       } else {  /* Run .com or .exe program. */
         char *args_str = p_line, args_buf[0x80], c2;
         const char* prog_filename;
-        const char* const *envp;
         char prog_drive;
         size_t size;
         for (; (c2 = *args_str) != '\0' && c2 != ' ' && c2 != '\t' && c2 != '=' && c2 != ','; ++args_str) {}  /* MS-DOS 6.22. */
@@ -5939,9 +5976,11 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
         } else {
           memcpy(args_buf, args_str, size + 1);  /* Including the trailing '\0'. */
           *args_str = '\0';  /* So that p_line becomes terminated by '\0'. */
-          for (envp = envp0; *envp && strncmp(*envp, "PATH=", 5) != 0; ++envp) {}
-          dir_state->dos_prog_abs = dos_prog_abs;  /* Of the .bat file. */
-          prog_filename = find_prog_on_path(p_line, dir_state, has_path_override ? path_override : (*envp ? *envp + 5 : NULL), &prog_drive);
+          {
+            const char *path_value = has_path_override ? path_override : getenv_prefix_nocase0("PATH=", (const char* const*)batch_env);
+            dir_state->dos_prog_abs = dos_prog_abs;  /* Of the .bat file. */
+            prog_filename = find_prog_on_path(p_line, dir_state, path_value, &prog_drive);
+          }
           if (!prog_filename) {
             /* DOSBox 0.74-4 prints "Illegal command: %s.\r\n" to stdout, we print our error to stderr. */
             /* MS-DOS 6.22 prints this to stderr: "Bad command or file name\r\n". */
@@ -5967,7 +6006,12 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
                 batch_extra_env[batch_extra_env_count++] = batch_path_env;
               }
               for (ei = 0; ei < batch_env_count && batch_extra_env_count < sizeof(batch_extra_env) / sizeof(batch_extra_env[0]); ++ei) {
-                if (strncmp(batch_env[ei], "PATH=", 5) == 0 && has_path_override) continue;
+                if (has_path_override &&
+                    ((batch_env[ei][0] | 32) == 'p') &&
+                    ((batch_env[ei][1] | 32) == 'a') &&
+                    ((batch_env[ei][2] | 32) == 't') &&
+                    ((batch_env[ei][3] | 32) == 'h') &&
+                    batch_env[ei][4] == '=') continue;
                 batch_extra_env[batch_extra_env_count++] = batch_env[ei];
               }
               if (has_dos_ext_nocase(prog_filename, ".bat")) {
@@ -5984,9 +6028,32 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
                   ab = ae;
                 }
                 child_args[ac] = NULL;
-                exit_code = run_dos_batch(emu, prog_filename, child_args, dir_state, tty_state, emu_params, envp0);
+                exit_code = run_dos_batch(emu, prog_filename, child_args, dir_state, tty_state, emu_params, envp0, batch_extra_env, batch_extra_env_count);
               } else {
-                exit_code = run_dos_prog(emu, prog_filename, args_buf, NULL, dir_state, tty_state, emu_params, envp0, batch_extra_env, batch_extra_env_count);
+                const enum mz_subformat_t subfmt = detect_mz_subformat(prog_filename);
+                if (subfmt == MZ_SUBFMT_PE && has_wine_in_path()) {
+                  const char *child_argv[64];
+                  char *ab = args_buf, *ae;
+                  unsigned ac = 0;
+                  char dos_cwd[DOS_PATH_SIZE + 4], linux_cwd[LINUX_PATH_SIZE];
+                  const char *cdp = dir_state->current_dir[dir_state->drive - 'A'];
+                  if (!cdp || !*cdp) cdp = "\\";
+                  snprintf(dos_cwd, sizeof(dos_cwd), "%c:%s", dir_state->drive, cdp);
+                  get_linux_filename_r(dos_cwd, dir_state, linux_cwd, NULL);
+                  while (*ab == ' ' || *ab == '\t') ++ab;
+                  while (*ab && ac + 1 < sizeof(child_argv) / sizeof(child_argv[0])) {
+                    ae = ab;
+                    while (*ae && *ae != ' ' && *ae != '\t') ++ae;
+                    if (*ae) *ae++ = '\0';
+                    child_argv[ac++] = ab;
+                    while (*ae == ' ' || *ae == '\t') ++ae;
+                    ab = ae;
+                  }
+                  child_argv[ac] = NULL;
+                  exit_code = run_with_wine(prog_filename, child_argv, linux_cwd);
+                } else {
+                  exit_code = run_dos_prog(emu, prog_filename, args_buf, NULL, dir_state, tty_state, emu_params, envp0, batch_extra_env, batch_extra_env_count);
+                }
               }
             }
           }
@@ -6127,7 +6194,7 @@ int main(int argc, char **argv) {
     }
       fprintf(stderr, "info: detected Windows executable, delegating to wine: %s\n", cmd_args.prog_filename);
       {
-        int rc = run_with_wine(cmd_args.prog_filename, cmd_args.args);
+        int rc = run_with_wine(cmd_args.prog_filename, cmd_args.args, NULL);
         free_extra_env_args(&cmd_args);
         return rc;
       }
@@ -6140,7 +6207,7 @@ int main(int argc, char **argv) {
     init_emu(&emu);  /* This is lightweight, it doesn't initialize KVM. */
     init_tty_state(&tty_state, cmd_args.tty_in_fd);
     if (is_same_ascii_nocase(ext, "bat", 4)) {
-      exit_code = run_dos_batch(&emu, cmd_args.prog_filename, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0);
+      exit_code = run_dos_batch(&emu, cmd_args.prog_filename, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0, (const char* const*)cmd_args.extra_env, cmd_args.extra_env_count);
     } else {
       exit_code = run_dos_prog(&emu, cmd_args.prog_filename, NULL, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0, (const char* const*)cmd_args.extra_env, cmd_args.extra_env_count);
     }
