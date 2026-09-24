@@ -78,6 +78,19 @@ static void copy_cstr0(char *dst, size_t dst_size, const char *src) {
 
 static unsigned g_case_fallback_mode = 2;  /* Best default: all. */
 static FILE *g_diag_file = NULL;
+/* Runtime diagnostic category mask, set from --diag=. The bit values match the
+ * --diag parser (compat=1 exec=2 int=4 fs=8 all=~0). DIAG_BIT_VERBOSE covers the
+ * extra-noisy malloc/MCB/register-dump tracing; it is reachable only via
+ * --diag=all so the individual categories stay usable. */
+static unsigned g_diag_mask = 0;
+#define DIAG_BIT_COMPAT   0x01u  /* compat: unsupported-feature/fallback notes */
+#define DIAG_BIT_EXEC     0x02u  /* exec: program exec/exit */
+#define DIAG_BIT_INT      0x04u  /* int: interrupt calls and vector get/set */
+#define DIAG_BIT_FS       0x08u  /* fs: filesystem and path operations */
+#define DIAG_BIT_VERBOSE  0x10u  /* verbose: malloc/MCB/register tracing (all only) */
+/* Runtime enable check, OR'd into the compile-time DEBUG* gates so that
+ * --diag=<cat> turns the matching diagnostics on without a rebuild. */
+#define DIAG_ON(bit) (g_diag_mask & (unsigned)(bit))
 
 #ifdef USE_MINI_KVM  /* For systems with a broken linux/kvm.h. */
 #  include "mini_kvm.h"
@@ -1753,11 +1766,11 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
           exepack_stub_plus_reloc_size >= 258 && exepack_stub_plus_reloc_size <= exepack_max_size) {
         char *after_packhdr = (char*)packhdr + exehdr[EXE_IP];
         const char *c = (const char*)memmem(after_packhdr, exepack_stub_plus_reloc_size, "\xcd\x21\xb8\xff\x4c\xcd\x21", 7);
-        if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%u exepack_stub_plus_reloc_size=%u\n", exehdr[EXE_IP], exepack_max_size, exepack_stub_plus_reloc_size);
+        if (DEBUG || DIAG_ON(DIAG_BIT_COMPAT)) fprintf(g_diag_file, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%u exepack_stub_plus_reloc_size=%u\n", exehdr[EXE_IP], exepack_max_size, exepack_stub_plus_reloc_size);
         if (c) {
           const unsigned exepack_stub_size = (unsigned)(c + 7 + 22 - after_packhdr);
           if (exepack_stub_size >= 258 && exepack_stub_size <= 290) {
-            if (DEBUG) fprintf(stderr, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%u exepack_stub_plus_reloc_size=%u exepack_stub_size=%u\n", exehdr[EXE_IP], exepack_max_size, exepack_stub_plus_reloc_size, exepack_stub_size);
+            if (DEBUG || DIAG_ON(DIAG_BIT_COMPAT)) fprintf(g_diag_file, "info: detected DOS .exe packed with exepack: header_size=%d exepack_max_size=%u exepack_stub_plus_reloc_size=%u exepack_stub_size=%u\n", exehdr[EXE_IP], exepack_max_size, exepack_stub_plus_reloc_size, exepack_stub_size);
             /* Fix A20 bug (failure as ``Packed file is corrupt'' because ES
              * wraps around 0x10000) by replacing the stub.
              */
@@ -1914,7 +1927,7 @@ static int load_dos_overlay_program(int img_fd, const char *filename, void *mem,
 static void dump_regs(const char *prefix, const struct kvm_regs *regs, const struct kvm_sregs *sregs) {
 #define R16(name) (*(unsigned short*)&regs->r##name)
 #define S16(name) (sregs->name.selector)  /* 16 bits. */
-  fprintf(stderr, "%s: regs: cs:%04x ip:%04x ax:%04x bx:%04x cx:%04x dx:%04x si:%04x di:%04x sp:%04x bp:%04x flags:%08x ds:%04x es:%04x fs:%04x gs:%04x ss:%04x\n",
+  fprintf(g_diag_file, "%s: regs: cs:%04x ip:%04x ax:%04x bx:%04x cx:%04x dx:%04x si:%04x di:%04x sp:%04x bp:%04x flags:%08x ds:%04x es:%04x fs:%04x gs:%04x ss:%04x\n",
           prefix, S16(cs), R16(ip),
           R16(ax), R16(bx), R16(cx), R16(dx), R16(si), R16(di), R16(sp), R16(bp), *(unsigned*)&regs->rflags,
           S16(ds), S16(es), S16(fs), S16(gs), S16(ss));
@@ -2035,7 +2048,7 @@ static void get_dos_abspath_r(const char *p, const DirState *dir_state, char *ou
   char *out_p = out_buf, *out_pend = out_buf + out_size;
   char drive_idx;
   const char *in_dos[2];
-  if (DEBUG) fprintf(stderr, "debug: get_dos_abspath_r (%s)\n", p);
+  if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: get_dos_abspath_r (%s)\n", p);
   if (*p == '\0' || out_size < 5) goto done;  /* Empty pathname is an error. */
   if (p[0] != '\0' && p[1] == ':') {
     drive_idx = (p[0] & ~32) - 'A';
@@ -2077,7 +2090,7 @@ static void get_dos_abspath_r(const char *p, const DirState *dir_state, char *ou
   }
  done:
   *out_p = '\0';
-  if (DEBUG) fprintf(stderr, "debug: get_dos_abspath_r=(%s)\n", out_buf);
+  if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: get_dos_abspath_r=(%s)\n", out_buf);
 }
 
 static char fnbuf[LINUX_PATH_SIZE], fnbuf2[LINUX_PATH_SIZE], argv0_fnbuf[LINUX_PATH_SIZE];
@@ -2127,8 +2140,8 @@ static const char *getenv_dos_prefix(const char *name_prefix, const char *env) {
  */
 static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, char had_get_ints, unsigned char *tasm30_bitset) {
   unsigned * const p = (unsigned*)mem + int_num;
-  if (DEBUG || DEBUG_INTVEC) {
-    fprintf(stderr, "debug: set interrupt vector int:%02x to cs:%04x ip:%04x\n",
+  if (DEBUG || DEBUG_INTVEC || DIAG_ON(DIAG_BIT_INT)) {
+    fprintf(g_diag_file, "debug: set interrupt vector int:%02x to cs:%04x ip:%04x\n",
             int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
   }
   /* !!! TODO(pts): Make the default permissive in general, and enable these protections only on a flag. */
@@ -2152,8 +2165,8 @@ static char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, ch
       0) {
     /* FYI kvikdos never sends Ctrl-<Break>. */
   } else {
-    if (DEBUG || DEBUG_INTVEC) {
-      fprintf(stderr, "debug: permissive set interrupt vector int:%02x to cs:%04x ip:%04x\n",
+    if (DEBUG || DEBUG_INTVEC || DIAG_ON(DIAG_BIT_INT)) {
+      fprintf(g_diag_file, "debug: permissive set interrupt vector int:%02x to cs:%04x ip:%04x\n",
               int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
     }
   }
@@ -2940,7 +2953,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
     char do_clear_after_env = envp0 == NULL;
     if (do_clear_after_env) {
       while (*env++ != '\0') {
-        if (DEBUG) fprintf(stderr, "debug: reusing env var (%s)\n", env - 1);
+        if (DEBUG || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: reusing env var (%s)\n", env - 1);
         if (!(env = memchr(env, '\0', env_end - env))) {
           fprintf(stderr, "fatal: exec environment too large\n");
           exit(252);
@@ -2956,7 +2969,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         const char *host_var = *envp0++;
         const char *eq;
         if (!strchr(host_var, '=')) {
-          if (DEBUG) fprintf(stderr, "debug: skipping malformed host env var without '=': %s\n", host_var);
+          if (DEBUG || DIAG_ON(DIAG_BIT_COMPAT)) fprintf(g_diag_file, "debug: skipping malformed host env var without '=': %s\n", host_var);
           continue;
         }
         eq = strchr(host_var, '=');
@@ -3035,7 +3048,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   is_stdout_write_cursor = 0;
   malloc_strategy = MS_BEST_FIT;  /* Doesn't matter which. */
 
-  if (DEBUG) dump_regs("debug", &regs, &sregs);
+  if (DEBUG || DIAG_ON(DIAG_BIT_VERBOSE)) dump_regs("debug", &regs, &sregs);
 
   /* !! Security: close all filehandles except for 0, 1, 2 and kvm_fds, so that read and write from DOS won't be able to touch them. */
 
@@ -3064,7 +3077,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       perror("fatal: KVM_GET_REGS");
       exit(252);
     }
-    if (DEBUG) dump_regs("debug", &regs, &sregs);
+    if (DEBUG || DIAG_ON(DIAG_BIT_VERBOSE)) dump_regs("debug", &regs, &sregs);
 
     if (run->exit_reason != KVM_EXIT_HLT) hlt_spin_count = 0;
     switch (run->exit_reason) {
@@ -3091,7 +3104,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         const unsigned short *csip_ptr = (const unsigned short*)((char*)mem + ((unsigned)sregs.ss.selector << 4) + (*(unsigned short*)&regs.rsp));  /* !! What if rsp wraps around 64 KiB boundary? Test it. Also calculate int_cs again. */
         const unsigned short int_ip = csip_ptr[0], int_cs = csip_ptr[1];  /* Return address. */  /* !! Security: check bounds, also check that rsp <= 0xfffe. */
         const unsigned char ah = ((unsigned)regs.rax >> 8) & 0xff;
-        if (DEBUG || DEBUG_INT) fprintf(stderr, "debug: int 0x%02x ah:%02x al:%02x cs:%04x ip:%04x\n", int_num, ah, (unsigned char)regs.rax, int_cs, int_ip);
+        if (DEBUG || DEBUG_INT || DIAG_ON(DIAG_BIT_INT)) fprintf(g_diag_file, "debug: int 0x%02x ah:%02x al:%02x cs:%04x ip:%04x\n", int_num, ah, (unsigned char)regs.rax, int_cs, int_ip);
         fflush(stdout);
         (void)ah;
         /* Documentation about DOS and BIOS int calls: https://stanislavs.org/helppc/idx_interrupt.html */
@@ -3161,7 +3174,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             (void)!write(1, &c, 1);  /* Emulate STDPRN with stdout. */
           } else if (ah == 0x30) {  /* Get DOS version number. */
             const unsigned char al = (unsigned char)regs.rax;
-            if (DEBUG || DEBUG_INTVEC) fprintf(stderr, "debug: get DOS version\n");
+            if (DEBUG || DEBUG_INTVEC || DIAG_ON(DIAG_BIT_INT)) fprintf(g_diag_file, "debug: get DOS version\n");
             had_get_ints |= 8;
             tasm30_bitset |= 1;
             *(unsigned short*)&regs.rax = 5 | 0 << 8;  /* 5.0. */
@@ -3178,7 +3191,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 if (last_dos_error_code > 0x12) *(unsigned short*)&regs.rax = 0x0d;  /* Invalid data. Use int 0x21 call with ah == 0x59 to get the real error. */
               }
               *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
-              if (DEBUG) fprintf(stderr, "debug: int 0x21 call error\n");
+              if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: int 0x21 call error\n");
             } else {
               const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
               const int size = (int)*(unsigned short*)&regs.rcx;
@@ -3267,7 +3280,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             }
             if (p != p0 && p[-1] == '/') --p;  /* Remove trailing '/'. */
             *p = '\0';  /* Silently truncate to 64 bytes. */
-            if (DEBUG) fprintf(stderr, "debug: get current directory on drive %c: (%s)\n", dir_state->drive, p0);
+            if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: get current directory on drive %c: (%s)\n", dir_state->drive, p0);
             *(unsigned short*)&regs.rax = 0x100;  /* DOSBox 0.74-4 also does this. */
           } else if (ah == 0x3d || ah == 0x3c) {  /* Open to handle (open()). Create to handle (creat()). */
             const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
@@ -3280,11 +3293,11 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             int fd;
             const char *linux_filename;
             char *linux_lastc;  /* Last component of linux_filename. */
-            if (DEBUG) fprintf(stderr, "debug: dos_open(%s) flags=0x%x\n", p, flags);
+            if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: dos_open(%s) flags=0x%x\n", p, flags);
             dir_state->dos_prog_abs = flags3 == O_RDONLY ? dos_prog_abs : NULL;  /* For loading the overlay from prog_filename, even if not mounted. */
             linux_filename = get_linux_filename_r(p, dir_state, fnbuf, &linux_lastc);
             dir_state->dos_prog_abs = NULL;  /* For security. */
-            if (DEBUG) fprintf(stderr, "debug: dos_open(%s) linux_filename=(%s) current_drive=%c:\n", p, linux_filename, dir_state->drive);
+            if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: dos_open(%s) linux_filename=(%s) current_drive=%c:\n", p, linux_filename, dir_state->drive);
             /* There is some code duplication here with "type" in run_dos_batch(). */
             /* Since we check linux_lastc rather than linux_filename, we
              * recognize foo\aux.bar as aux. DOSBox 0.74-4 and MS-DOS 6.22
@@ -3327,7 +3340,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = 4;  /* Too many open files. */
               goto error_on_21;
             }
-            if (DEBUG) fprintf(stderr, "debug: dos_open(%s) dos_fd=%d\n", p, fd);
+            if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: dos_open(%s) dos_fd=%d\n", p, fd);
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             *(unsigned short*)&regs.rax = fd;
           } else if (ah == 0x6c) {  /* Extended open/create (DOS 4.0+). */
@@ -3494,7 +3507,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             if (set_int((unsigned char)regs.rax, *(unsigned short*)&regs.rdx | sregs.ds.selector << 16, mem, had_get_ints, &tasm30_bitset)) goto fatal;
           } else if (ah == 0x35) {  /* Get interrupt vector. */
             const unsigned char get_int_num = (unsigned char)regs.rax;
-            if (DEBUG || DEBUG_INTVEC) fprintf(stderr, "debug: get interrupt vector int:%02x\n", get_int_num);
+            if (DEBUG || DEBUG_INTVEC || DIAG_ON(DIAG_BIT_INT)) fprintf(g_diag_file, "debug: get interrupt vector int:%02x\n", get_int_num);
             if (get_int_num == 0) had_get_ints |= 1;  /* Turbo Pascal 7.0 programs start with this. */
             if (get_int_num == 0x18) { had_get_ints |= 2; tasm30_bitset |= 0x10; }  /* TASM 3.0, TASM 3.2, Borland C++ 2.0 compiler bcc.exe for memory allocation. */
             if (get_int_num == 0x06) had_get_ints |= 4;  /* TLINK 4.0. */
@@ -3509,12 +3522,12 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 ((had_get_ints & 2) && (get_int_num == 0x1b || get_int_num == 0x3f)) ||  /* Borland Turbo C++ 1.01 compiler tcc.exe, Borland C++ 2.0 complier bcc.exe */
                0) {
               const unsigned short *pp = (const unsigned short*)((char*)mem + (get_int_num << 2));
-              if (DEBUG) fprintf(stderr, "debug: get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
+              if (DEBUG || DIAG_ON(DIAG_BIT_INT)) fprintf(g_diag_file, "debug: get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
               (*(unsigned short*)&regs.rbx) = pp[0];
               SET_SREG(es, pp[1]);
             } else {
               const unsigned short *pp = (const unsigned short*)((char*)mem + (get_int_num << 2));
-              if (DEBUG) fprintf(stderr, "debug: permissive get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
+              if (DEBUG || DIAG_ON(DIAG_BIT_INT)) fprintf(g_diag_file, "debug: permissive get interrupt vector int:%02x is cs:%04x ip:%04x\n", get_int_num, pp[1], pp[0]);
               (*(unsigned short*)&regs.rbx) = pp[0];
               SET_SREG(es, pp[1]);
             }
@@ -3559,10 +3572,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 static const char fake_drive = 'C';
                 /* Without the 1 << 15 bit, the VAL 1995-05-27 linker val.exe fprintf(stdout, ...) function wouldn't write anything to stdout. DOSBox 0.74-4 doesn't set 1 << 15 on regular files. */
                 *(unsigned short*)&regs.rdx = S_ISCHR(st.st_mode) ? 1 << 15 /* reserved */ | 1 << 5  /* binary */ | 1 << 7  /* character device */ : 1 << 15 | (fake_drive - 'A') /* regular file on block device */;
-                if (DEBUG) fprintf(stderr, "debug: ioctl get_device_info dos_fd=%d linux_fd=%d result=0x%04x\n", *(unsigned short*)&regs.rbx, fd, *(unsigned short*)&regs.rdx);
+                if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: ioctl get_device_info dos_fd=%d linux_fd=%d result=0x%04x\n", *(unsigned short*)&regs.rbx, fd, *(unsigned short*)&regs.rdx);
                 *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
               } else {
-                if (DEBUG) fprintf(stderr, "debug: ioctl get_device_info dos_fd=%d linux_fd=%d value=0x%04x\n", *(unsigned short*)&regs.rbx, fd, *(unsigned short*)&regs.rdx);
+                if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: ioctl get_device_info dos_fd=%d linux_fd=%d value=0x%04x\n", *(unsigned short*)&regs.rbx, fd, *(unsigned short*)&regs.rdx);
                 if (!S_ISCHR(st.st_mode)) goto error_invalid_drive;  /* We want to indicate that it's not a character device. */
                 /* TLIB 3.01 sets (dx & 0x80) to zero, to disable binary mode (and enable translation). */
                 /* We just ignore the setting. */
@@ -3604,7 +3617,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = 0xff;  /* Input is ready (0xff). */
 #endif
             } else {
-              if (DEBUG) fprintf(stderr, "debug: unsupported DOS ioctl call ignored: call=0x%02x dos_fd=%d\n", al, *(unsigned short*)&regs.rbx);
+              if (DEBUG || DIAG_ON(DIAG_BIT_COMPAT)) fprintf(g_diag_file, "debug: unsupported DOS ioctl call ignored: call=0x%02x dos_fd=%d\n", al, *(unsigned short*)&regs.rbx);
               ioctl_ok = 0;
             }
             if (ioctl_ok) *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
@@ -3616,13 +3629,13 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             char * const mcb = (char*)mem + (block_para << 4) - 16;
             char *next_mcb;
             if (is_mcb_bad(mem, block_para) || MCB_PID(mcb) == 0) {
-              if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: inplace_realloc bad block_para=0x%04x new_size_para=0x%04x\n", block_para, new_size_para);
+              if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: inplace_realloc bad block_para=0x%04x new_size_para=0x%04x\n", block_para, new_size_para);
              error_bad_mcb:
               /*fprintf(stderr, "fatal: bad MCB\n"); goto fatal;*/
               *(unsigned short*)&regs.rax = 7;  /* Memory control blocks destroyed. */ /* !! anasm.com reports this. From where? */
               goto error_on_21;
             }
-            if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: inplace_realloc block_para=0x%04x new_size_para=0x%04x old_size_para=0x%04x\n", block_para, new_size_para, MCB_SIZE_PARA(mcb));
+            if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: inplace_realloc block_para=0x%04x new_size_para=0x%04x old_size_para=0x%04x\n", block_para, new_size_para, MCB_SIZE_PARA(mcb));
             DEBUG_CHECK_ALL_MCBS(mem);
             old_size_para = MCB_SIZE_PARA(mcb);
             if (old_size_para != new_size_para) {
@@ -3631,12 +3644,12 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               available_para = !next_mcb ? (unsigned)(DOS_ALLOC_PARA_LIMIT - block_para) : MCB_PID(next_mcb) != 0 ? old_size_para : old_size_para + 1 + MCB_SIZE_PARA(next_mcb);
               if (new_size_para > available_para) {
                 *(unsigned short*)&regs.rbx = available_para;
-                if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: inplace_realloc insufficient memory\n");
+                if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: inplace_realloc insufficient memory\n");
                error_insufficient_memory:
                 *(unsigned short*)&regs.rax = 8;  /* Insufficient memory. */
                 goto error_on_21;
               }
-              if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: inplace_realloc block_para=0x%04x new_size_para=0x%04x available_para=0x%04x\n", block_para, new_size_para, available_para);
+              if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: inplace_realloc block_para=0x%04x new_size_para=0x%04x available_para=0x%04x\n", block_para, new_size_para, available_para);
               if (!next_mcb) {
                 MCB_SIZE_PARA(mcb) = new_size_para;
               } else if (MCB_PID(next_mcb) != 0) {  /* Insert a free block after the current block. */
@@ -3673,7 +3686,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x48) {  /* Allocate memory (malloc()). */
             const unsigned alloc_size_para = *(unsigned short*)&regs.rbx;
-            if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: malloc(0x%04x)\n", alloc_size_para);
+            if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: malloc(0x%04x)\n", alloc_size_para);
             /*DEBUG_CHECK_ALL_MCBS(mem);*/  /* No need, the is_mcb_bad calls below do all the checks. */
             {
               unsigned fit_waste_para = (unsigned)-1;
@@ -3686,7 +3699,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                   const char * const mcb = (const char*)mem + (block_para << 4) - 16;
                   unsigned size_para;
                   if (is_mcb_bad(mem, block_para)) goto error_bad_mcb;
-                  if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: malloc find block=0x%04x...0x%04x size=0x%04x psize=0x%04x mcb_type=%c is_used=%d\n", block_para, block_para + MCB_SIZE_PARA(mcb), MCB_SIZE_PARA(mcb), MCB_PSIZE_PARA(mcb), MCB_TYPE(mcb), MCB_PID(mcb) != 0);
+                  if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: malloc find block=0x%04x...0x%04x size=0x%04x psize=0x%04x mcb_type=%c is_used=%d\n", block_para, block_para + MCB_SIZE_PARA(mcb), MCB_SIZE_PARA(mcb), MCB_PSIZE_PARA(mcb), MCB_TYPE(mcb), MCB_PID(mcb) != 0);
                   size_para = MCB_SIZE_PARA(mcb);
                   if (MCB_TYPE(mcb) == 'Z') {  /* Last block (must be non-free), try afterwards. */
                     prev_block_para = block_para;
@@ -3698,7 +3711,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                    try_fit:
                     if (size_para >= alloc_size_para) {
                       const unsigned waste_para = malloc_strategy == MS_FIRST_FIT ? block_para : malloc_strategy == MS_BEST_FIT ? size_para - alloc_size_para : /* malloc_strategy >= MS_LAST_FIT ? */ ~block_para;
-                      if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: malloc fit prev_block=0x%04x block=0x%04x waste=0x%04x\n", prev_block_para, block_para, waste_para);
+                      if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: malloc fit prev_block=0x%04x block=0x%04x waste=0x%04x\n", prev_block_para, block_para, waste_para);
                       if (waste_para < fit_waste_para) {
                         fit_waste_para = waste_para;
                         fit_block_para = block_para;
@@ -3715,7 +3728,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               }
               if (fit_waste_para == (unsigned)-1) {
                 *(unsigned short*)&regs.rbx = largest_available_para - (largest_available_para > 0);
-                if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: malloc insufficient memory\n");
+                if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: malloc insufficient memory\n");
                 goto error_insufficient_memory;
               } else {
                 char * const prev_mcb = (char*)mem + (fit_prev_block_para << 4) - 16;
@@ -3723,8 +3736,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 char * const free_mcb = (char*)mem + ((fit_block_para + alloc_size_para) << 4);
                 char mcb_error;
                 if (MCB_TYPE(prev_mcb) == 'Z') {  /* Append after last block. */
-                  if (DEBUG || DEBUG_ALLOC) {
-                    fprintf(stderr, "debug: malloc append prev_block=0x%04x block=0x%04x free=0x%04x strategy=%u\n",
+                  if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) {
+                    fprintf(g_diag_file, "debug: malloc append prev_block=0x%04x block=0x%04x free=0x%04x strategy=%u\n",
                             fit_prev_block_para, fit_block_para, fit_block_para + alloc_size_para + 1, malloc_strategy);
                   }
                   memcpy(mcb, default_program_mcb, 16);
@@ -3745,13 +3758,13 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 {  /* Change existing free block. */
                   char * const next_mcb = mcb + (MCB_SIZE_PARA(mcb) << 4) + 16;
                   MCB_PID(mcb) = PROCESS_ID;  /* Mark as in use. */
-                  if (DEBUG || DEBUG_ALLOC) {
-                    fprintf(stderr, "debug: malloc middle prev_block=0x%04x block=0x%04x next=0x%04x free=0x%04x is_exact_fit=%d strategy=%u\n",
+                  if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) {
+                    fprintf(g_diag_file, "debug: malloc middle prev_block=0x%04x block=0x%04x next=0x%04x free=0x%04x is_exact_fit=%d strategy=%u\n",
                             fit_prev_block_para, fit_block_para, fit_block_para + MCB_SIZE_PARA(mcb) + 1, fit_block_para + alloc_size_para + 1,
                             fit_block_para + MCB_SIZE_PARA(mcb) + 1 == fit_block_para + alloc_size_para + 1, malloc_strategy);
                   }
                   if (free_mcb == next_mcb) {  /* Exact fit. */
-                    if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: malloc exact fit\n");
+                    if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: malloc exact fit\n");
                   } else if (malloc_strategy == MS_LAST_FIT) {  /* Not an exact fit, prepend a free block. */
                     char * const after_mcb = mcb + ((MCB_SIZE_PARA(mcb) - alloc_size_para) << 4);
                     memcpy(after_mcb, default_program_mcb, 16);  /* 'Z' (last) by default. */
@@ -3767,7 +3780,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                       exit(252);
                     }
                     fit_block_para += MCB_SIZE_PARA(mcb) + 1;
-                    if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: malloc last block=0x%04x\n", fit_block_para);
+                    if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: malloc last block=0x%04x\n", fit_block_para);
                   } else {  /* Not an exact fit, append a free block. */
                     const unsigned size_para = MCB_SIZE_PARA(mcb);
                     memcpy(free_mcb, default_program_mcb, 16);
@@ -3791,29 +3804,29 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                   exit(252);
                 }
               }
-              if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: malloc(0x%04x) == 0x%04x\n", alloc_size_para, fit_block_para);
+              if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: malloc(0x%04x) == 0x%04x\n", alloc_size_para, fit_block_para);
               *(unsigned short*)&regs.rax = fit_block_para;  /* Insufficient memory. */
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             }
           } else if (ah == 0x49) {  /* Free allocated memory (free()). */
             const unsigned block_para = (unsigned short)sregs.es.selector;
             char *mcb = (char*)mem + (block_para << 4) - 16;
-            if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: free(0x%04x)\n", block_para);
+            if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free(0x%04x)\n", block_para);
             DEBUG_CHECK_ALL_MCBS(mem);
             if (block_para == PSP_PARA) {  /* It's not allowed to free the program image. */
               goto error_invalid_parameter;
             } else if (block_para > PSP_PARA && block_para < DOS_ALLOC_PARA_LIMIT && mcb[0] == freed_mcb[0] && memcmp(mcb, freed_mcb, 16) == 0) {  /* Already free, has been freed. Succeed as noop just like DOSBox 0.74 and MS-DOS 6.22 do. */
-              if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: free: already freed\n");
+              if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free: already freed\n");
             } else if (is_mcb_bad(mem, block_para)) {
-              if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: free: bad MCB para=0x%04x: %d\n", block_para, is_mcb_bad(mem, block_para));
+              if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free: bad MCB para=0x%04x: %d\n", block_para, is_mcb_bad(mem, block_para));
               goto error_bad_mcb;
             } else if (MCB_PID(mcb) == 0) {  /* Already free. Succeed as noop just like DOSBox 0.74 and MS-DOS 6.22 do. */
-              if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: free: already free\n");
+              if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free: already free\n");
             } else if (is_mcb_bad(mem, block_para - MCB_PSIZE_PARA(mcb) - 1)) {
-              if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: free: bad prev MCB para=0x%04x: %d\n", block_para - MCB_PSIZE_PARA(mcb) - 1, is_mcb_bad(mem, block_para - MCB_PSIZE_PARA(mcb) - 1));
+              if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free: bad prev MCB para=0x%04x: %d\n", block_para - MCB_PSIZE_PARA(mcb) - 1, is_mcb_bad(mem, block_para - MCB_PSIZE_PARA(mcb) - 1));
               goto error_bad_mcb;
             } else if (MCB_TYPE(mcb) != 'Z' && is_mcb_bad(mem, block_para + MCB_SIZE_PARA(mcb) + 1)) {
-              if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: free: bad next MCB para=0x%04x: %d\n", block_para + MCB_SIZE_PARA(mcb) + 1, is_mcb_bad(mem, block_para + MCB_SIZE_PARA(mcb) + 1));
+              if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free: bad next MCB para=0x%04x: %d\n", block_para + MCB_SIZE_PARA(mcb) + 1, is_mcb_bad(mem, block_para + MCB_SIZE_PARA(mcb) + 1));
               goto error_bad_mcb;
             } else {
               char *prev_mcb = mcb - 16 - (MCB_PSIZE_PARA(mcb) << 4);  /* Always exists since block_para != PSP_PARA. */
@@ -3822,9 +3835,9 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 char *next_mcb2 = next_mcb + 16 + (MCB_SIZE_PARA(next_mcb) << 4);
                 const unsigned next_para2 = block_para + MCB_SIZE_PARA(mcb) + 1 + MCB_SIZE_PARA(next_mcb) + 1;
                 const char next_type = MCB_TYPE(next_mcb);
-                if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: free: merge with next free\n");
+                if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free: merge with next free\n");
                 if (next_type != 'Z' && is_mcb_bad(mem, next_para2)) {
-                  if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: free: bad next2 MCB block_para=%04x next_para=0x%04x next_para2=0x%04x: %d\n", block_para, block_para + MCB_SIZE_PARA(mcb) + 1, next_para2, is_mcb_bad(mem, next_para2));
+                  if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free: bad next2 MCB block_para=%04x next_para=0x%04x next_para2=0x%04x: %d\n", block_para, block_para + MCB_SIZE_PARA(mcb) + 1, next_para2, is_mcb_bad(mem, next_para2));
                   goto error_bad_mcb;
                 }
                 MCB_SIZE_PARA(mcb) += 1 + MCB_SIZE_PARA(next_mcb);
@@ -3835,7 +3848,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               MCB_PID(mcb) = 0;  /* Mark it as free. */
               if (MCB_PID(prev_mcb) == 0) {  /* Merge it with the preceding free block. */
                 const char mcb_type = MCB_TYPE(mcb);
-                if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: free: merge with prev free\n");
+                if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free: merge with prev free\n");
                 MCB_SIZE_PARA(prev_mcb) += 1 + MCB_SIZE_PARA(mcb);
                 memcpy(mcb, freed_mcb, 16);
                 if (mcb_type != 'Z') MCB_PSIZE_PARA(next_mcb) = MCB_SIZE_PARA(prev_mcb);
@@ -3843,13 +3856,13 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 mcb = prev_mcb;
               }
               if (MCB_TYPE(mcb) == 'Z') {  /* Delete it as last free MCB. */
-                if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: free: delete last\n");
+                if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free: delete last\n");
                 prev_mcb = mcb - 16 - (MCB_PSIZE_PARA(mcb) << 4);
                 memcpy(mcb, freed_mcb, 16);
                 MCB_TYPE(prev_mcb) = 'Z';
               }
             }
-            if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: free(0x%04x) OK\n", block_para);
+            if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free(0x%04x) OK\n", block_para);
             DEBUG_CHECK_ALL_MCBS(mem);
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
           } else if (ah == 0x43) {  /* Get/set file attributes. */
@@ -3892,7 +3905,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rbx = 0x500;  /* DOS 5.0. */
               *(unsigned short*)&regs.rdx = 0x100;  /* DL contains DOS revision number 0. */
             } else {
-              if (DEBUG) fprintf(stderr, "debug: unsupported get/set system values subcall: al=%02x dl=%02x\n", al, dl);
+              if (DEBUG || DIAG_ON(DIAG_BIT_COMPAT)) fprintf(g_diag_file, "debug: unsupported get/set system values subcall: al=%02x dl=%02x\n", al, dl);
               goto nonfatal_unknown_int_21_call;
             }
           } else if (ah == 0x0e) {  /* Select disk. */
@@ -3915,7 +3928,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               memcpy(p, &country_info, 0x18);
               *(unsigned short*)&regs.rax = *(unsigned short*)&regs.rbx = 1;
             } else {
-              if (DEBUG) fprintf(stderr, "debug: unsupported country subcall: al=%02x\n", al);
+              if (DEBUG || DIAG_ON(DIAG_BIT_COMPAT)) fprintf(g_diag_file, "debug: unsupported country subcall: al=%02x\n", al);
               goto nonfatal_unknown_int_21_call;
             }
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
@@ -3927,7 +3940,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             } else if (al == 0x02) {  /* Get device prefix flag. */
               *(unsigned char*)&regs.rdx = 0xff;  /* Device prefix /dev/... not needed. */
             } else {
-              if (DEBUG) fprintf(stderr, "debug: unsupported switch-character subcall: al=%02x\n", al);
+              if (DEBUG || DIAG_ON(DIAG_BIT_COMPAT)) fprintf(g_diag_file, "debug: unsupported switch-character subcall: al=%02x\n", al);
               goto nonfatal_unknown_int_21_call;
             }
           } else if (ah == 0x4e) {  /* Find first matching file (findfirst). */
@@ -3939,7 +3952,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             char dos_pat_prefix[DOS_PATH_SIZE];
             const char *linux_probe, *linux_dir;
             struct dirent *de;
-            if (DEBUG) fprintf(stderr, "debug: findfirst pattern=(%s) attrs=0x%04x\n", pattern, attrs);
+            if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: findfirst pattern=(%s) attrs=0x%04x\n", pattern, attrs);
             if (!is_linear_byte_user_writable(dta_linear) || !is_linear_byte_user_writable(dta_linear + 0x2b - 1)) goto error_invalid_parameter;
             if (attrs & 8) {  /* Volume label requested. */
              no_more_files:
@@ -4158,7 +4171,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = *(unsigned short*)&regs.rbx;
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
               malloc_strategy = *(unsigned short*)&regs.rbx;
-              if (DEBUG || DEBUG_ALLOC) fprintf(stderr, "debug: set malloc strategy=%u\n", malloc_strategy);
+              if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: set malloc strategy=%u\n", malloc_strategy);
             } else if (al == 0x02) {  /* Get UMB link state. */
               *(unsigned short*)&regs.rax = (unsigned short)(unsigned char)umb_link_state;
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
@@ -4222,7 +4235,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                         dos_filename, safe_args);
                 goto fatal_int;
               }
-              if (DEBUG || DEBUG_EXEC) fprintf(stderr, "debug: exec: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, safe_args);
+              if (DEBUG || DEBUG_EXEC || DIAG_ON(DIAG_BIT_EXEC)) fprintf(g_diag_file, "debug: exec: al:%02x reason=%d program=(%s) args=(%s)\n", al, reason, dos_filename, safe_args);
               if (0 && al == 0) {  /* TODO(pts): Why stop? */
                 /* Power C 2.2.0 compiler pc.exe. */
                 fprintf(stderr, "fatal: unsupported exec with al:%02d: %s\n", al, dos_filename);
@@ -4348,7 +4361,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               }
               if (reason == -1 && cleanup_fn[0] == '\0' && safe_args[0] == '@' && strlen(safe_args) <= sizeof(cleanup_fn)) {
                 strcpy(cleanup_fn, safe_args + 1);  /* Example args: "@turboc.$ln". */
-                if (DEBUG) fprintf(stderr, "debug: will remove file at exit: %s\n", cleanup_fn);
+                if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: will remove file at exit: %s\n", cleanup_fn);
               }
               dir_state->dos_prog_abs = dos_prog_abs;  /* For loading the overlay from prog_filename, even if not mounted. */
               prog_filename = get_linux_filename_r(dos_filename, dir_state, exec_fnbuf, NULL);
@@ -4368,7 +4381,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               strcpy(fnbuf2, safe_args);  /* Large enough to hold 0x7f bytes. */
               args_str = fnbuf2;
               dos_prog_abs = get_dos_abs_filename_r(prog_filename, new_prog_drive, dir_state, dosfnbuf);
-              if (DEBUG) fprintf(stderr, "debug: exec prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dos_prog_abs, new_prog_drive);
+              if (DEBUG || DIAG_ON(DIAG_BIT_EXEC)) fprintf(g_diag_file, "debug: exec prog_filename=(%s) dos_prog_abs=(%s) dos_prog_drive=%c\n", prog_filename, dos_prog_abs, new_prog_drive);
               if (dos_prog_abs[0] == '\0') {
                 fprintf(stderr, "fatal: error getting DOS absolute filename for exec on drive %c: %s\n", new_prog_drive, prog_filename);
                 exit(252);
@@ -5060,7 +5073,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           redir_in[0] = redir_out[0] = redir_err[0] = '\0';
           if (*q == '\x1a') batch_eof = 1;
 	      *q = '\0';  /* Make it ASCIIZ (terminated by \0). */
-	      if (DEBUG) fprintf(stderr, "debug: batch line: (%s)\n", p_line);
+	      if (DEBUG || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: batch line: (%s)\n", p_line);
       if (*p_line == ':') {  /* label */
         if (have_goto) {
           const char *ln = p_line + 1;
@@ -6124,11 +6137,13 @@ static void free_extra_env_args(ParsedCmdArgs *cmd_args) {
 int main(int argc, char **argv) {
   ParsedCmdArgs cmd_args;
   (void)argc;
+  g_diag_file = stderr; /* default diag stream: valid before parse_args (compile-time DEBUG paths may print early) */
   parse_args(
       argv, &cmd_args,
       "kvikdos: run DOS programs headless (a very fast DOS emulator)\nUsage: ", "",
       "This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.\n");
   g_case_fallback_mode = cmd_args.emu_params.case_fallback_mode;
+  g_diag_mask = cmd_args.emu_params.diag_mask;
   if (cmd_args.emu_params.diag_filename) {
     g_diag_file = fopen(cmd_args.emu_params.diag_filename, "ab");
     if (!g_diag_file) {
@@ -6138,6 +6153,9 @@ int main(int argc, char **argv) {
   } else {
     g_diag_file = stderr;
   }
+  /* Unbuffered so a hung or looping guest's diagnostics stream out live instead
+   * of sitting in the stdio buffer until (a never-arriving) exit. */
+  setvbuf(g_diag_file, NULL, _IONBF, 0);
   if (0) {  /* Just dump the parsed command-line. */
     /* cmd_args.dir_state.linux_prog is still NULL, use cmd_args.prog_filename instead. */
     printf("linux prog: %s\n", cmd_args.prog_filename);
@@ -6211,7 +6229,7 @@ int main(int argc, char **argv) {
     } else {
       exit_code = run_dos_prog(&emu, cmd_args.prog_filename, NULL, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0, (const char* const*)cmd_args.extra_env, cmd_args.extra_env_count);
     }
-    if (DEBUG) fprintf(stderr, "debug: DOS program exited with code: 0x%02x", exit_code);
+    if (DEBUG || DIAG_ON(DIAG_BIT_EXEC)) fprintf(g_diag_file, "debug: DOS program exited with code: 0x%02x", exit_code);
     free_extra_env_args(&cmd_args);
     return exit_code;
   }
