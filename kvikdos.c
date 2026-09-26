@@ -91,6 +91,108 @@ static unsigned g_diag_mask = 0;
 /* Runtime enable check, OR'd into the compile-time DEBUG* gates so that
  * --diag=<cat> turns the matching diagnostics on without a rebuild. */
 #define DIAG_ON(bit) (g_diag_mask & (unsigned)(bit))
+static FILE *g_io_trace_file = NULL;
+static int g_io_trace_all = 0;
+static char *g_mem_dump_filename = NULL;
+static unsigned long g_mem_dump_start = 0;
+static unsigned long g_mem_dump_size = 0;
+static int g_exit_regs = 0;
+
+static void close_io_trace_file(void) {
+  if (g_io_trace_file != NULL) {
+    fclose(g_io_trace_file);
+    g_io_trace_file = NULL;
+  }
+}
+
+static void maybe_open_io_trace_file(void) {
+  const char *filename = getenv("KVIKDOS_IO_TRACE");
+  const char *mode = getenv("KVIKDOS_IO_TRACE_PORTS");
+  if (filename == NULL || filename[0] == '\0') return;
+  g_io_trace_all = (mode != NULL && 0 == strcmp(mode, "all"));
+  g_io_trace_file = fopen(filename, "wb");
+  if (g_io_trace_file == NULL) {
+    perror("fatal: cannot open KVIKDOS_IO_TRACE");
+    exit(1);
+  }
+  if (atexit(close_io_trace_file) != 0) {
+    fprintf(stderr, "fatal: atexit failed for KVIKDOS_IO_TRACE\n");
+    exit(1);
+  }
+}
+
+static void maybe_parse_mem_dump(void) {
+  const char *filename = getenv("KVIKDOS_MEM_DUMP");
+  const char *start = getenv("KVIKDOS_MEM_DUMP_START");
+  const char *size = getenv("KVIKDOS_MEM_DUMP_SIZE");
+  char *endp;
+  if (filename == NULL || filename[0] == '\0') return;
+  if (start == NULL || size == NULL || start[0] == '\0' || size[0] == '\0') {
+    fprintf(stderr, "fatal: KVIKDOS_MEM_DUMP requires KVIKDOS_MEM_DUMP_START and KVIKDOS_MEM_DUMP_SIZE\n");
+    exit(1);
+  }
+  g_mem_dump_start = strtoul(start, &endp, 0);
+  if (*endp != '\0') {
+    fprintf(stderr, "fatal: bad KVIKDOS_MEM_DUMP_START: %s\n", start);
+    exit(1);
+  }
+  g_mem_dump_size = strtoul(size, &endp, 0);
+  if (*endp != '\0') {
+    fprintf(stderr, "fatal: bad KVIKDOS_MEM_DUMP_SIZE: %s\n", size);
+    exit(1);
+  }
+  g_mem_dump_filename = xstrdup(filename);
+  if (g_mem_dump_filename == NULL) {
+    perror("fatal: xstrdup");
+    exit(1);
+  }
+}
+
+static void maybe_parse_exit_regs(void) {
+  const char *value = getenv("KVIKDOS_EXIT_REGS");
+  g_exit_regs = (value != NULL && value[0] != '\0' && strcmp(value, "0") != 0);
+}
+
+static void maybe_dump_guest_mem(const void *mem, unsigned mem_size) {
+  int fd;
+  if (g_mem_dump_filename == NULL) return;
+  if (g_mem_dump_start > mem_size || g_mem_dump_size > mem_size - g_mem_dump_start) {
+    fprintf(stderr, "fatal: KVIKDOS_MEM_DUMP range out of bounds: start=0x%lx size=0x%lx mem=0x%x\n",
+            g_mem_dump_start, g_mem_dump_size, mem_size);
+    exit(252);
+  }
+  fd = open(g_mem_dump_filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (fd < 0) {
+    perror("fatal: cannot open KVIKDOS_MEM_DUMP");
+    exit(252);
+  }
+  if ((unsigned long)write(fd, (const char*)mem + g_mem_dump_start, g_mem_dump_size) != g_mem_dump_size) {
+    perror("fatal: cannot write KVIKDOS_MEM_DUMP");
+    close(fd);
+    exit(252);
+  }
+  close(fd);
+}
+
+static void trace_guest_io(unsigned short port, unsigned char direction, unsigned char size, unsigned char count, const char *data) {
+  unsigned i;
+  unsigned n;
+  unsigned char rec[4];
+  if (g_io_trace_file == NULL) return;
+  if (!g_io_trace_all && !(port == 0x388 || port == 0x389)) return;
+  if (size == 0 || count == 0) return;
+  n = (unsigned)size * (unsigned)count;
+  rec[0] = direction ? 'O' : 'I';
+  rec[1] = (unsigned char)port;
+  rec[2] = (unsigned char)(port >> 8);
+  for (i = 0; i < n; ++i) {
+    rec[3] = (unsigned char)data[i];
+    if (fwrite(rec, 1, sizeof(rec), g_io_trace_file) != sizeof(rec)) {
+      perror("fatal: error writing KVIKDOS_IO_TRACE");
+      exit(252);
+    }
+  }
+}
 
 #ifdef USE_MINI_KVM  /* For systems with a broken linux/kvm.h. */
 #  include "mini_kvm.h"
@@ -668,6 +770,27 @@ typedef struct EmuParams {
   unsigned diag_mask;
   unsigned case_fallback_mode;  /* 0=off 1=prog 2=all */
   char strict_mode;  /* 0=permissive 1=strict */
+  char batch_cd_root_mode;  /* 0=legacy, 1=interpret `cd \foo' as drive-root absolute. */
+  char call_near_enabled;
+  unsigned short call_near_ip;
+  char call_far_enabled;
+  unsigned short call_far_seg;
+  unsigned short call_far_ip;
+  char call_ss_enabled;
+  unsigned short call_ss;
+  unsigned short call_sp;
+  char call_cs_enabled;
+  unsigned short call_cs;
+  char call_ds_enabled;
+  unsigned short call_ds;
+  unsigned short call_args[16];
+  unsigned call_arg_count;
+  unsigned short call_set_regs[7];  /* ax,cx,dx,bx,si,di,bp */
+  unsigned call_set_mask;
+  unsigned short poke_word_segs[64];
+  unsigned short poke_word_ofs[64];
+  unsigned short poke_word_values[64];
+  unsigned poke_word_count;
 } EmuParams;
 
 typedef struct ParsedCmdArgs {
@@ -706,6 +829,22 @@ static void init_parsed_cmd_args(ParsedCmdArgs *cmd_args, char *placeholder_for_
   cmd_args->emu_params.diag_mask = 1;  /* compat */
   cmd_args->emu_params.case_fallback_mode = 2;  /* all */
   cmd_args->emu_params.strict_mode = 0;  /* permissive */
+  cmd_args->emu_params.batch_cd_root_mode = 0;  /* legacy */
+  cmd_args->emu_params.call_near_enabled = 0;
+  cmd_args->emu_params.call_near_ip = 0;
+  cmd_args->emu_params.call_far_enabled = 0;
+  cmd_args->emu_params.call_far_seg = 0;
+  cmd_args->emu_params.call_far_ip = 0;
+  cmd_args->emu_params.call_ss_enabled = 0;
+  cmd_args->emu_params.call_ss = 0;
+  cmd_args->emu_params.call_sp = 0;
+  cmd_args->emu_params.call_cs_enabled = 0;
+  cmd_args->emu_params.call_cs = 0;
+  cmd_args->emu_params.call_ds_enabled = 0;
+  cmd_args->emu_params.call_ds = 0;
+  cmd_args->emu_params.call_arg_count = 0;
+  cmd_args->emu_params.call_set_mask = 0;
+  cmd_args->emu_params.poke_word_count = 0;
 }
 
 static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const char *pre_msg, const char *usage_extra, const char *post_msg) {
@@ -738,6 +877,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
                     "  --path-dos=<pathlist>      Set DOS PATH directly (e.g. C:\\BIN;C:\\)\n"
                     "  --prog=<dos-pathname>      Set DOS pathname of running program\n"
                     "  --cwd-dos=<path>           Set initial DOS current directory (e.g. C:\\BIN)\n"
+                    "  --batch-cd-root            Enable root-absolute `cd \\foo' in .bat built-in `cd'\n"
                     "\n"
                     "Mounts:\n"
                     "  --mount=<drive><case><dirname>/   Mount Linux dir to DOS drive\n"
@@ -756,7 +896,17 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
                     "  --tty-in=<fd>               -3 fake, -2 buffered stdin, -1 /dev/tty, >=0 fd\n"
                     "  --mem-mb=<n>                DOS memory in MiB (currently only 1)\n"
                     "  --hlt-ok                    Allow hlt instruction\n"
-                    "  --hlt-dump=<filename>       Dump guest memory on hlt\n",
+                    "  --hlt-dump=<filename>       Dump guest memory on hlt\n"
+                    "\n"
+                    "Function Harness:\n"
+                    "  --call-near=<ip>            Run one near function at CS:<ip> after loading the MZ image\n"
+                    "  --call-far=<seg>:<ip>       Run one far function at <seg>:<ip> after loading the MZ image\n"
+                    "  --call-cs=<seg>             Set CS before entering --call-near\n"
+                    "  --call-ss=<seg>:<sp>        Set SS:SP before entering --call-near/--call-far\n"
+                    "  --call-ds=<seg>             Set DS and ES before entering --call-near\n"
+                    "  --call-arg=<word>           Append one 16-bit stack argument for --call-near\n"
+                    "  --call-set=<reg>:<word>     Set ax/cx/dx/bx/si/di/bp before --call-near/--call-far\n"
+                    "  --poke-word=<seg>:<off>:<word>  Store one 16-bit word before --call-near\n",
                     pre_msg, argv0, usage_extra, post_msg);
     exit(argv0 && argv[1] ? 0 : 1);
   }
@@ -819,6 +969,181 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     } else if (0 == strncmp(arg, "--hlt-dump=", 11)) {
       arg += 11;
       goto do_hlt_dump;
+    } else if (0 == strcmp(arg, "--call-near")) {
+      char *endp;
+      unsigned long value;
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_call_near:
+      value = strtoul(arg, &endp, 0);
+      if (*endp != '\0' || value > 0xffffUL) {
+        fprintf(stderr, "fatal: call-near argument must be a 16-bit offset: %s\n", arg);
+        exit(1);
+      }
+      cmd_args.emu_params.call_near_enabled = 1;
+      cmd_args.emu_params.call_near_ip = (unsigned short)value;
+      cmd_args.emu_params.is_hlt_ok = 1;
+    } else if (0 == strncmp(arg, "--call-near=", 12)) {
+      arg += 12;
+      goto do_call_near;
+    } else if (0 == strcmp(arg, "--call-far")) {
+      char *endp;
+      unsigned long seg, ofs;
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_call_far:
+      seg = strtoul(arg, &endp, 0);
+      if (*endp != ':') {
+        fprintf(stderr, "fatal: call-far argument must be <seg>:<ip>: %s\n", arg);
+        exit(1);
+      }
+      ofs = strtoul(endp + 1, &endp, 0);
+      if (*endp != '\0' || ofs > 0xffffUL || seg > 0xffffUL) {
+        fprintf(stderr, "fatal: call-far argument must be <seg>:<ip>: %s\n", arg);
+        exit(1);
+      }
+      cmd_args.emu_params.call_far_enabled = 1;
+      cmd_args.emu_params.call_far_seg = (unsigned short)seg;
+      cmd_args.emu_params.call_far_ip = (unsigned short)ofs;
+      cmd_args.emu_params.is_hlt_ok = 1;
+    } else if (0 == strncmp(arg, "--call-far=", 11)) {
+      arg += 11;
+      goto do_call_far;
+    } else if (0 == strcmp(arg, "--call-ss")) {
+      char *endp;
+      unsigned long seg, ofs;
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_call_ss:
+      seg = strtoul(arg, &endp, 0);
+      if (*endp != ':') {
+        fprintf(stderr, "fatal: call-ss argument must be <seg>:<sp>: %s\n", arg);
+        exit(1);
+      }
+      ofs = strtoul(endp + 1, &endp, 0);
+      if (*endp != '\0' || ofs > 0xffffUL || seg > 0xffffUL) {
+        fprintf(stderr, "fatal: call-ss argument must be <seg>:<sp>: %s\n", arg);
+        exit(1);
+      }
+      cmd_args.emu_params.call_ss_enabled = 1;
+      cmd_args.emu_params.call_ss = (unsigned short)seg;
+      cmd_args.emu_params.call_sp = (unsigned short)ofs;
+    } else if (0 == strncmp(arg, "--call-ss=", 10)) {
+      arg += 10;
+      goto do_call_ss;
+    } else if (0 == strcmp(arg, "--call-cs")) {
+      char *endp;
+      unsigned long value;
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_call_cs:
+      value = strtoul(arg, &endp, 0);
+      if (*endp != '\0' || value > 0xffffUL) {
+        fprintf(stderr, "fatal: call-cs argument must be a 16-bit segment: %s\n", arg);
+        exit(1);
+      }
+      cmd_args.emu_params.call_cs_enabled = 1;
+      cmd_args.emu_params.call_cs = (unsigned short)value;
+    } else if (0 == strncmp(arg, "--call-cs=", 10)) {
+      arg += 10;
+      goto do_call_cs;
+    } else if (0 == strcmp(arg, "--call-ds")) {
+      char *endp;
+      unsigned long value;
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_call_ds:
+      value = strtoul(arg, &endp, 0);
+      if (*endp != '\0' || value > 0xffffUL) {
+        fprintf(stderr, "fatal: call-ds argument must be a 16-bit segment: %s\n", arg);
+        exit(1);
+      }
+      cmd_args.emu_params.call_ds_enabled = 1;
+      cmd_args.emu_params.call_ds = (unsigned short)value;
+    } else if (0 == strncmp(arg, "--call-ds=", 10)) {
+      arg += 10;
+      goto do_call_ds;
+    } else if (0 == strcmp(arg, "--call-arg")) {
+      char *endp;
+      unsigned long value;
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_call_arg:
+      if (cmd_args.emu_params.call_arg_count >= sizeof(cmd_args.emu_params.call_args) / sizeof(cmd_args.emu_params.call_args[0])) {
+        fprintf(stderr, "fatal: too many call-arg values, maximum is 16\n");
+        exit(1);
+      }
+      value = strtoul(arg, &endp, 0);
+      if (*endp != '\0' || value > 0xffffUL) {
+        fprintf(stderr, "fatal: call-arg argument must be a 16-bit word: %s\n", arg);
+        exit(1);
+      }
+      cmd_args.emu_params.call_args[cmd_args.emu_params.call_arg_count++] = (unsigned short)value;
+    } else if (0 == strncmp(arg, "--call-arg=", 11)) {
+      arg += 11;
+      goto do_call_arg;
+    } else if (0 == strcmp(arg, "--call-set")) {
+      char *endp;
+      unsigned long value;
+      unsigned idx;
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+     do_call_set:
+      if (0 == strncmp(arg, "ax:", 3)) idx = 0;
+      else if (0 == strncmp(arg, "cx:", 3)) idx = 1;
+      else if (0 == strncmp(arg, "dx:", 3)) idx = 2;
+      else if (0 == strncmp(arg, "bx:", 3)) idx = 3;
+      else if (0 == strncmp(arg, "si:", 3)) idx = 4;
+      else if (0 == strncmp(arg, "di:", 3)) idx = 5;
+      else if (0 == strncmp(arg, "bp:", 3)) idx = 6;
+      else {
+        fprintf(stderr, "fatal: call-set argument must be <ax|cx|dx|bx|si|di|bp>:<word>: %s\n", arg);
+        exit(1);
+      }
+      value = strtoul(arg + 3, &endp, 0);
+      if (*endp != '\0' || value > 0xffffUL) {
+        fprintf(stderr, "fatal: call-set argument must be a 16-bit word: %s\n", arg);
+        exit(1);
+      }
+      cmd_args.emu_params.call_set_regs[idx] = (unsigned short)value;
+      cmd_args.emu_params.call_set_mask |= 1U << idx;
+    } else if (0 == strncmp(arg, "--call-set=", 11)) {
+      arg += 11;
+      goto do_call_set;
+    } else if (0 == strcmp(arg, "--poke-word")) {
+      if (!argv[0]) goto missing_argument;
+      arg = *argv++;
+      goto do_poke_word;
+    } else if (0 == strncmp(arg, "--poke-word=", 12)) {
+      arg += 12;
+     do_poke_word:
+      {
+        char *p1, *p2, *endp;
+        unsigned long seg, ofs, value;
+        if (cmd_args.emu_params.poke_word_count >= sizeof(cmd_args.emu_params.poke_word_values) / sizeof(cmd_args.emu_params.poke_word_values[0])) {
+          fprintf(stderr, "fatal: too many poke-word values, maximum is 64\n");
+          exit(1);
+        }
+        seg = strtoul(arg, &p1, 0);
+        if (*p1 != ':') {
+          fprintf(stderr, "fatal: poke-word argument must be <seg>:<off>:<word>: %s\n", arg);
+          exit(1);
+        }
+        ofs = strtoul(p1 + 1, &p2, 0);
+        if (*p2 != ':') {
+          fprintf(stderr, "fatal: poke-word argument must be <seg>:<off>:<word>: %s\n", arg);
+          exit(1);
+        }
+        value = strtoul(p2 + 1, &endp, 0);
+        if (*endp != '\0' || seg > 0xffffUL || ofs > 0xffffUL || value > 0xffffUL) {
+          fprintf(stderr, "fatal: poke-word values must be 16-bit numbers: %s\n", arg);
+          exit(1);
+        }
+        cmd_args.emu_params.poke_word_segs[cmd_args.emu_params.poke_word_count] = (unsigned short)seg;
+        cmd_args.emu_params.poke_word_ofs[cmd_args.emu_params.poke_word_count] = (unsigned short)ofs;
+        cmd_args.emu_params.poke_word_values[cmd_args.emu_params.poke_word_count] = (unsigned short)value;
+        ++cmd_args.emu_params.poke_word_count;
+      }
     } else if (0 == strcmp(arg, "--mount")) {  /* Can be specified multiple times. */
       if (!argv[0]) goto missing_argument;
       arg = *argv++;
@@ -911,6 +1236,8 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
       cmd_args.emu_params.strict_mode = 0;
     } else if (0 == strcmp(arg, "--strict")) {
       cmd_args.emu_params.strict_mode = 1;
+    } else if (0 == strcmp(arg, "--batch-cd-root")) {
+      cmd_args.emu_params.batch_cd_root_mode = 1;
     } else if (0 == strcmp(arg, "--path-dos")) {
       if (!argv[0]) goto missing_argument;
       path_dos_flag = *argv++;
@@ -1262,6 +1589,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
  * 0x01000...0x01100    +0x100  PSP_PARA. Program Segment Prefix (PSP). https://stanislavs.org/helppc/program_segment_prefix.html
  * 0x01100...0xa0000  +0x9ef00  Loaded program image, .bss and stack. This region is called ``conventional memory''.
  * 0xa0000                  +0  DOS_ALLOC_PARA_LIMIT and DOS_MEM_LIMIT.
+ * 0xa0000...0xc0000  +0x20000  EGA/VGA/CGA/MDA display memory, mapped for direct text/graphics writes and --hlt-dump capture.
  *
  * On a normal machine, there is also EBDA which ends at 0xa0000. You can
  * determine the size of the EBDA by using BIOS function `int 0x12', or by
@@ -1384,6 +1712,13 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
  * Must be divisible by 0x1000 because it's used in madvise().
  */
 #define DOS_MEM_LIMIT 0xa0000
+
+/* Mapped guest memory limit. This intentionally extends beyond DOS_MEM_LIMIT
+ * so programs can write VGA/CGA/MDA display memory directly at A000:0000,
+ * B000:0000, and B800:0000, while DOS allocation/top-of-memory still stop at
+ * conventional memory.
+ */
+#define GUEST_MEM_LIMIT 0xc0000
 
 /* Points after last paragraph which can be allocated by DOS, conventional memory. 640 KiB. */
 #define DOS_ALLOC_PARA_LIMIT 0xa000
@@ -2413,7 +2748,7 @@ static void reset_emu(struct EmuState *emu) {
       exit(252);
     }
     /* If emu_params->mem_mb > 1, then we have allocate more. */
-    if ((emu->mem = mem = mmap(NULL, DOS_MEM_LIMIT, PROT_READ | PROT_WRITE,
+    if ((emu->mem = mem = mmap(NULL, GUEST_MEM_LIMIT, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) ==
         NULL) {
       perror("fatal: mmap");
@@ -2423,7 +2758,7 @@ static void reset_emu(struct EmuState *emu) {
     memset(&region, 0, sizeof(region));
     region.slot = 0;
     region.guest_phys_addr = GUEST_MEM_MODULE_START;  /* Must be a multiple of the Linux page size (0x1000), otherwise KVM_SET_USER_MEMORY_REGION returns EINVAL. */
-    region.memory_size = DOS_MEM_LIMIT - GUEST_MEM_MODULE_START;
+    region.memory_size = GUEST_MEM_LIMIT - GUEST_MEM_MODULE_START;
     region.userspace_addr = (uintptr_t)mem + GUEST_MEM_MODULE_START;
     /*region.flags = KVM_MEM_READONLY;*/  /* Not needed, read-write is default. */
     if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
@@ -2709,6 +3044,30 @@ static int is_probable_windows_message_stub(const char *path) {
   return is_stub;
 }
 
+static int is_probable_dos_extender_program(const char *path) {
+  int fd;
+  unsigned char *buf = NULL;
+  ssize_t got;
+  int is_ext = 0;
+  const size_t scan_size = 1U << 20;  /* Scan first 1 MiB. */
+  fd = open(path, O_RDONLY);
+  if (fd < 0) return 0;
+  buf = (unsigned char*)malloc(scan_size);
+  if (!buf) goto done;
+  got = read(fd, buf, scan_size);
+  if (got <= 0) goto done;
+  if (memmem(buf, (size_t)got, "DOSX16", 6) ||
+      memmem(buf, (size_t)got, "DPMI, VCPI", 10) ||
+      memmem(buf, (size_t)got, "__DOSEXT16_MODE", 14) ||
+      memmem(buf, (size_t)got, "DOSEXTENDER", 10)) {
+    is_ext = 1;
+  }
+ done:
+  if (buf) free(buf);
+  close(fd);
+  return is_ext;
+}
+
 static int run_with_wine(const char *prog_filename, const char *const *args, const char *linux_cwd) {
   const char *argv_child[512];
   unsigned argc = 0;
@@ -2855,6 +3214,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   unsigned short ems_pages_by_handle[EMS_HANDLE_COUNT];
   unsigned short ems_page_map[4];
   unsigned short ems_free_pages, ems_total_pages;
+  unsigned short call_hlt_cs, call_hlt_ip;
   enum malloc_strategy_t { MS_FIRST_FIT = 0, MS_BEST_FIT = 1, MS_LAST_FIT = 2 };
   unsigned malloc_strategy;
   char cleanup_fn[16];
@@ -2893,6 +3253,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   memset(ems_pages_by_handle, 0, sizeof(ems_pages_by_handle));
   ems_page_map[0] = ems_page_map[1] = ems_page_map[2] = ems_page_map[3] = 0xffff;
   ems_total_pages = ems_free_pages = 256;  /* 4 MiB EMS in 16 KiB pages. */
+  call_hlt_cs = call_hlt_ip = 0;
   cleanup_fn[0] = '\0';
   find_dirp = NULL;
   find_linux_dir[0] = '\0';
@@ -3032,6 +3393,77 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   FIX_SREG(fs);
   FIX_SREG(gs);
 
+  if (emu_params->poke_word_count != 0) {
+    unsigned i;
+    for (i = 0; i < emu_params->poke_word_count; ++i) {
+      unsigned linear = ((unsigned)emu_params->poke_word_segs[i] << 4) + emu_params->poke_word_ofs[i];
+      if (linear + 2 > DOS_MEM_LIMIT) {
+        fprintf(stderr, "fatal: --poke-word address out of DOS memory\n");
+        exit(252);
+      }
+      *(unsigned short*)((char*)mem + linear) = emu_params->poke_word_values[i];
+    }
+  }
+
+  if (emu_params->call_near_enabled || emu_params->call_far_enabled) {
+    unsigned i;
+    unsigned short new_sp;
+    unsigned stack_linear;
+    unsigned frame_words = emu_params->call_far_enabled ? 2 : 1;
+
+    /* Build the exact stack a near CALL (or far CALLF for --call-far) would
+     * have produced: [SP] is the return IP ([SP+2] the return CS for far
+     * calls) and the following words are C/Pascal 16-bit arguments in source
+     * order. Small-model game code expects DS/ES to be DGROUP after the C
+     * runtime starts; callers can provide that selector with --call-ds. */
+    if (emu_params->call_cs_enabled) {
+      SET_SREG(cs, emu_params->call_cs);
+    }
+    if (emu_params->call_ss_enabled) {
+      SET_SREG(ss, emu_params->call_ss);
+      regs.rsp = emu_params->call_sp;
+    }
+    if (emu_params->call_ds_enabled) {
+      SET_SREG(ds, emu_params->call_ds);
+      SET_SREG(es, emu_params->call_ds);
+    } else {
+      SET_SREG(ds, sregs.ss.selector);
+      SET_SREG(es, sregs.ss.selector);
+    }
+    if (emu_params->call_set_mask) {
+      if (emu_params->call_set_mask & (1U << 0)) regs.rax = emu_params->call_set_regs[0];
+      if (emu_params->call_set_mask & (1U << 1)) regs.rcx = emu_params->call_set_regs[1];
+      if (emu_params->call_set_mask & (1U << 2)) regs.rdx = emu_params->call_set_regs[2];
+      if (emu_params->call_set_mask & (1U << 3)) regs.rbx = emu_params->call_set_regs[3];
+      if (emu_params->call_set_mask & (1U << 4)) regs.rsi = emu_params->call_set_regs[4];
+      if (emu_params->call_set_mask & (1U << 5)) regs.rdi = emu_params->call_set_regs[5];
+      if (emu_params->call_set_mask & (1U << 6)) regs.rbp = emu_params->call_set_regs[6];
+    }
+    call_hlt_cs = sregs.cs.selector;
+    call_hlt_ip = (unsigned short)regs.rip;
+    ((unsigned char*)mem)[sregs.cs.base + call_hlt_ip] = 0xf4;  /* HLT sentinel after RET. */
+    new_sp = (unsigned short)((unsigned short)regs.rsp - (unsigned short)(2 * (emu_params->call_arg_count + frame_words)));
+    stack_linear = sregs.ss.base + new_sp;
+    if (stack_linear + 2 * (emu_params->call_arg_count + frame_words) > DOS_MEM_LIMIT) {
+      fprintf(stderr, "fatal: --call-near/--call-far stack frame out of DOS memory\n");
+      exit(252);
+    }
+    *(unsigned short*)((char*)mem + stack_linear) = call_hlt_ip;
+    if (emu_params->call_far_enabled) {
+      *(unsigned short*)((char*)mem + stack_linear + 2) = call_hlt_cs;
+    }
+    for (i = 0; i < emu_params->call_arg_count; ++i) {
+      *(unsigned short*)((char*)mem + stack_linear + 2 * frame_words + i * 2) = emu_params->call_args[i];
+    }
+    regs.rsp = new_sp;
+    if (emu_params->call_far_enabled) {
+      SET_SREG(cs, emu_params->call_far_seg);
+      regs.rip = emu_params->call_far_ip;
+    } else {
+      regs.rip = emu_params->call_near_ip;
+    }
+  }
+
   *(unsigned short*)&regs.rflags |= 1 << 1;  /* Reserved bit in EFLAGS. */
   /**(unsigned short*)&regs.rflags |= 1 << 9;*/  /* IF=1, enable interrupts. */
 
@@ -3085,12 +3517,15 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       { char *p = (char*)run + run->io.data_offset;
         if (run->io.port == 0x40 && run->io.size == 1 && run->io.direction == 0) {
           *p = port_0x40_tick++;  /* Simulate some timer ticks. */
+          trace_guest_io(run->io.port, run->io.direction, run->io.size, run->io.count, p);
           break;
         } else if (!emu_params->strict_mode) {
           if (run->io.direction == 0) memset(p, 0, run->io.size * run->io.count);  /* IN: return 0. */
+          trace_guest_io(run->io.port, run->io.direction, run->io.size, run->io.count, p);
           /* OUT: ignore in permissive mode. */
           break;
         } else {
+          trace_guest_io(run->io.port, run->io.direction, run->io.size, run->io.count, p);
           fprintf(stderr, "fatal: IO port: port=0x%02x data=%08x size=%d direction=%s\n", run->io.port, *(const unsigned*)p, run->io.size, run->io.direction ? "out" : "in");
           goto fatal;
         }
@@ -3105,6 +3540,22 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         const unsigned short int_ip = csip_ptr[0], int_cs = csip_ptr[1];  /* Return address. */  /* !! Security: check bounds, also check that rsp <= 0xfffe. */
         const unsigned char ah = ((unsigned)regs.rax >> 8) & 0xff;
         if (DEBUG || DEBUG_INT || DIAG_ON(DIAG_BIT_INT)) fprintf(g_diag_file, "debug: int 0x%02x ah:%02x al:%02x cs:%04x ip:%04x\n", int_num, ah, (unsigned char)regs.rax, int_cs, int_ip);
+        /* TEMP-DIAG: on int 6, dump fault context + stack backtrace to find the caller. */
+        if (int_num == 6) {
+          static int int6_count = 0;
+          if (++int6_count <= 2) {
+            unsigned char *m = (unsigned char*)mem;
+            unsigned fb = ((unsigned)int_cs << 4) + int_ip;   /* faulting/return addr */
+            unsigned sb = ((unsigned)sregs.ss.selector << 4) + (*(unsigned short*)&regs.rsp);
+            int k;
+            fprintf(g_diag_file, "  INT6 ctx: ss:%04x sp:%04x ds:%04x es:%04x  fault-bytes@%04x:%04x:",
+                sregs.ss.selector, (unsigned short)regs.rsp, sregs.ds.selector, sregs.es.selector, int_cs, int_ip);
+            for (k = -4; k < 8; ++k) fprintf(g_diag_file, " %02x", m[(fb + k) & 0x1fffff]);
+            fprintf(g_diag_file, "\n  stack@%04x:%04x (return-addr chain):", sregs.ss.selector, (unsigned short)regs.rsp);
+            for (k = 0; k < 96; k += 2) fprintf(g_diag_file, " %04x", (unsigned)(m[((sb + k) & 0x1fffff)] | (m[((sb + k + 1) & 0x1fffff)] << 8)));
+            fprintf(g_diag_file, "\n");
+          }
+        }
         fflush(stdout);
         (void)ah;
         /* Documentation about DOS and BIOS int calls: https://stanislavs.org/helppc/idx_interrupt.html */
@@ -3140,6 +3591,12 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             if (cleanup_fn[0] != '\0') unlink(get_linux_filename(cleanup_fn));
            do_exit:
             if (find_dirp) { closedir(find_dirp); find_dirp = NULL; }
+            if (g_exit_regs) {
+              fprintf(stderr, "info: exit regs cs=%04x ds=%04x es=%04x ss=%04x ip=%04x sp=%04x ax=%04x\n",
+                      sregs.cs.selector, sregs.ds.selector, sregs.es.selector, sregs.ss.selector,
+                      (unsigned short)regs.rip, (unsigned short)regs.rsp, (unsigned short)regs.rax);
+            }
+            maybe_dump_guest_mem(mem, GUEST_MEM_LIMIT);
             return (unsigned char)regs.rax;
           } else if (ah == 0x06) {  /* Direct console I/O. */
            func_0x06:
@@ -4847,13 +5304,28 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         if (emu_params->hlt_dump_filename) {
           const int fd = open(emu_params->hlt_dump_filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
           if (fd >= 0) {
-            if (write(fd, mem, DOS_MEM_LIMIT) != DOS_MEM_LIMIT) {
+            if (write(fd, mem, GUEST_MEM_LIMIT) != GUEST_MEM_LIMIT) {
               fprintf(stderr, "error: error writing to --hlt-dump=... file: %s\n", emu_params->hlt_dump_filename);
             }
             close(fd);
           } else {
             fprintf(stderr, "error: error opening --hlt-dump=... file for writing: %s\n", emu_params->hlt_dump_filename);
           }
+        }
+        if ((emu_params->call_near_enabled || emu_params->call_far_enabled) &&
+            sregs.cs.selector == call_hlt_cs &&
+            (unsigned short)(regs.rip - 1) == call_hlt_ip) {
+          maybe_dump_guest_mem(mem, GUEST_MEM_LIMIT);
+          fprintf(stdout,
+                  "kvikdos-call-result cs=%04x ip=%04x ax=%04x bx=%04x cx=%04x dx=%04x si=%04x di=%04x sp=%04x bp=%04x flags=%04x ds=%04x es=%04x ss=%04x\n",
+                  sregs.cs.selector, (unsigned short)regs.rip,
+                  (unsigned short)regs.rax, (unsigned short)regs.rbx,
+                  (unsigned short)regs.rcx, (unsigned short)regs.rdx,
+                  (unsigned short)regs.rsi, (unsigned short)regs.rdi,
+                  (unsigned short)regs.rsp, (unsigned short)regs.rbp,
+                  (unsigned short)regs.rflags, sregs.ds.selector,
+                  sregs.es.selector, sregs.ss.selector);
+          return (unsigned char)regs.rax;
         }
         if (sregs.cs.selector >= PSP_PARA && (emu_params->is_hlt_ok || !emu_params->strict_mode)) {
           /* The 8253 timer chip increments the counter in each 1 / 1193182s
@@ -5501,18 +5973,15 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           char *t = tmp;
           const char *s = arg;
           char drive = dir_state->drive;
-          char is_root_abs = 0;
           struct stat st;
           if ((s[0] & ~32) - 'A' + 0U < DRIVE_COUNT && s[1] == ':') {
             drive = s[0] & ~32;
             s += 2;
-            if (*s == '\\' || *s == '/') { ++s; is_root_abs = 1; }
+            if (*s == '\\' || *s == '/') {
+              ++s;
+            }
           } else if (*s == '\\' || *s == '/') {
             ++s;
-            is_root_abs = 1;
-          }
-          if (is_root_abs && t + 1 < tmp + sizeof(tmp)) {
-            *t++ = '\\';
           }
           while (*s && t + 2 < tmp + sizeof(tmp)) {
             char c3 = *s++;
@@ -5524,14 +5993,28 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           if (tmp[0] == '\0') strcpy(tmp, "\\");
           {
             char dos_abs[DOS_PATH_SIZE + 4];
-            snprintf(dos_abs, sizeof(dos_abs), "%c:%s", drive, tmp);
-            if (*get_linux_filename_r(dos_abs, dir_state, fnbuf, NULL) == '\0' || stat(fnbuf, &st) != 0 || !S_ISDIR(st.st_mode)) {
-              fprintf(stderr, "Invalid directory - %s\r\n", arg);
-              exit_code = 1;
-            } else {
-              copy_cstr0(dir_state->current_dir[drive - 'A'], sizeof(dir_state->current_dir[drive - 'A']), tmp);
-              dir_state->drive = drive;
-              exit_code = 0;
+            char tmp_for_check[DOS_PATH_SIZE];
+            size_t tlen = strlen(tmp);
+            copy_cstr0(tmp_for_check, sizeof(tmp_for_check), tmp);
+            /* get_linux_filename_r rejects a trailing slash, so trim for existence checks.
+             * Keep "\" intact for drive root.
+             */
+            if (tlen > 1 && tmp_for_check[tlen - 1] == '\\') tmp_for_check[tlen - 1] = '\0';
+            snprintf(dos_abs, sizeof(dos_abs), "%c:%s", drive, tmp_for_check);
+            {
+              char *linux_path = get_linux_filename_r(dos_abs, dir_state, fnbuf, NULL);
+              if (getenv("KVIKDOS_DEBUG_CD")) {
+                fprintf(g_diag_file, "debug: cd arg=(%s) dos_abs=(%s) linux=(%s) drive=%c case=%d\n",
+                        arg, dos_abs, linux_path, drive, dir_state->case_mode[drive - 'A']);
+              }
+              if (*linux_path == '\0' || stat(linux_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                fprintf(stderr, "Invalid directory - %s\r\n", arg);
+                exit_code = 1;
+              } else {
+                copy_cstr0(dir_state->current_dir[drive - 'A'], sizeof(dir_state->current_dir[drive - 'A']), tmp);
+                dir_state->drive = drive;
+                exit_code = 0;
+              }
             }
           }
         }
@@ -5992,7 +6475,23 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
           {
             const char *path_value = has_path_override ? path_override : getenv_prefix_nocase0("PATH=", (const char* const*)batch_env);
             dir_state->dos_prog_abs = dos_prog_abs;  /* Of the .bat file. */
-            prog_filename = find_prog_on_path(p_line, dir_state, path_value, &prog_drive);
+            prog_filename = NULL;
+            prog_drive = dir_state->drive;
+            if (!strchr(p_line, ':') && !strchr(p_line, '\\') && !strchr(p_line, '/')) {
+              struct stat st2;
+              const char *cand = get_linux_filename_r(p_line, dir_state, fnbuf2, NULL);
+              if (getenv("KVIKDOS_DEBUG_RESOLVE")) {
+                fprintf(g_diag_file, "debug: resolve cmd=(%s) cand=(%s) cwd=%c:%s\n",
+                        p_line, cand ? cand : "(null)", dir_state->drive, dir_state->current_dir[dir_state->drive - 'A']);
+              }
+              if (cand && *cand && stat(cand, &st2) == 0 && S_ISREG(st2.st_mode)) {
+                copy_cstr0(fnbuf, sizeof(fnbuf), cand);
+                prog_filename = fnbuf;
+              }
+            }
+            if (!prog_filename) {
+              prog_filename = find_prog_on_path(p_line, dir_state, path_value, &prog_drive);
+            }
           }
           if (!prog_filename) {
             /* DOSBox 0.74-4 prints "Illegal command: %s.\r\n" to stdout, we print our error to stderr. */
@@ -6048,11 +6547,15 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
                   const char *child_argv[64];
                   char *ab = args_buf, *ae;
                   unsigned ac = 0;
-                  char dos_cwd[DOS_PATH_SIZE + 4], linux_cwd[LINUX_PATH_SIZE];
+                  char dos_cwd[DOS_PATH_SIZE + 4], dos_cwd_norm[DOS_PATH_SIZE + 4], linux_cwd[LINUX_PATH_SIZE];
+                  size_t cwd_len;
                   const char *cdp = dir_state->current_dir[dir_state->drive - 'A'];
                   if (!cdp || !*cdp) cdp = "\\";
                   snprintf(dos_cwd, sizeof(dos_cwd), "%c:%s", dir_state->drive, cdp);
-                  get_linux_filename_r(dos_cwd, dir_state, linux_cwd, NULL);
+                  copy_cstr0(dos_cwd_norm, sizeof(dos_cwd_norm), dos_cwd);
+                  cwd_len = strlen(dos_cwd_norm);
+                  if (cwd_len > 3 && dos_cwd_norm[cwd_len - 1] == '\\') dos_cwd_norm[cwd_len - 1] = '\0';
+                  get_linux_filename_r(dos_cwd_norm, dir_state, linux_cwd, NULL);
                   while (*ab == ' ' || *ab == '\t') ++ab;
                   while (*ab && ac + 1 < sizeof(child_argv) / sizeof(child_argv[0])) {
                     ae = ab;
@@ -6156,6 +6659,9 @@ int main(int argc, char **argv) {
   /* Unbuffered so a hung or looping guest's diagnostics stream out live instead
    * of sitting in the stdio buffer until (a never-arriving) exit. */
   setvbuf(g_diag_file, NULL, _IONBF, 0);
+  maybe_open_io_trace_file();
+  maybe_parse_mem_dump();
+  maybe_parse_exit_regs();
   if (0) {  /* Just dump the parsed command-line. */
     /* cmd_args.dir_state.linux_prog is still NULL, use cmd_args.prog_filename instead. */
     printf("linux prog: %s\n", cmd_args.prog_filename);
@@ -6202,6 +6708,7 @@ int main(int argc, char **argv) {
   {
     const enum mz_subformat_t subfmt = detect_mz_subformat(cmd_args.prog_filename);
     if (subfmt == MZ_SUBFMT_PE ||
+        is_probable_dos_extender_program(cmd_args.prog_filename) ||
         ((subfmt == MZ_SUBFMT_NE || subfmt == MZ_SUBFMT_LE || subfmt == MZ_SUBFMT_LX) &&
          !is_probable_borland_dual_mode_ne(cmd_args.prog_filename) &&
          is_probable_windows_message_stub(cmd_args.prog_filename))) {
