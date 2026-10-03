@@ -1,5 +1,9 @@
 #include "ALINK.H"
 
+#ifndef _WIN32
+#include <dirent.h>
+#endif
+
 char case_sensitive = 1;
 char padsegments = 0;
 char mapfile = 0;
@@ -58,6 +62,590 @@ UINT namecount = 0, namemin = 0, pubcount = 0, pubmin = 0, segcount = 0, segmin 
 UINT libPathCount = 0;
 PCHAR *libPath = NULL;
 char *entryPoint = NULL;
+PPCHAR defaultLibsExcluded = NULL;
+UINT defaultLibExcludeCount = 0;
+
+static int strnicmp_local(const char *left, const char *right, size_t len)
+{
+    while (len)
+    {
+	unsigned char a = (unsigned char)toupper((unsigned char)*left);
+	unsigned char b = (unsigned char)toupper((unsigned char)*right);
+
+	if (a != b)
+	    return a - b;
+	if (!*left || !*right)
+	    break;
+	left++;
+	right++;
+	len--;
+    }
+    return 0;
+}
+
+static void addDefaultLibExclude(const char *name)
+{
+    defaultLibsExcluded =
+	checkRealloc(defaultLibsExcluded, (defaultLibExcludeCount + 1) * sizeof(PCHAR));
+    defaultLibsExcluded[defaultLibExcludeCount++] = checkStrdup(name);
+}
+
+static int libBaseNameMatches(const char *left, const char *right)
+{
+    const char *lbase, *rbase, *ldot, *rdot;
+    size_t llen, rlen;
+
+    if (!left || !right)
+	return FALSE;
+    if (!stricmp(left, right))
+	return TRUE;
+
+    lbase = strrchr(left, PATH_CHAR);
+    if (!lbase)
+	lbase = strrchr(left, ALT_PATH_CHAR);
+    lbase = lbase ? lbase + 1 : left;
+
+    rbase = strrchr(right, PATH_CHAR);
+    if (!rbase)
+	rbase = strrchr(right, ALT_PATH_CHAR);
+    rbase = rbase ? rbase + 1 : right;
+
+    ldot = strrchr(lbase, '.');
+    rdot = strrchr(rbase, '.');
+    llen = ldot ? (size_t)(ldot - lbase) : strlen(lbase);
+    rlen = rdot ? (size_t)(rdot - rbase) : strlen(rbase);
+    if (llen != rlen)
+	return FALSE;
+    return !strnicmp_local(lbase, rbase, llen);
+}
+
+int defaultLibSuppressed(const char *libname)
+{
+    UINT i;
+
+    for (i = 0; i < defaultLibExcludeCount; i++)
+    {
+	if (!defaultLibsExcluded[i] || !defaultLibsExcluded[i][0])
+	    return TRUE;
+	if (libBaseNameMatches(libname, defaultLibsExcluded[i]))
+	    return TRUE;
+    }
+    return FALSE;
+}
+
+static const char *matchMsvcOptionArg(const char *opt, const char *name)
+{
+    size_t len;
+
+    len = strlen(name);
+    if (strnicmp_local(opt, name, len))
+	return NULL;
+    if (!opt[len])
+	return opt + len;
+    if ((opt[len] == ':') || (opt[len] == '='))
+	return opt + len + 1;
+    return NULL;
+}
+
+static int isMsvcOptionToken(const char *arg)
+{
+    const char *p;
+
+    if (!arg || (arg[0] != '/'))
+	return FALSE;
+    if ((arg[1] == '?') && !arg[2])
+	return TRUE;
+    p = arg + 1;
+    while (*p)
+    {
+	if ((*p == ':') || (*p == '='))
+	    return TRUE;
+	if ((*p == '/') || (*p == '\\'))
+	    return FALSE;
+	p++;
+    }
+    return TRUE;
+}
+
+static void appendArg(char ***pargv, int *pargc, const char *value)
+{
+    *pargv = (char **)checkRealloc(*pargv, ((*pargc) + 1) * sizeof(char *));
+    (*pargv)[*pargc] = checkStrdup(value);
+    (*pargc)++;
+}
+
+static char *copyTrimmedRange(const char *start, const char *end)
+{
+    char *out;
+    size_t len;
+
+    while ((start < end) && isspace((unsigned char)*start))
+	start++;
+    while ((end > start) && isspace((unsigned char)end[-1]))
+	end--;
+    len = (size_t)(end - start);
+    out = (char *)checkMalloc(len + 1);
+    if (len)
+	memcpy(out, start, len);
+    out[len] = 0;
+    return out;
+}
+
+static int symbolNamesEqual(const char *left, const char *right)
+{
+    return case_sensitive ? !strcmp(left, right) : !stricmp(left, right);
+}
+
+static PPUBLIC ensureBSSBoundarySymbol(const char *name, long modnum)
+{
+    PSORTENTRY listnode;
+    UINT i;
+    PPUBLIC pubdef = NULL;
+    UINT j;
+
+    if (!name)
+	return NULL;
+
+    listnode = binarySearch(publics, pubcount, (PCHAR)name);
+    if (listnode)
+    {
+	for (i = 0; i < listnode->count; i++)
+	{
+	    pubdef = (PPUBLIC)listnode->object[i];
+	    if (!pubdef->aliasName && (pubdef->modnum == modnum))
+	    {
+		return pubdef;
+	    }
+	}
+	for (j = 0; j < listnode->count; j++)
+	{
+	    pubdef = (PPUBLIC)listnode->object[j];
+	    if (!pubdef->aliasName && (pubdef->modnum == 0))
+	    {
+		return pubdef;
+	    }
+	}
+    }
+
+    pubdef = (PPUBLIC)checkMalloc(sizeof(PUBLIC));
+    pubdef->segnum = -1;
+    pubdef->grpnum = -1;
+    pubdef->typenum = 0;
+    pubdef->ofs = 0;
+    pubdef->modnum = modnum;
+    pubdef->aliasName = NULL;
+    sortedInsert(&publics, &pubcount, (PCHAR)name, pubdef);
+    return pubdef;
+}
+
+static int isSpecialBSSBoundarySymbol(const char *name)
+{
+    if (!name)
+	return FALSE;
+    if (symbolNamesEqual(name, "_edata"))
+	return TRUE;
+    if (symbolNamesEqual(name, "__edata"))
+	return TRUE;
+    if (symbolNamesEqual(name, "_end"))
+	return TRUE;
+    if (symbolNamesEqual(name, "__end"))
+	return TRUE;
+    return FALSE;
+}
+
+static int isBSSSegment(const PSEG seg)
+{
+    if (!seg || (seg->classindex < 0) || !namelist || (seg->classindex >= (long)namecount))
+	return FALSE;
+    return !stricmp(namelist[seg->classindex], "BSS");
+}
+
+static void applyBSSBoundaryValues(void)
+{
+    UINT bssStart = 0;
+    UINT bssEnd = 0;
+    long i;
+    int foundBSS = FALSE;
+
+    for (i = 0; i < (long)outcount; i++)
+    {
+	if (!isBSSSegment(outlist[i]))
+	    continue;
+	if (!foundBSS)
+	{
+	    bssStart = outlist[i]->base;
+	    foundBSS = TRUE;
+	}
+	bssEnd = outlist[i]->base + outlist[i]->length;
+    }
+
+    if (isSpecialBSSBoundarySymbol("_edata"))
+    {
+	PSORTENTRY listnode;
+	PPUBLIC pubdef;
+	int n;
+
+	listnode = binarySearch(publics, pubcount, "_edata");
+	if (listnode)
+	{
+	    for (n = 0; n < (int)listnode->count; n++)
+	    {
+		pubdef = (PPUBLIC)listnode->object[n];
+		if (!pubdef->aliasName && (pubdef->segnum < 0))
+		    pubdef->ofs = bssStart;
+	    }
+	}
+    }
+    if (isSpecialBSSBoundarySymbol("__edata"))
+    {
+	PSORTENTRY listnode;
+	PPUBLIC pubdef;
+	int n;
+
+	listnode = binarySearch(publics, pubcount, "__edata");
+	if (listnode)
+	{
+	    for (n = 0; n < (int)listnode->count; n++)
+	    {
+		pubdef = (PPUBLIC)listnode->object[n];
+		if (!pubdef->aliasName && (pubdef->segnum < 0))
+		    pubdef->ofs = bssStart;
+	    }
+	}
+    }
+    if (isSpecialBSSBoundarySymbol("_end"))
+    {
+	PSORTENTRY listnode;
+	PPUBLIC pubdef;
+	int n;
+
+	listnode = binarySearch(publics, pubcount, "_end");
+	if (listnode)
+	{
+	    for (n = 0; n < (int)listnode->count; n++)
+	    {
+		pubdef = (PPUBLIC)listnode->object[n];
+		if (!pubdef->aliasName && (pubdef->segnum < 0))
+		    pubdef->ofs = bssEnd;
+	    }
+	}
+    }
+    if (isSpecialBSSBoundarySymbol("__end"))
+    {
+	PSORTENTRY listnode;
+	PPUBLIC pubdef;
+	int n;
+
+	listnode = binarySearch(publics, pubcount, "__end");
+	if (listnode)
+	{
+	    for (n = 0; n < (int)listnode->count; n++)
+	    {
+		pubdef = (PPUBLIC)listnode->object[n];
+		if (!pubdef->aliasName && (pubdef->segnum < 0))
+		    pubdef->ofs = bssEnd;
+	    }
+	}
+    }
+}
+
+static void appendFieldTokens(const char *field, int splitPlus, char ***pargv, int *pargc)
+{
+    const char *p;
+
+    p = field;
+    while (*p)
+    {
+	while (*p && (isspace((unsigned char)*p) || (splitPlus && (*p == '+'))))
+	    p++;
+	if (!*p)
+	    break;
+	if (*p == '"')
+	{
+	    const char *start;
+	    char *token;
+
+	    p++;
+	    start = p;
+	    while (*p && (*p != '"'))
+		p++;
+	    token = copyTrimmedRange(start, p);
+	    if (token[0])
+		appendArg(pargv, pargc, token);
+	    free(token);
+	    if (*p == '"')
+		p++;
+	    continue;
+	}
+	else
+	{
+	    const char *start;
+	    char *token;
+
+	    start = p;
+	    while (*p && !isspace((unsigned char)*p) && !(splitPlus && (*p == '+')))
+		p++;
+	    token = copyTrimmedRange(start, p);
+	    if (token[0])
+		appendArg(pargv, pargc, token);
+	    free(token);
+	}
+    }
+}
+
+static int looksLikeLinkResponse(const char *text)
+{
+    int commas, quoted;
+
+    commas = 0;
+    quoted = FALSE;
+    while (*text)
+    {
+	if (*text == '"')
+	    quoted = !quoted;
+	else if (!quoted && (*text == ';'))
+	    break;
+	else if (!quoted && (*text == ','))
+	    commas++;
+	text++;
+    }
+    return commas >= 4;
+}
+
+static void appendMsvcResponseArgs(const char *text, char ***pargv, int *pargc)
+{
+    const char *fields[5];
+    const char *fieldEnd[5];
+    const char *p;
+    int field;
+    char *trimmed;
+    char **tokens;
+    int tokc, i;
+
+    field = 0;
+    p = text;
+    fields[field] = p;
+    while (*p)
+    {
+	if (*p == '"')
+	{
+	    p++;
+	    while (*p && (*p != '"'))
+		p++;
+	    if (*p)
+		p++;
+	    continue;
+	}
+	if ((*p == ',') && (field < 4))
+	{
+	    fieldEnd[field] = p;
+	    field++;
+	    fields[field] = p + 1;
+	}
+	else if (*p == ';')
+	{
+	    break;
+	}
+	p++;
+    }
+    fieldEnd[field] = p;
+    while (field < 4)
+    {
+	field++;
+	fields[field] = p;
+	fieldEnd[field] = p;
+    }
+
+    trimmed = copyTrimmedRange(fields[0], fieldEnd[0]);
+    appendFieldTokens(trimmed, TRUE, pargv, pargc);
+    free(trimmed);
+
+    trimmed = copyTrimmedRange(fields[1], fieldEnd[1]);
+    if (trimmed[0] && stricmp(trimmed, "NUL"))
+    {
+	appendArg(pargv, pargc, "-o");
+	appendArg(pargv, pargc, trimmed);
+    }
+    free(trimmed);
+
+    trimmed = copyTrimmedRange(fields[2], fieldEnd[2]);
+    if (trimmed[0])
+    {
+	if (stricmp(trimmed, "NUL"))
+	{
+	    char *mapopt;
+
+	    mapopt = (char *)checkMalloc(strlen(trimmed) + 6);
+	    strcpy(mapopt, "/MAP:");
+	    strcat(mapopt, trimmed);
+	    appendArg(pargv, pargc, mapopt);
+	    free(mapopt);
+	}
+	else
+	{
+	    appendArg(pargv, pargc, "/MAP:NUL");
+	}
+    }
+    free(trimmed);
+
+    trimmed = copyTrimmedRange(fields[3], fieldEnd[3]);
+    appendFieldTokens(trimmed, TRUE, pargv, pargc);
+    free(trimmed);
+
+    tokens = NULL;
+    tokc = 0;
+    trimmed = copyTrimmedRange(fields[4], fieldEnd[4]);
+    appendFieldTokens(trimmed, FALSE, &tokens, &tokc);
+    free(trimmed);
+    for (i = 0; i < tokc; i++)
+    {
+	if ((i == 0) && tokens[i][0] && (tokens[i][0] != '/') && (tokens[i][0] != '-'))
+	{
+	    if (!stricmp(tokens[i], "NUL"))
+		continue;
+	    if (strrchr(tokens[i], '.') && !stricmp(strrchr(tokens[i], '.'), ".DEF"))
+		continue;
+	}
+	appendArg(pargv, pargc, tokens[i]);
+    }
+}
+
+static void appendPlainResponseArgs(const char *text, char ***pargv, int *pargc)
+{
+    const char *p;
+
+    p = text;
+    while (*p)
+    {
+	while (*p && isspace((unsigned char)*p))
+	    p++;
+	if (!*p)
+	    break;
+	if (*p == ';')
+	{
+	    while (*p && (*p != '\n'))
+		p++;
+	    continue;
+	}
+	if (*p == '"')
+	{
+	    const char *start;
+	    char *token;
+
+	    p++;
+	    start = p;
+	    while (*p && (*p != '"'))
+	    {
+		if ((*p == '\\') && p[1])
+		    p++;
+		p++;
+	    }
+	    token = copyTrimmedRange(start, p);
+	    if (token[0])
+		appendArg(pargv, pargc, token);
+	    free(token);
+	    if (*p == '"')
+		p++;
+	}
+	else
+	{
+	    const char *start;
+	    char *token;
+
+	    start = p;
+	    while (*p && !isspace((unsigned char)*p))
+		p++;
+	    token = copyTrimmedRange(start, p);
+	    if (token[0])
+		appendArg(pargv, pargc, token);
+	    free(token);
+	}
+    }
+}
+
+static void loadResponseFileArgs(const char *path, char ***pargv, int *pargc)
+{
+    FILE *argFile;
+    long length;
+    char *text;
+
+    argFile = fopen(path, "rb");
+    if (!argFile)
+    {
+	printf("Unable to open response file \"%s\"\n", path);
+	exit(1);
+    }
+    if (fseek(argFile, 0, SEEK_END))
+    {
+	printf("Unable to read response file \"%s\"\n", path);
+	exit(1);
+    }
+    length = ftell(argFile);
+    if (length < 0)
+    {
+	printf("Unable to read response file \"%s\"\n", path);
+	exit(1);
+    }
+    if (fseek(argFile, 0, SEEK_SET))
+    {
+	printf("Unable to read response file \"%s\"\n", path);
+	exit(1);
+    }
+    text = (char *)checkMalloc((size_t)length + 1);
+    if (length && (fread(text, 1, (size_t)length, argFile) != (size_t)length))
+    {
+	printf("Unable to read response file \"%s\"\n", path);
+	exit(1);
+    }
+    text[length] = 0;
+    fclose(argFile);
+
+    if (looksLikeLinkResponse(text))
+	appendMsvcResponseArgs(text, pargv, pargc);
+    else
+	appendPlainResponseArgs(text, pargv, pargc);
+    free(text);
+}
+
+static void applyOutputType(int type)
+{
+    output_type = type;
+    switch (type)
+    {
+    case OUTPUT_EXE:
+	imageBase = 0;
+	fileAlign = 1;
+	objectAlign = 1;
+	stackSize = 0;
+	stackCommitSize = 0;
+	heapSize = 0;
+	heapCommitSize = 0;
+	break;
+    case OUTPUT_COM:
+	imageBase = 0;
+	fileAlign = 1;
+	objectAlign = 1;
+	stackSize = 0;
+	stackCommitSize = 0;
+	heapSize = 0;
+	heapCommitSize = 0;
+	break;
+    case OUTPUT_PE:
+	imageBase = WIN32_DEFAULT_BASE;
+	fileAlign = WIN32_DEFAULT_FILEALIGN;
+	objectAlign = WIN32_DEFAULT_OBJECTALIGN;
+	stackSize = WIN32_DEFAULT_STACKSIZE;
+	stackCommitSize = WIN32_DEFAULT_STACKCOMMITSIZE;
+	heapSize = WIN32_DEFAULT_HEAPSIZE;
+	heapCommitSize = WIN32_DEFAULT_HEAPCOMMITSIZE;
+	subSystem = WIN32_DEFAULT_SUBSYS;
+	subsysMajor = WIN32_DEFAULT_SUBSYSMAJOR;
+	subsysMinor = WIN32_DEFAULT_SUBSYSMINOR;
+	osMajor = WIN32_DEFAULT_OSMAJOR;
+	osMinor = WIN32_DEFAULT_OSMINOR;
+	break;
+    }
+}
 
 void processArgs(int argc, char **argv)
 {
@@ -71,98 +659,148 @@ void processArgs(int argc, char **argv)
     int gotbase = FALSE, gotfalign = FALSE, gotoalign = FALSE, gotsubsys = FALSE;
     int gotstack = FALSE, gotstackcommit = FALSE, gotheap = FALSE, gotheapcommit = FALSE;
     int gotsubsysver = FALSE, gotosver = FALSE;
-    char *p;
+    char *p, *endp;
+    const char *msarg;
     PCHAR *newLibPath;
     int c;
     char **newargs;
-    FILE *argFile;
 
     for (i = 1; i < argc; i++)
     {
 	/* cater for response files */
 	if (argv[i][0] == '@')
 	{
-	    argFile = fopen(argv[i] + 1, "rt");
-	    if (!argFile)
-	    {
-		printf("Unable to open response file \"%s\"\n", argv[i] + 1);
-		exit(1);
-	    }
 	    newargs = (char **)checkMalloc(argc * sizeof(char *));
 	    for (j = 0; j < argc; j++)
 	    {
 		newargs[j] = argv[j];
 	    }
-	    p = NULL;
-	    j = 0;
-	    while ((c = fgetc(argFile)) != EOF)
-	    {
-		if (c == ';') /* allow comments, starting with ; */
-		{
-		    while (((c = fgetc(argFile)) != EOF) && (c != '\n'))
-			; /* loop until end of line */
-		    /* continue main loop */
-		    continue;
-		}
-		if (isspace(c))
-		{
-		    if (p) /* if we've got an argument, add to list */
-		    {
-			newargs = (char **)checkRealloc(newargs, (argc + 1) * sizeof(char *));
-			newargs[argc] = p;
-			argc++;
-			/* clear pointer and length indicator */
-			p = NULL;
-			j = 0;
-		    }
-		    /* and continue */
-		    continue;
-		}
-		if (c == '"')
-		{
-		    /* quoted strings */
-		    while (((c = fgetc(argFile)) != EOF) &&
-			   (c != '"')) /* loop until end of string */
-		    {
-			if (c == '\\')
-			{
-			    c = fgetc(argFile);
-			    if (c == EOF)
-			    {
-				printf("Missing character to escape in quoted string, unexpected "
-				       "end of file found\n");
-				exit(1);
-			    }
-			}
-
-			p = (char *)checkRealloc(p, j + 2);
-			p[j] = c;
-			j++;
-			p[j] = 0;
-		    }
-		    if (c == EOF)
-		    {
-			printf("Unexpected end of file encountered in quoted string\n");
-			exit(1);
-		    }
-
-		    /* continue main loop */
-		    continue;
-		}
-		/* if no special case, then add to string */
-		p = (char *)checkRealloc(p, j + 2);
-		p[j] = c;
-		j++;
-		p[j] = 0;
-	    }
-	    if (p)
-	    {
-		newargs = (char **)checkRealloc(newargs, (argc + 1) * sizeof(char *));
-		newargs[argc] = p;
-		argc++;
-	    }
-	    fclose(argFile);
+	    loadResponseFileArgs(argv[i] + 1, &newargs, &argc);
 	    argv = newargs;
+	}
+	else if (isMsvcOptionToken(argv[i]))
+	{
+	    msarg = argv[i] + 1;
+	    if ((argv[i][1] == '?') && !argv[i][2])
+	    {
+		helpRequested = TRUE;
+	    }
+	    else if (!stricmp(msarg, "HELP") || !stricmp(msarg, "BATCH") ||
+		     !stricmp(msarg, "CO") || !stricmp(msarg, "CODEVIEW") ||
+		     !stricmp(msarg, "INC") || !stricmp(msarg, "INCR") ||
+		     !stricmp(msarg, "INCREMENTAL") || !stricmp(msarg, "NOE") ||
+		     !stricmp(msarg, "NOEXTDICTIONARY") || !stricmp(msarg, "FAR") ||
+		     !stricmp(msarg, "PACKC") || !stricmp(msarg, "PACKCODE") ||
+		     !stricmp(msarg, "NOPACKCODE") || !stricmp(msarg, "PACKDATA") ||
+		     !stricmp(msarg, "DOSSEG") || !stricmp(msarg, "NONULLSDOSSEG") ||
+		     !stricmp(msarg, "EXEPACK") || !stricmp(msarg, "HIGH") ||
+		     !stricmp(msarg, "NOLOGO") || !stricmp(msarg, "KEEPFIXUPS") ||
+		     !stricmp(msarg, "DSALLOC") || !stricmp(msarg, "DSALLOCATE") ||
+		     !stricmp(msarg, "NOGROUPASSOCIATION") ||
+		     !stricmp(msarg, "FARCALL") || !stricmp(msarg, "FARCALLTRANSLATION") ||
+		     !stricmp(msarg, "NOFARCALLTRANSLATION") || !stricmp(msarg, "ONERROR") ||
+		     !stricmp(msarg, "PAU") || !stricmp(msarg, "PAUSE") ||
+		     !stricmp(msarg, "PCODE") || !stricmp(msarg, "DYNAMIC"))
+	    {
+		continue;
+	    }
+	    else if (!stricmp(msarg, "NOI") || !stricmp(msarg, "NOIGNORECASE"))
+	    {
+		case_sensitive = 1;
+	    }
+	    else if (!stricmp(msarg, "M"))
+	    {
+		mapfile = 1;
+	    }
+	    else if (!stricmp(msarg, "M+"))
+	    {
+		mapfile = 1;
+	    }
+	    else if (!stricmp(msarg, "M-"))
+	    {
+		mapfile = 0;
+	    }
+	    else if (!stricmp(msarg, "I") || !stricmp(msarg, "INCREMENTAL"))
+	    {
+		/* compatibility no-op */
+	    }
+	    else if (!stricmp(msarg, "EXE"))
+	    {
+		applyOutputType(OUTPUT_EXE);
+	    }
+	    else if (!stricmp(msarg, "TINY"))
+	    {
+		applyOutputType(OUTPUT_COM);
+	    }
+	    else if ((p = (char *)matchMsvcOptionArg(msarg, "MAP")) != NULL)
+	    {
+		mapfile = 1;
+		if (*p)
+		{
+		    if (!stricmp(p, "NUL"))
+		    {
+			mapfile = 0;
+		    }
+		    else
+		    {
+			if (mapname)
+			    free(mapname);
+			mapname = checkStrdup(p);
+		    }
+		}
+	    }
+	    else if (((p = (char *)matchMsvcOptionArg(msarg, "STACK")) != NULL) ||
+		     ((p = (char *)matchMsvcOptionArg(msarg, "STACKSIZE")) != NULL))
+	    {
+		if (*p)
+		{
+		    if (output_type == OUTPUT_PE)
+		    {
+			setstack = strtoul(p, &endp, 0);
+			if (endp[0])
+			{
+			    printf("Bad stack size\n");
+			    exit(1);
+			}
+			gotstack = TRUE;
+		    }
+		}
+	    }
+	    else if (((p = (char *)matchMsvcOptionArg(msarg, "ALIGNMENT")) != NULL) ||
+		     ((p = (char *)matchMsvcOptionArg(msarg, "SEGMENTS")) != NULL))
+	    {
+		continue;
+	    }
+	    else if ((p = (char *)matchMsvcOptionArg(msarg, "CPARMAXALLOC")) != NULL)
+	    {
+		if (!*p)
+		{
+		    printf("Invalid switch %s\n", argv[i]);
+		    exit(1);
+		}
+		maxalloc = (unsigned short)strtoul(p, &endp, 0);
+		if (endp[0])
+		{
+		    printf("Bad CPARMAXALLOC value\n");
+		    exit(1);
+		}
+	    }
+	    else if ((p = (char *)matchMsvcOptionArg(msarg, "NOD")) != NULL)
+	    {
+		if (!*p)
+		{
+		    addDefaultLibExclude("");
+		}
+		else
+		{
+		    addDefaultLibExclude(p);
+		}
+	    }
+	    else
+	    {
+		printf("Invalid switch %s\n", argv[i]);
+		exit(1);
+	    }
 	}
 	else if (argv[i][0] == SWITCHCHAR)
 	{
@@ -271,41 +909,15 @@ void processArgs(int argc, char **argv)
 		default:
 		    if (!strcmp(argv[i] + 2, "EXE"))
 		    {
-			output_type = OUTPUT_EXE;
-			imageBase = 0;
-			fileAlign = 1;
-			objectAlign = 1;
-			stackSize = 0;
-			stackCommitSize = 0;
-			heapSize = 0;
-			heapCommitSize = 0;
+			applyOutputType(OUTPUT_EXE);
 		    }
 		    else if (!strcmp(argv[i] + 2, "COM"))
 		    {
-			output_type = OUTPUT_COM;
-			imageBase = 0;
-			fileAlign = 1;
-			objectAlign = 1;
-			stackSize = 0;
-			stackCommitSize = 0;
-			heapSize = 0;
-			heapCommitSize = 0;
+			applyOutputType(OUTPUT_COM);
 		    }
 		    else if (!strcmp(argv[i] + 2, "PE"))
 		    {
-			output_type = OUTPUT_PE;
-			imageBase = WIN32_DEFAULT_BASE;
-			fileAlign = WIN32_DEFAULT_FILEALIGN;
-			objectAlign = WIN32_DEFAULT_OBJECTALIGN;
-			stackSize = WIN32_DEFAULT_STACKSIZE;
-			stackCommitSize = WIN32_DEFAULT_STACKCOMMITSIZE;
-			heapSize = WIN32_DEFAULT_HEAPSIZE;
-			heapCommitSize = WIN32_DEFAULT_HEAPCOMMITSIZE;
-			subSystem = WIN32_DEFAULT_SUBSYS;
-			subsysMajor = WIN32_DEFAULT_SUBSYSMAJOR;
-			subsysMinor = WIN32_DEFAULT_SUBSYSMINOR;
-			osMajor = WIN32_DEFAULT_OSMAJOR;
-			osMinor = WIN32_DEFAULT_OSMINOR;
+			applyOutputType(OUTPUT_PE);
 		    }
 		    else if (!strcmp(argv[i] + 1, "objectalign"))
 		    {
@@ -715,6 +1327,15 @@ void processArgs(int argc, char **argv)
 	printf("    -m      Enable map file\n");
 	printf("    -m+     Enable map file\n");
 	printf("    -m-     Disable map file\n");
+	printf("    /?      Display this help list\n");
+	printf("    /NOI    LINK.EXE compatibility alias for case-sensitive matches\n");
+	printf("    /NOE    LINK.EXE compatibility alias accepted as a no-op\n");
+	printf("    /BATCH  LINK.EXE compatibility alias accepted as a no-op\n");
+	printf("    /EXE    LINK.EXE compatibility alias for MSDOS EXE output\n");
+	printf("    /TINY   LINK.EXE compatibility alias for MSDOS COM output\n");
+	printf("    /MAP[:name|NUL] Enable map output, set map file name, or disable with NUL\n");
+	printf("    /NOD[:lib] Suppress all or selected default libraries from OMF comments\n");
+	printf("    /CPARMAXALLOC:n Set MZ EXE max allocation paragraphs\n");
 	printf("----Press Enter to continue---");
 	while (((c = getchar()) != '\n') && (c != EOF))
 	    ;
@@ -816,6 +1437,95 @@ void processArgs(int argc, char **argv)
 	osMajor = setosmajor;
 	osMinor = setosminor;
     }
+}
+
+FILE *openInputFile(const char *path)
+{
+    FILE *file;
+    char *dir;
+    char *target;
+    char *cursor;
+    const char *base;
+
+    file = fopen(path, "rb");
+    if (file)
+    {
+	return file;
+    }
+
+#ifndef _WIN32
+    if (getenv("ALINK_DEBUG_IO"))
+    {
+	fprintf(stderr, "openInputFile fallback for %s\n", path);
+    }
+    /* Case-insensitive fallback for case-sensitive filesystems. */
+    cursor = strrchr(path, PATH_CHAR);
+    if (!cursor)
+    {
+	cursor = strrchr(path, ALT_PATH_CHAR);
+    }
+    if (!cursor)
+    {
+	dir = checkStrdup(".");
+	base = path;
+    }
+    else
+    {
+	dir = checkMalloc((cursor - path) + 1);
+	memcpy(dir, path, (size_t)(cursor - path));
+	dir[cursor - path] = 0;
+	base = cursor + 1;
+    }
+
+    {
+	DIR *d = opendir(dir);
+	struct dirent *entry;
+
+	if (d)
+	{
+	    while ((entry = readdir(d)) != NULL)
+	    {
+		if (getenv("ALINK_DEBUG_IO"))
+		{
+		    fprintf(stderr, "  dir entry: %s\n", entry->d_name);
+		}
+		if (!stricmp(entry->d_name, base))
+		{
+		    size_t dirLen;
+
+		    dirLen = strlen(dir);
+		    target = (char *)checkMalloc(dirLen + 1 + strlen(entry->d_name) + 1);
+		    if (dir[0] == 0 || (dir[0] == '.' && dir[1] == 0))
+		    {
+			target[0] = 0;
+			strcpy(target, entry->d_name);
+		    }
+		    else
+		    {
+			strcpy(target, dir);
+			target[dirLen] = PATH_CHAR;
+			target[dirLen + 1] = 0;
+			strcpy(target + dirLen + 1, entry->d_name);
+		    }
+		    file = fopen(target, "rb");
+		    if (getenv("ALINK_DEBUG_IO"))
+		    {
+			fprintf(stderr, "  matched name %s opened=%d\n", target, file != NULL);
+		    }
+		    free(target);
+		    if (file)
+		    {
+			break;
+		    }
+		}
+	    }
+	    closedir(d);
+	}
+    }
+    free(dir);
+#endif
+
+    return file;
 }
 
 static char *SegmentName(long segnum)
@@ -1008,6 +1718,12 @@ void matchExterns()
 	}
 	for (i = 0; i < extcount; i++)
 	{
+	    if (isSpecialBSSBoundarySymbol(externs[i].name))
+	    {
+		externs[i].pubdef = ensureBSSBoundarySymbol(externs[i].name, externs[i].modnum);
+		externs[i].flags = EXT_MATCHEDPUBLIC;
+		continue;
+	    }
 	    /* skip if we've already matched a public symbol */
 	    /* as they override all others */
 	    if (externs[i].flags == EXT_MATCHEDPUBLIC)
@@ -1081,6 +1797,10 @@ void matchExterns()
 	}
 	for (i = 0; (i < extcount) && (nummods == old_nummods); i++)
 	{
+		    if (getenv("ALINK_TRACE"))
+		    {
+			printf("Resolving extern %s\n", externs[i].name);
+		    }
 	    if (externs[i].flags == EXT_NOMATCH)
 	    {
 		for (k = 0; k < libcount; ++k)
@@ -1094,8 +1814,18 @@ void matchExterns()
 		    if ((listnode = binarySearch(libfiles[k].symbols, libfiles[k].numsyms, name)) !=
 			NULL)
 		    {
+			if (getenv("ALINK_TRACE"))
+			{
+			    printf("  -> symbol %s from %s at module %u\n", name, libfiles[k].filename,
+				   listnode->count);
+			}
 			loadlibmod(k, listnode->count);
 			break;
+		    }
+		    else if (getenv("ALINK_TRACE"))
+		    {
+			printf("  -> no match in %s (case=%u flags=%u)\n", libfiles[k].filename,
+			       case_sensitive, libfiles[k].flags);
 		    }
 		    free(name);
 		}
@@ -1519,10 +2249,22 @@ void sortSegments()
 		switch (seglist[i]->attr & SEG_ALIGN)
 		{
 		case SEG_WORD:
-		case SEG_BYTE:
+		    align = 2;
+		    break;
 		case SEG_DWORD:
+		    align = 4;
+		    break;
+		case SEG_8BYTE:
+		    align = 0x8;
+		    break;
 		case SEG_PARA:
 		    align = 0x10;
+		    break;
+		case SEG_32BYTE:
+		    align = 0x20;
+		    break;
+		case SEG_64BYTE:
+		    align = 0x40;
 		    break;
 		case SEG_PAGE:
 		    align = 0x100;
@@ -1530,6 +2272,7 @@ void sortSegments()
 		case SEG_MEMPAGE:
 		    align = 0x1000;
 		    break;
+		case SEG_BYTE:
 		default:
 		    align = 1;
 		    break;
@@ -1584,7 +2327,7 @@ void loadFiles()
 
     for (i = 0; i < filecount; i++)
     {
-	afile = fopen(filename[i], "rb");
+    afile = openInputFile(filename[i]);
 	if (!strchr(filename[i], PATH_CHAR) && !strchr(filename[i], ALT_PATH_CHAR))
 	{
 	    /* if no path specified, search library path list */
@@ -1593,7 +2336,7 @@ void loadFiles()
 		name = (char *)checkMalloc(strlen(libPath[j]) + strlen(filename[i]) + 1);
 		strcpy(name, libPath[j]);
 		strcat(name, filename[i]);
-		afile = fopen(name, "rb");
+                afile = openInputFile(name);
 		if (afile)
 		{
 		    free(filename[i]);
@@ -1797,8 +2540,8 @@ int main(int argc, char *argv[])
     char *libList;
     char *libListCopy;
     PCHAR *newLibPath;
-    printf("ALINK v1.6 (C) Copyright 1998-9 Anthony A.J. Williams.\n");
-    printf("All Rights Reserved\n\n");
+    printf("ALINK v1.7 (C) Copyright 1998-9 Anthony A.J. Williams, 2026 xor2003.\n");
+    printf("Co-authored by Anthony A.J. Williams and xor2003\n\n");
 
     libList = getenv("LIB");
     if (libList)
@@ -1852,7 +2595,7 @@ int main(int argc, char *argv[])
 	{
 	    i--;
 	}
-	if (outname[i] == '.')
+	if ((i >= 0) && (outname[i] == '.'))
 	{
 	    outname[i] = 0;
 	}
@@ -1862,7 +2605,7 @@ int main(int argc, char *argv[])
     {
 	i--;
     }
-    if (outname[i] != '.')
+    if ((i < 0) || (outname[i] != '.'))
     {
 	switch (output_type)
 	{
@@ -1964,6 +2707,8 @@ int main(int argc, char *argv[])
 
     matchComDefs();
     printf("matched ComDefs\n");
+
+    applyBSSBoundaryValues();
 
     for (i = 0; i < expcount; i++)
     {

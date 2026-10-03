@@ -1,5 +1,183 @@
 #include "ALINK.H"
 
+static const char *padMessageClassNames[] = {
+    "MSG",
+    "FAR_MSG"
+};
+
+static int is_msg_pad_segment(PSEG seg)
+{
+	if (!seg)
+	{
+	    return 0;
+	}
+	if ((seg->nameindex < 0) || (seg->classindex < 0) ||
+	    (seg->nameindex >= (long)namecount) || (seg->classindex >= (long)namecount) ||
+	    !namelist[seg->classindex] || !namelist[seg->nameindex])
+	{
+	    return 0;
+	}
+
+	{
+	    int c;
+	    int found = 0;
+	    const char *cls = namelist[seg->classindex];
+
+	    for (c = 0; c < (int)(sizeof(padMessageClassNames) / sizeof(*padMessageClassNames)); c++)
+	    {
+		if (!stricmp(cls, padMessageClassNames[c]))
+		{
+		    found = 1;
+		    break;
+		}
+	    }
+	    if (!found)
+	    {
+		return 0;
+	    }
+	}
+
+	if (!strncmp(namelist[seg->nameindex], "PAD", 3) ||
+	    !strncmp(namelist[seg->nameindex], "EPAD", 4))
+	{
+	    return 1;
+	}
+
+	return 0;
+}
+
+static int is_msg_pad_fill_override(PSEG dst, PSEG src, UINT ofs)
+{
+	unsigned char dst_value;
+	unsigned char src_value;
+
+	if (!is_msg_pad_segment(dst) || !is_msg_pad_segment(src))
+	{
+	    return 0;
+	}
+	if ((ofs >= dst->length) || (ofs >= src->length))
+	{
+	    return 0;
+	}
+	if ((!GetNbit(dst->datmask, ofs)) || (!GetNbit(src->datmask, ofs)))
+	{
+	    return 0;
+	}
+	dst_value = dst->data[ofs];
+	src_value = src->data[ofs];
+	if ((dst_value == (unsigned char)0xff) && (src_value != (unsigned char)0xff))
+	{
+	    return 1;
+	}
+	if ((src_value == (unsigned char)0xff) && (dst_value != (unsigned char)0xff))
+	{
+	    return 2;
+    }
+    return 0;
+}
+
+static int find_segment_in_group(PGRP grp, long seg)
+{
+    UINT n;
+
+    if (!grp)
+    {
+	return -1;
+    }
+    for (n = 0; n < (UINT)grp->numsegs; n++)
+    {
+	if (grp->segindex[n] == seg)
+	{
+	    return (int)n;
+	}
+    }
+    return -1;
+}
+
+static void remove_segment_from_group(PGRP grp, int idx)
+{
+    UINT n;
+
+    if (!grp || (idx < 0))
+    {
+	return;
+    }
+    for (n = (UINT)idx; n + 1 < (UINT)grp->numsegs; n++)
+    {
+	grp->segindex[n] = grp->segindex[n + 1];
+    }
+    grp->numsegs--;
+}
+
+static void remap_segment_in_groups(long dest, long src)
+{
+    long keepGroup = -1;
+    UINT g;
+    int idx;
+
+    if ((dest == src) || (dest < 0) || (src < 0))
+    {
+	return;
+    }
+
+    for (g = 0; g < grpcount; g++)
+    {
+	if (!grplist[g])
+	{
+	    continue;
+	}
+	if ((keepGroup < 0) && (find_segment_in_group(grplist[g], dest) >= 0))
+	{
+	    keepGroup = (long)g;
+	    break;
+	}
+    }
+
+    if (keepGroup < 0)
+    {
+	for (g = 0; g < grpcount; g++)
+	{
+	    if (!grplist[g])
+	    {
+		continue;
+	    }
+	    if (find_segment_in_group(grplist[g], src) >= 0)
+	    {
+		keepGroup = (long)g;
+		break;
+	    }
+	}
+    }
+
+    for (g = 0; g < grpcount; g++)
+    {
+	PGRP grp;
+	int hasDest;
+
+	if (!grplist[g])
+	{
+	    continue;
+	}
+	grp = grplist[g];
+
+	hasDest = (find_segment_in_group(grp, dest) >= 0) ? 1 : 0;
+	idx = find_segment_in_group(grp, src);
+	while (idx >= 0)
+	{
+	    if ((long)g == keepGroup && !hasDest)
+	    {
+		grp->segindex[idx] = dest;
+		hasDest = 1;
+	    }
+	    else
+	    {
+		remove_segment_from_group(grp, idx);
+	    }
+	    idx = find_segment_in_group(grp, src);
+	}
+    }
+}
+
 void fixpubsegs(int src, int dest, UINT shift)
 {
     UINT i, j;
@@ -85,13 +263,15 @@ void redirect_segment(long dest, long src)
 
     for (k = 0; k < grpcount; k++)
     {
-	if (!grplist[k])
-	    continue;
-	for (n = 0; n < grplist[k]->numsegs; n++)
+	if (grplist[k])
 	{
-	    if (grplist[k]->segindex[n] != src)
-		continue;
-	    grplist[k]->segindex[n] = dest;
+	    for (n = 0; n < grplist[k]->numsegs; n++)
+	    {
+		if (grplist[k]->segindex[n] == src)
+		{
+		    grplist[k]->segindex[n] = dest;
+		}
+	    }
 	}
     }
 
@@ -103,7 +283,7 @@ void redirect_segment(long dest, long src)
 
 void combine_segments(long dest, long src)
 {
-    UINT k, n;
+    UINT k;
     PUCHAR p, q;
     long a1, a2;
 
@@ -281,19 +461,7 @@ void combine_segments(long dest, long src)
 	}
     }
 
-    for (k = 0; k < grpcount; k++)
-    {
-	if (grplist[k])
-	{
-	    for (n = 0; n < grplist[k]->numsegs; n++)
-	    {
-		if (grplist[k]->segindex[n] == src)
-		{
-		    grplist[k]->segindex[n] = dest;
-		}
-	    }
-	}
-    }
+    remap_segment_in_groups(dest, src);
 
     free(seglist[src]);
     seglist[src] = 0;
@@ -301,7 +469,7 @@ void combine_segments(long dest, long src)
 
 void combine_common(long i, long j)
 {
-    UINT k, n;
+    UINT k;
     PUCHAR p, q;
 
     if (seglist[j]->length > seglist[i]->length)
@@ -319,18 +487,51 @@ void combine_common(long i, long j)
 	p = seglist[j]->data;
 	q = seglist[j]->datmask;
     }
-    for (k = 0; k < seglist[j]->length; k++)
-    {
-	if (GetNbit(q, k))
+	for (k = 0; k < seglist[j]->length; k++)
 	{
-	    if (GetNbit(seglist[i]->datmask, k))
+	    if (GetNbit(q, k))
 	    {
-		if (seglist[i]->data[k] != p[k])
+		if (GetNbit(seglist[i]->datmask, k))
 		{
-		    ReportError(ERR_OVERWRITE);
+		    if (seglist[i]->data[k] != p[k])
+		    {
+			int override;
+
+			override = is_msg_pad_fill_override(seglist[i], seglist[j], (UINT)k);
+			if (override == 1)
+			{
+			    if (getenv("ALINK_DEBUG_OVERWRITE"))
+			    {
+				printf(
+				    "COMBINE_PAD_OVERWRITE name=%s seg%d<->seg%d ofs=%lu old=%u new=%u action=src\n",
+				    (seglist[i]->nameindex >= 0) ? namelist[seglist[i]->nameindex] : "?",
+				    (int)i, (int)j, (unsigned long)k, seglist[i]->data[k], p[k]);
+			    }
+			    seglist[i]->data[k] = p[k];
+			    continue;
+			}
+			if (override == 2)
+			{
+			    if (getenv("ALINK_DEBUG_OVERWRITE"))
+			    {
+				printf(
+				    "COMBINE_PAD_OVERWRITE name=%s seg%d<->seg%d ofs=%lu old=%u new=%u action=keep\n",
+				    (seglist[i]->nameindex >= 0) ? namelist[seglist[i]->nameindex] : "?",
+				    (int)i, (int)j, (unsigned long)k, seglist[i]->data[k], p[k]);
+			    }
+			    continue;
+			}
+			if (getenv("ALINK_DEBUG_OVERWRITE"))
+			{
+			    printf(
+				"COMBINE_OVERWRITE name=%s seg%d<->seg%d ofs=%lu old=%u new=%u\n",
+				(seglist[i]->nameindex >= 0) ? namelist[seglist[i]->nameindex] : "?",
+				(int)i, (int)j, (unsigned long)k, seglist[i]->data[k], p[k]);
+			}
+			ReportError(ERR_OVERWRITE);
+		    }
 		}
-	    }
-	    else
+		else
 	    {
 		SetNbit(seglist[i]->datmask, k);
 		seglist[i]->data[k] = p[k];
@@ -396,19 +597,7 @@ void combine_common(long i, long j)
 	}
     }
 
-    for (k = 0; k < grpcount; k++)
-    {
-	if (grplist[k])
-	{
-	    for (n = 0; n < grplist[k]->numsegs; n++)
-	    {
-		if (grplist[k]->segindex[n] == j)
-		{
-		    grplist[k]->segindex[n] = i;
-		}
-	    }
-	}
-    }
+    remap_segment_in_groups(i, j);
 
     free(seglist[j]);
     seglist[j] = 0;
@@ -431,8 +620,8 @@ void combine_groups(long i, long j)
 	}
 	if (!match)
 	{
-	    grplist[i]->numsegs++;
 	    grplist[i]->segindex[grplist[i]->numsegs] = grplist[j]->segindex[n];
+	    grplist[i]->numsegs++;
 	}
     }
     free(grplist[j]);

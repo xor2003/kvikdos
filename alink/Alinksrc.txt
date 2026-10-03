@@ -1,5 +1,5 @@
-ALINK Source Code, V1.6, Copyright 1998-9 Anthony A.J. Williams. 
-All Rights Reserved.
+ALINK Source Code, V1.7, Copyright 1998-9 Anthony A.J. Williams, 2026 xor2003.
+Co-authored by Anthony A.J. Williams and xor2003.
 
 This source code is free for all to use, compile and distribute for any
 purpose, provided it remains unmodified, and I am credited. You may not

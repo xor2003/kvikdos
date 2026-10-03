@@ -655,7 +655,8 @@ void OutputEXEfile(PCHAR outname)
 		    printf("SP value out of range\n");
 		    errcount++;
 		}
-		if ((outlist[i]->base > 0xfffff) || ((outlist[i]->base & 0xf) != 0))
+		if ((outlist[i]->base > 0xffff0) ||
+		    ((outlist[i]->base & 0xf) + outlist[i]->length > 0x10000))
 		{
 		    printf("SS value out of range\n");
 		    errcount++;
@@ -664,8 +665,10 @@ void OutputEXEfile(PCHAR outname)
 		{
 		    headbuf[0x0e] = (outlist[i]->base >> 4) & 0xff;
 		    headbuf[0x0f] = outlist[i]->base >> 12;
-		    headbuf[0x10] = outlist[i]->length & 0xff;
-		    headbuf[0x11] = (outlist[i]->length >> 8) & 0xff;
+		    /* non-para base: SP covers the base offset plus length */
+		    j = (outlist[i]->base & 0xf) + outlist[i]->length;
+		    headbuf[0x10] = j & 0xff;
+		    headbuf[0x11] = (j >> 8) & 0xff;
 		}
 	    }
 	}
@@ -966,6 +969,7 @@ void OutputEXEfile(PCHAR outname)
 	}
     }
     fclose(outfile);
+    free(headbuf);
 }
 
 long createOutputSection(char *name, UINT winFlags)

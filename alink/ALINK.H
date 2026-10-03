@@ -579,8 +579,10 @@ char *checkStrdup(const char *s) ALINK_RETURNS_NONNULL;
 int stricmp(const char *s1, const char *s2);
 char *strupr(char *s);
 char *_strdup(const char *s);
+FILE *openInputFile(const char *path);
 PSORTENTRY binarySearch(PSORTENTRY list, UINT count, char *key);
 void sortedInsert(PSORTENTRY *plist, UINT *pcount, char *key, void *object);
+int defaultLibSuppressed(const char *libname);
 #define strdup _strdup
 
 extern char case_sensitive;
@@ -638,3 +640,5 @@ extern UINT namecount, namemin, pubcount, pubmin, segcount, segmin, outcount, gr
 
 extern int buildDll;
 extern PUCHAR stubName;
+extern PPCHAR defaultLibsExcluded;
+extern UINT defaultLibExcludeCount;

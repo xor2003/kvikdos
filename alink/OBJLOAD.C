@@ -5,6 +5,8 @@ char f_thred[4];
 int t_thredindex[4];
 int f_thredindex[4];
 static PCOMDAT currentComdat = NULL;
+static long debugModNum = -1;
+static PCHAR debugModName = NULL;
 
 static UINT LoadComdefNumber(long *index)
 {
@@ -69,7 +71,7 @@ static void LoadComdefRecord(int isLocal)
 	    i = count * element_size;
 	    k = 1;
 	}
-	else if (buf[j] == 0x62)
+	else if (buf[j] == 0x62 || buf[j] == 0x02)
 	{
 	    j++;
 	    i = LoadComdefNumber(&j);
@@ -130,6 +132,93 @@ static void EnsureSegmentSize(long segnum, UINT size)
 	seglist[segnum]->datmask[i] = 0;
     }
     seglist[segnum]->length = size;
+}
+
+static int IsDebugInfoSegment(long segnum)
+{
+    int nameIndex;
+    int classIndex;
+
+    if (segnum < 0 || segnum >= (long)segcount || !seglist[segnum])
+	return FALSE;
+
+    nameIndex = seglist[segnum]->nameindex;
+    if ((nameIndex >= 0) && (nameIndex < (long)namecount))
+    {
+	if (!stricmp(namelist[nameIndex], "$$SYMBOLS") ||
+	    !stricmp(namelist[nameIndex], "$$TYPES"))
+	{
+	    return TRUE;
+	}
+    }
+    classIndex = seglist[segnum]->classindex;
+    if ((classIndex >= 0) && (classIndex < (long)namecount))
+    {
+	if (!stricmp(namelist[classIndex], "DEBSYM") ||
+	    !stricmp(namelist[classIndex], "DEBTYP"))
+	{
+	    return TRUE;
+	}
+    }
+    return FALSE;
+}
+
+static void EmitSegmentByte(long segnum, long ofs, unsigned char val)
+{
+    const char *moduleFilter;
+    const char *segmentFilter;
+
+    if (GetNbit(seglist[segnum]->datmask, ofs))
+    {
+	if ((seglist[segnum]->data[ofs] != val) && !IsDebugInfoSegment(segnum))
+	{
+	    moduleFilter = getenv("ALINK_DEBUG_MODULE");
+	    segmentFilter = getenv("ALINK_DEBUG_SEGMENT");
+	    if (getenv("ALINK_DEBUG_OVERWRITE"))
+	    {
+		const char *name = "";
+		const char *className = "";
+		const char *module = "";
+			if ((seglist[segnum]->nameindex >= 0) && (seglist[segnum]->nameindex < (long)namecount))
+			{
+			    name = namelist[seglist[segnum]->nameindex];
+			}
+		if ((seglist[segnum]->classindex >= 0) && (seglist[segnum]->classindex < (long)namecount))
+			{
+			    className = namelist[seglist[segnum]->classindex];
+			}
+			if (debugModName)
+			{
+			    module = debugModName;
+			}
+		fprintf(stderr,
+				"ALINK overlap: seg=%ld ofs=%ld old=%u new=%u name=%s class=%s mod=%ld/%s\n",
+				segnum, ofs, seglist[segnum]->data[ofs], val, name, className, debugModNum,
+				module);
+	    }
+	    if (moduleFilter && debugModName && segmentFilter && !stricmp(debugModName, moduleFilter) &&
+		!stricmp(namelist[seglist[segnum]->nameindex], segmentFilter))
+	    {
+		fprintf(stderr,
+			"ALINK overlap target: mod=%s seg=%ld name=%s ofs=%ld old=%u new=%u\n",
+			debugModName, segnum, namelist[seglist[segnum]->nameindex], ofs,
+			seglist[segnum]->data[ofs], val);
+	    }
+	    ReportError(ERR_OVERWRITE);
+	}
+    }
+    moduleFilter = getenv("ALINK_DEBUG_MODULE");
+    segmentFilter = getenv("ALINK_DEBUG_SEGMENT");
+    if (moduleFilter && debugModName && segmentFilter &&
+	!stricmp(debugModName, moduleFilter) &&
+	!stricmp(namelist[seglist[segnum]->nameindex], segmentFilter) &&
+	ofs < 64)
+    {
+	fprintf(stderr, "ALINK write: mod=%s seg=%ld ofs=%ld val=%u\n",
+		debugModName, segnum, ofs, val);
+    }
+    seglist[segnum]->data[ofs] = val;
+    SetNbit(seglist[segnum]->datmask, ofs);
 }
 
 static unsigned short GetComdatAlign(unsigned char align, long assocSeg)
@@ -247,15 +336,7 @@ void EmitLiData(PDATABLOCK p, long segnum, long *ofs)
 		{
 		    ReportError(ERR_INV_DATA);
 		}
-		if (GetNbit(seglist[segnum]->datmask, *ofs))
-		{
-		    if (seglist[segnum]->data[*ofs] != ((PUCHAR)p->data)[j + 1])
-		    {
-			ReportError(ERR_OVERWRITE);
-		    }
-		}
-		seglist[segnum]->data[*ofs] = ((PUCHAR)p->data)[j + 1];
-		SetNbit(seglist[segnum]->datmask, *ofs);
+		EmitSegmentByte(segnum, *ofs, ((PUCHAR)p->data)[j + 1]);
 	    }
 	}
     }
@@ -560,11 +641,11 @@ long loadmod(FILE *objfile)
 	}
 	switch (rectype)
 	{
-	case THEADR:
-	case LHEADR:
-	    if (modpos)
-	    {
-		ReportError(ERR_EXTRA_HEADER);
+		case THEADR:
+		case LHEADR:
+		    if (modpos)
+		    {
+			ReportError(ERR_EXTRA_HEADER);
 	    }
 	    modname = checkRealloc(modname, (nummods + 1) * sizeof(PCHAR));
 	    modname[nummods] = checkMalloc(buf[0] + 1);
@@ -572,10 +653,16 @@ long loadmod(FILE *objfile)
 	    {
 		modname[nummods][i] = buf[i + 1];
 	    }
-	    modname[nummods][i] = 0;
-	    strupr(modname[nummods]);
-	    /*	    printf("Loading module %s\n",modname[nummods]);*/
-	    if ((buf[0] + 1) != reclength)
+		    modname[nummods][i] = 0;
+		    strupr(modname[nummods]);
+		    debugModNum = nummods;
+		    debugModName = modname[nummods];
+		    if (getenv("ALINK_DEBUG_MODULE"))
+		    {
+			fprintf(stderr, "ALINK loading module %s (%ld)\n", debugModName, debugModNum);
+		    }
+		    /*	    printf("Loading module %s\n",modname[nummods]);*/
+		    if ((buf[0] + 1) != reclength)
 	    {
 		ReportError(ERR_EXTRA_DATA);
 	    }
@@ -771,7 +858,7 @@ long loadmod(FILE *objfile)
 		case COMENT_SOURCEFILE:
 		    break;
 		default:
-		    printf("COMENT Record (unknown type %02X)\n", buf[1]);
+		    /* OMF spec: unknown comment classes are ignored */
 		    break;
 		}
 	    }
@@ -930,18 +1017,7 @@ long loadmod(FILE *objfile)
 		{
 		    ReportError(ERR_INV_DATA);
 		}
-		if (GetNbit(seglist[prevseg]->datmask, prevofs + k))
-		{
-		    if (seglist[prevseg]->data[prevofs + k] != buf[j])
-		    {
-			printf("%08lX: %08lX: %i, %u,%u,%li\n", prevofs + k, j,
-			       GetNbit(seglist[prevseg]->datmask, prevofs + k), segcount, segmin,
-			       prevseg);
-			ReportError(ERR_OVERWRITE);
-		    }
-		}
-		seglist[prevseg]->data[prevofs + k] = buf[j];
-		SetNbit(seglist[prevseg]->datmask, prevofs + k);
+		EmitSegmentByte(prevseg, prevofs + k, buf[j]);
 	    }
 	    li_le = PREV_LE;
 	    break;
@@ -1755,7 +1831,7 @@ void loadlibmod(UINT libnum, UINT modpage)
 	    return;
     }
 
-    libfile = fopen(p->filename, "rb");
+    libfile = openInputFile(p->filename);
     if (!libfile)
     {
 	printf("Error opening file %s\n", p->filename);
