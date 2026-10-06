@@ -73,7 +73,9 @@ int i21_mem(void) {
                 fprintf(stderr, "fatal: bad MCB after inplace_realloc()\n");
                 exit(252);
               }
-              if (next_mcb && is_mcb_bad(mem, available_para = block_para + 1 + MCB_SIZE_PARA((char*)mem + (block_para << 4) - 16))) {
+              /* A 'Z' result is the chain's last block: there is no next
+               * MCB to validate (checking it would read past the arena). */
+              if (MCB_TYPE(mcb) != 'Z' && is_mcb_bad(mem, available_para = block_para + 1 + MCB_SIZE_PARA(mcb))) {
                 fprintf(stderr, "fatal: bad next/free MCB after inplace_realloc(): %d\n", is_mcb_bad(mem, available_para));
                 exit(252);
               }
