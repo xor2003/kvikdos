@@ -248,16 +248,20 @@ Building from source:
 
     $ make kvikdos
 
-* Portable binary (cosmopolitan APE, runs on Linux + Windows + more):
+* Portable binary (cosmopolitan APE, runs on Linux + Windows, stripped):
 
-    $ make kvikdos.ape COSMOCC=/path/to/cosmocc
+    $ make kvikdos.ape
 
-  Get cosmocc from https://cosmo.zip/pub/cosmocc/ (cosmocc-<ver>.zip,
-  unzip anywhere). The resulting kvikdos.ape runs DOS programs through
-  KVM on Linux; rename/copy it to kvikdos.com on Windows, where it loads
-  WinHvPlatform.dll and runs through WHPX (enable the "Windows
-  Hypervisor Platform" optional feature). The backend is selected at
-  runtime, so the same file works on both hosts.
+  Get the cosmopolitan toolchain from
+  https://cosmo.zip/pub/cosmocc/ (cosmocc-<ver>.zip, unzip anywhere, put
+  its bin/ on PATH or pass COSMOCC=/path/to/x86_64-unknown-cosmo-cc
+  COSTRIP=/path/to/x86_64-unknown-cosmo-strip). The resulting
+  kvikdos.ape runs DOS programs through KVM on Linux; rename/copy it to
+  kvikdos.com on Windows, where it loads WinHvPlatform.dll and runs
+  through WHPX (enable the "Windows Hypervisor Platform" optional
+  feature). The backend is selected at runtime, so the same file works
+  on both hosts. x86-64 is the only arch since KVM/WHPX virtualization
+  is x86-specific.
 
 Command-line options (structured):
 

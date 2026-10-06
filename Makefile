@@ -64,12 +64,17 @@ kvikdos.static: $(SRCDEPS)
 kvikdos.diet: $(SRCDEPS)
 	minicc --gcc=4.8 --diet -DUSE_MINI_KVM -fno-strict-aliasing -o kvikdos.diet $(KVIKDOS_SRCS)
 
-# Cosmopolitan APE build: one binary that runs on Linux (KVM backend),
-# Windows (WHPX backend, picked via IsWindows()) and other cosmo hosts.
-# Copy/rename kvikdos.ape to kvikdos.com (or .exe) to run it on Windows.
-COSMOCC ?= cosmocc
+# Cosmopolitan APE build: one x86-64 binary that runs on Linux (KVM
+# backend) and Windows (WHPX backend, picked via IsWindows()). The
+# single-arch unknown-cosmo target is used deliberately: KVM/WHPX are
+# x86-only hypervisors, so the aarch64 half of a fat cosmopolitan binary
+# would be dead weight. Stripped for release. Copy/rename kvikdos.ape to
+# kvikdos.com (or .exe) to run it on Windows.
+COSMOCC ?= x86_64-unknown-cosmo-cc
+COSTRIP ?= x86_64-unknown-cosmo-strip
 kvikdos.ape: $(SRCDEPS)
-	$(COSMOCC) -O2 -s -o $@ $(KVIKDOS_SRCS)
+	$(COSMOCC) -O2 -o $@ $(KVIKDOS_SRCS)
+	$(COSTRIP) $@
 
 ape: kvikdos.ape
 

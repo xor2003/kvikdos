@@ -66,8 +66,11 @@ jobs:
           curl -fsSL -o /tmp/cosmocc.zip "https://cosmo.zip/pub/cosmocc/cosmocc-${{ env.COSMOCC_VERSION }}.zip"
           unzip -q /tmp/cosmocc.zip -d "$HOME/cosmocc"
 
-      - name: Build APE (one binary for Linux + Windows)
-        run: make kvikdos.ape COSMOCC="$HOME/cosmocc/bin/cosmocc"
+      - name: Build stripped APE (one binary for Linux + Windows)
+        run: |
+          make kvikdos.ape \
+            COSMOCC="$HOME/cosmocc/bin/x86_64-unknown-cosmo-cc" \
+            COSTRIP="$HOME/cosmocc/bin/x86_64-unknown-cosmo-strip"
 
       - name: Smoke-test APE on Linux via KVM
         if: steps.kvm.outputs.available == 'yes'
