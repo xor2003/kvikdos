@@ -132,18 +132,16 @@ int i21_exec(void) {
                 return IA_FATAL_INT;
               }
               if (DEBUG || DEBUG_EXEC || DIAG_ON(DIAG_BIT_EXEC)) fprintf(g_diag_file, "debug: exec: al:%02x reason=%d program=(%s) g_prog_args=(%s)\n", al, reason, dos_filename, safe_args);
-              if (0 && al == 0) {  /* TODO(pts): Why stop? */
-                /* Power C 2.2.0 compiler pc.exe. */
-                fprintf(stderr, "fatal: unsupported exec with al:%02d: %s\n", al, dos_filename);
-                return IA_FATAL_INT;
-              }
               /* Even with al == 0, the correct behavior would be resuming
                * execution of the parent proess (e.g. Borland C++ 2.0
-               * compiler bcc.exe) after the child process (e.g. TLINK 4.0
-               * linker tlink.exe) has finished (and then e.g. print the
-               * ``Available memory'' message and remove the `turboc.$ln'
-               * file). However, kvikdos is not smart enough for that, so it
-               * just does an exec() and forgets about the parent process.
+               * compiler bcc.exe, Power C 2.2.0 pc.exe) after the child
+               * process (e.g. TLINK 4.0 linker tlink.exe) has finished (and
+               * then e.g. print the ``Available memory'' message and remove
+               * the `turboc.$ln' file). However, kvikdos is not smart enough
+               * for that, so it just does an exec() and forgets about the
+               * parent process.
+               * TODO(pts): Return to the parent on child exit (needs a real
+               * process model with a saved parent context).
                */
               if (al == 3) {
                 char ovl_dos[LINUX_PATH_SIZE];

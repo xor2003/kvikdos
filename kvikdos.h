@@ -13,6 +13,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>  /* For gettimeofday(2). */
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>

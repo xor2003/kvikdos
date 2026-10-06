@@ -133,14 +133,14 @@ int detect_dos_executable_program(int img_fd, const char *prog_filename, char *p
     /* !! TODO(pts): Follow emulated symlink e.g. if tcc.exe contains `@@@ bcc.exe' */
   } else if (r >= 6 && is_same_ascii_nocase(p, "@echo ", 6)) {
     fprintf(stderr, "fatal: DOS .bat batch files not supported as executable: %s\n", prog_filename);
-    exit(252);  /* !! add support */
+    exit(252);  /* TODO(pts): Delegate a DOS exec() of a .bat to run_dos_batch (top-level .bat targets already run in main.c). */
   } else if (r >= 4 && 0 == memcmp(p, "\x7f""ELF", 4)) {  /* Typically Linux native executable. */
     fprintf(stderr, "fatal: ELF executable programs not supported as executable: %s\n", prog_filename);
-    exit(252);  /* TODO(pts): Run them natively, without setting up KVM. */
+    exit(252);  /* TODO(pts): Delegate a DOS exec() of an ELF to run_native_execvp (top-level ELF targets already run natively in main.c). */
   } else if (r >= 3 && ('#' | '!' << 8) == *(unsigned short*)p && (p[2] == ' ' || p[2] == '/')) {
     /* Unix script #! shebang detected. */
     fprintf(stderr, "fatal: Unix scripts not supported: %s\n", prog_filename);
-    exit(252);  /* TODO(pts): Run them natively, without setting up KVM. */
+    exit(252);  /* TODO(pts): Delegate a DOS exec() of a script to run_native_execvp (top-level shebang targets already run natively in main.c). */
   } else if (img_fd < 0) {  /* For --kvm-check. */
   } else {  /* Otherwise it's a DOS .com program, but only if it has .com extension. */
     const char *ext = get_linux_ext(prog_filename);

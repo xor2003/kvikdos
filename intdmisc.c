@@ -34,7 +34,8 @@ int i21_misc(void) {
   /* Get time. */
             time_t ts = time(0);
             struct tm *tm = localtime(&ts);
-            const unsigned char hundredths = 0;  /* TODO(pts): Use gettimeofday(2) to get it. */
+            struct timeval tv;
+            const unsigned char hundredths = gettimeofday(&tv, NULL) == 0 ? (unsigned char)(tv.tv_usec / 10000) : 0;
             *(unsigned short*)&regs.rcx = tm->tm_hour << 8 | tm->tm_min;
             *(unsigned short*)&regs.rdx = tm->tm_sec << 8 | hundredths;
             tasm30_bitset |= 0x40;
@@ -206,7 +207,6 @@ int i21_misc(void) {
             }
   }   else if (ah == 0x0e) {
   /* Select disk. */
-            /* TODO(pts): Use the default drive specified here (dl + 'A') in get_linux_filename_r(...). */
             const unsigned char dl = (unsigned char)regs.rdx;
             if (dl < DRIVE_COUNT && dir_state->linux_mount_dir[dl]) dir_state->drive = dl + 'A';
             *(unsigned char*)&regs.rax = 26;  /* 26 drives: 'A' .. 'Z'. */

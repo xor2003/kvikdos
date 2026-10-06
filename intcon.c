@@ -42,16 +42,19 @@ int i21_con(void) {
   }   else if (ah == 0x09) {
   /* Print string. */
             unsigned short dx = *(unsigned short*)&regs.rdx, dx0 = dx;
-            const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4);
+            const char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4), *p0 = p;
             for (;;) {
               if (p[dx] == '$') break;
               ++dx;
-              if (dx == 0) {
-                fprintf(stderr, "fatal: !! offset overflow in print\n");  /* TODO(pts): Implement it.  */
-                exit(252);
+              if (dx == 0) {  /* End of segment: the `$' may live in the next one, like on real DOS. */
+                p += 0x10000;
+                if (p - (const char*)mem >= GUEST_MEM_LIMIT) {
+                  fprintf(stderr, "fatal: unterminated $-terminated string in print\n");
+                  exit(252);
+                }
               }
             }
-            stdout_write_p = p + dx0;
+            stdout_write_p = p0 + dx0;
             stdout_write_end = p + dx;
             emit_stdout(); return IA_NEXT;
   }   else if (ah == 0x0b) {
