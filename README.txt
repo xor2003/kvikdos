@@ -12,6 +12,36 @@ kvikdos is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.
 kvikdos should be pronunced as ``quick DOS''. the initials ``kv'' refers to
 KVM, the underlying virtualization technology.
 
+Features at a glance:
+
+* Fast: CPU runs natively under Linux KVM (Intel VT-x/AMD-V); I/O calls
+  map directly to Linux syscalls; quick startup for short-lived tools.
+* Real mode and protected mode: 16-bit DOS programs run directly;
+  32-bit protected-mode programs run either through a bound extender
+  (Phar Lap 386|DOS-Extender/TNT) or through an external resident DPMI
+  host loaded with `--dpmi=' (CWSDPMI, HDPMI32, DPMIRES-style stubs).
+* Memory: fully-chained conventional MCB arena (msdos_player semantics:
+  per-PSP owners, free `Z' tail) plus up to 1 GiB guest memory
+  (`--mem-mb=', 128 MiB default) exposed via XMS 3.0 (incl. 0x88/0x89
+  for >64 MiB) and int 15h AH=88h; partial EMS (int 67h) for probes.
+* DOS ABI: a working subset of int 21h (files, directories, findfirst/
+  next, FCB, exec, memory, environment, PSP, exit codes), plus BIOS
+  ints 10h (video), 11h, 15h, 16h (keyboard), 1ah (time), multiplex
+  int 2fh, and direct IVT writes. int 21h AH=52h returns a real
+  List-of-Lists (dos_info_t).
+* Console: stdout/stdin/stderr map to Linux streams for pipeline use;
+  a minimal 80x25 text mode renders full-screen text programs
+  (colors, cursor, blink, Alt keys) on the terminal — IDEs and editors
+  like Watcom VI and Turbo Pascal IDE work.
+* DOS drives: Linux directories mounted as DOS drive letters with
+  configurable case folding; executable auto-resolution with case
+  fallback.
+* Batch files: a built-in interpreter for .bat driver scripts
+  (`set`, `%VAR%`, `%1..%9`, `shift`, `call`, `if`, `goto`, `mkdir`,
+  `copy`, `del` ...).
+* Integration: propagates DOS exit codes, passes environment variables,
+  runs Linux ELF/scripts natively and delegates PE/NE/LE/LX to wine.
+
 Requirements:
 
 * Linux operating system running on i386 (x86, i686) or amd64 (x86_64)
