@@ -21,7 +21,10 @@ void map_handle_close(unsigned short handle) {
   mapped_handles[handle - 5] = 0;  /* Mark it as available. */
 }
 
-int get_linux_fd(unsigned short handle, const struct kvm_fds *kvm_fds) {
+int get_linux_fd(unsigned short handle) {
+  extern struct hv *hv;  /* From intrun.h (not visible through kvikdos.h). */
+  int hv_fds[3];
+  const int hv_fd_count = hv ? hv_get_fds(hv, hv_fds, 3) : 0;
   /* Redirection (`./kvikdos prog >prog.out') just works and redirects DOS
    * STDOUT (not DOS STDERR), and because of the conditions below, STDPRN as
    * well. This matches the behavior of `pts-fast-dosbox noscreenprn'. In
@@ -37,8 +40,12 @@ int get_linux_fd(unsigned short handle, const struct kvm_fds *kvm_fds) {
   }
   fd = handle >= 5 + sizeof(mapped_handles) / sizeof(mapped_handles[0]) ? (int)(handle - (5 + sizeof(mapped_handles) / sizeof(mapped_handles[0]))) :
       mapped_handles[handle - 5] ? mapped_handles[handle - 5] : -1;
-  return (fd == kvm_fds->kvm_fd || fd == kvm_fds->vm_fd || fd == kvm_fds->vcpu_fd) ? -1  /* Disallow these handles from DOS for security. */
-       : fd;
+  { int i;
+    for (i = 0; i < hv_fd_count; ++i) {  /* Disallow hypervisor fds from DOS for security. */
+      if (fd == hv_fds[i]) return -1;
+    }
+  }
+  return fd;
 }
 
 int open_dos_file(const char *dos_filename, const char *dos_prog_abs, int flags, DirState *dir_state) {

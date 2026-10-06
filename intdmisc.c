@@ -451,7 +451,7 @@ int i21_misc(void) {
   }   else if (ah == 0x5c) {
   /* Record lock/unlock. */
             const unsigned char al = (unsigned char)regs.rax;
-            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
+            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx);
             struct flock fl;
             if (fd < 0) return dos_err_ax(6);
             memset(&fl, 0, sizeof(fl));

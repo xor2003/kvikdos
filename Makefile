@@ -1,4 +1,4 @@
-.PHONY: all clean run test test-batch test-mem test-cli test-cli-matrix test-static test-sanitizers test-valgrind test-tooling
+.PHONY: all clean run test test-batch test-mem test-cli test-cli-matrix test-static test-sanitizers test-valgrind test-tooling test-x86dec ape
 .SUFFIXES:
 MAKEFLAGS += -r
 
@@ -10,13 +10,13 @@ XCFLAGS =  # To be overridden from the command-line.
 
 # Split translation units (was a single kvikdos.c). kvikdos.h is the shared
 # internal header with the common types, constants, externs and prototypes.
-KVIKDOS_SRCS = util.c diag.c resolve.c dospath.c args.c argsparse.c argspost.c batchline.c batchcmd_a.c batchcmd_b.c batchcmd_c.c loader.c mzdetect.c fds.c video.c tty.c vm.c spawn.c runstate.c run.c vmexit.c intmisc.c intdos.c intcon.c intopen.c intio.c intmem.c intfcb.c intfind.c intexec.c intdmisc.c intvid.c intems.c intxms.c batch.c main.c
-SRCDEPS = $(KVIKDOS_SRCS) kvikdos.h mini_kvm.h
+KVIKDOS_SRCS = util.c diag.c resolve.c dospath.c args.c argsparse.c argspost.c batchline.c batchcmd_a.c batchcmd_b.c batchcmd_c.c loader.c mzdetect.c fds.c video.c tty.c vm.c hv_kvm.c hv_whpx.c hvpick.c x86dec.c spawn.c runstate.c run.c vmexit.c intmisc.c intdos.c intcon.c intopen.c intio.c intmem.c intfcb.c intfind.c intexec.c intdmisc.c intvid.c intems.c intxms.c batch.c main.c
+SRCDEPS = $(KVIKDOS_SRCS) kvikdos.h mini_kvm.h mini_whpx.h hv.h x86dec.h
 
 all: $(ALL)
 
 clean:
-	rm -f $(ALL) kvikdos32 kvikdos64 kvikdos.static
+	rm -f $(ALL) kvikdos32 kvikdos64 kvikdos.static kvikdos.ape
 
 run: kvikdos guest.com
 	./kvikdos guest.com hello world
@@ -63,3 +63,18 @@ kvikdos.static: $(SRCDEPS)
 
 kvikdos.diet: $(SRCDEPS)
 	minicc --gcc=4.8 --diet -DUSE_MINI_KVM -fno-strict-aliasing -o kvikdos.diet $(KVIKDOS_SRCS)
+
+# Cosmopolitan APE build: one binary that runs on Linux (KVM backend),
+# Windows (WHPX backend, picked via IsWindows()) and other cosmo hosts.
+# Copy/rename kvikdos.ape to kvikdos.com (or .exe) to run it on Windows.
+COSMOCC ?= cosmocc
+kvikdos.ape: $(SRCDEPS)
+	$(COSMOCC) -O2 -s -o $@ $(KVIKDOS_SRCS)
+
+ape: kvikdos.ape
+
+# Host-native unit test for the mini instruction decoder the WHPX backend
+# uses to complete memory-access exits (no guest or hypervisor needed).
+test-x86dec: tests/test_x86dec.c x86dec.c x86dec.h mini_kvm.h
+	gcc -O2 -Wall -Wextra -I. -o /tmp/test_x86dec tests/test_x86dec.c x86dec.c
+	/tmp/test_x86dec

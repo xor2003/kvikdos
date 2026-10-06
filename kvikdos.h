@@ -24,11 +24,15 @@
 #define DIAG_BIT_FS       0x08u  /* fs: filesystem and path operations */
 #define DIAG_BIT_VERBOSE  0x10u  /* verbose: malloc/MCB/register tracing (all only) */
 #define DIAG_ON(bit) (g_diag_mask & (unsigned)(bit))
-#ifdef USE_MINI_KVM  /* For systems with a broken linux/kvm.h. */
+#if defined(USE_MINI_KVM) || defined(__COSMOPOLITAN__)
+/* USE_MINI_KVM for systems with a broken linux/kvm.h; cosmopolitan has none
+ * at all (its headers are host-neutral), and the vendored ABI decls in
+ * mini_kvm.h double as the universal regs/sregs POD format for all backends. */
 #  include "mini_kvm.h"
 #else
 #  include <linux/kvm.h>
 #endif
+#include "hv.h"  /* Hypervisor backend abstraction (KVM on Linux, WHPX on Windows). */
 #ifndef DEBUG
 #define DEBUG 0
 #endif
@@ -169,10 +173,6 @@ typedef struct ParsedCmdArgs {
   char force_dos;
 } ParsedCmdArgs;
 
-struct kvm_fds {
-  int kvm_fd, vm_fd, vcpu_fd;
-};
-
 typedef struct TtyState {
   int tty_in_fd;
   char is_tty_in_error;
@@ -182,9 +182,8 @@ typedef struct TtyState {
 } TtyState;
 
 typedef struct EmuState {
-  struct kvm_fds kvm_fds;
+  struct hv *hv;  /* Hypervisor backend (KVM on Linux, WHPX on Windows). */
   struct kvm_sregs initial_sregs;
-  struct kvm_run *kvm_run;
   void *mem;
   void *xmem;  /* Extended memory: guest physical [0x100000, 0x100000 + xmem_size). */
   unsigned long xmem_size;  /* Bytes. 0 if --mem-mb=1. */
@@ -348,7 +347,7 @@ int is_probable_windows_message_stub(const char *path);
 int is_probable_dos_extender_program(const char *path);
 int map_fd_open(int fd);
 void map_handle_close(unsigned short handle);
-int get_linux_fd(unsigned short handle, const struct kvm_fds *kvm_fds);
+int get_linux_fd(unsigned short handle);
 int open_dos_file(const char *dos_filename, const char *dos_prog_abs, int flags, DirState *dir_state);
 void get_dos_abspath_r(const char *p, const DirState *dir_state, char *out_buf, unsigned out_size);
 unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char *dpmi_host, const char *args_str, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0, const char* const *extra_env, unsigned extra_env_count);

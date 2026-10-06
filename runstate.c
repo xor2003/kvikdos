@@ -4,9 +4,9 @@
 
 /* Shared DOS run state (was locals of run_dos_prog; see intrun.h). */
 struct EmuState *emu;
-struct kvm_fds kvm_fds;
+struct hv *hv;
 void *mem;
-struct kvm_run *run;
+struct hv_exit hx;
 struct kvm_regs regs;
 struct kvm_sregs sregs;
 DirState *dir_state;
@@ -82,7 +82,7 @@ unsigned char dos_exit(void) {
   if (find_dirp) { closedir(find_dirp); find_dirp = NULL; }
   if (g_exit_regs) {
     struct kvm_sregs sr;
-    if (ioctl(kvm_fds.vcpu_fd, KVM_GET_SREGS, &sr) == 0)
+    if (hv_get_sregs(hv, &sr) == 0)
       fprintf(stderr, "info: exit regs cs=%04x ds=%04x es=%04x ss=%04x ip=%04x sp=%04x ax=%04x cr0=%lx cr2=%lx cr3=%lx\n",
               sregs.cs.selector, sregs.ds.selector, sregs.es.selector, sregs.ss.selector,
               (unsigned short)regs.rip, (unsigned short)regs.rsp, (unsigned short)regs.rax,

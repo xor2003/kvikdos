@@ -91,10 +91,9 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
       const unsigned long i1588 = xmem_kb > 0xffffUL ? 0xffffUL : xmem_kb;
       const unsigned long reserve = i1588 > XMS_KERNEL_RESERVE_KB ? XMS_KERNEL_RESERVE_KB : 0;
       xms_free_kb = emu->xmem_size >= (64 << 10) ? xmem_kb - 64 - reserve : 0; }
-    kvm_fds = emu->kvm_fds;
+    hv = emu->hv;
     mem = emu->mem;
-    run = emu->kvm_run;
-    /* Any read/write outside the regions above will trigger a KVM_EXIT_MMIO. */
+    /* Any read/write outside the regions above will trigger an MMIO exit. */
     /* Fill magic interrupt table. */
     { unsigned u;
       for (u = 0; u < 0x100; ++u) { ((unsigned*)mem)[u] = MAGIC_INT_VALUE(u); }
@@ -336,44 +335,43 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
   /* !! Security: close all filehandles except for 0, 1, 2 and kvm_fds, so that read and write from DOS won't be able to touch them. */
 
  set_sregs_regs_and_continue:
-  if (ioctl(kvm_fds.vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
-    perror("fatal: KVM_SET_SREGS");
+  if (hv_set_sregs(hv, &sregs) < 0) {
+    perror("fatal: hv_set_sregs");
     exit(252);
   }
-  if (ioctl(kvm_fds.vcpu_fd, KVM_SET_REGS, &regs) < 0) {
-    perror("fatal: KVM_SET_REGS\n");
+  if (hv_set_regs(hv, &regs) < 0) {
+    perror("fatal: hv_set_regs\n");
     exit(252);
   }
 
   /* !! Trap it if it tries to enter protected mode (cr0 |= 1). Is this possible? */
   for (;;) {
-    int ret = ioctl(kvm_fds.vcpu_fd, KVM_RUN, 0);
-    if (ret < 0) {
-      fprintf(stderr, "KVM_RUN failed");
+    if (hv_run(hv, &hx) < 0) {
+      fprintf(stderr, "hv_run failed");
       exit(252);
     }
-    if (ioctl(kvm_fds.vcpu_fd, KVM_GET_REGS, &regs) < 0) {
-      perror("fatal: KVM_GET_REGS");
+    if (hv_get_regs(hv, &regs) < 0) {
+      perror("fatal: hv_get_regs");
       exit(252);
     }
-    if (ioctl(kvm_fds.vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
-      perror("fatal: KVM_GET_REGS");
+    if (hv_get_sregs(hv, &sregs) < 0) {
+      perror("fatal: hv_get_sregs");
       exit(252);
     }
     if (DEBUG || DIAG_ON(DIAG_BIT_VERBOSE)) dump_regs("debug", &regs, &sregs);
 
-    if (run->exit_reason != KVM_EXIT_HLT) hlt_spin_count = 0;
+    if (hx.reason != HV_EXIT_HLT) hlt_spin_count = 0;
     if (++vid_tick >= 512) { vid_tick = 0; vid_render(mem); }  /* Periodic repaint of the guest text screen. */
-    switch (run->exit_reason) {
-     case KVM_EXIT_IO:
+    switch (hx.reason) {
+     case HV_EXIT_IO:
       if (io_dispatch() == IA_FATAL) goto fatal;
       break;
-     case KVM_EXIT_DEBUG:
+     case HV_EXIT_DEBUG:
       break;
-     case KVM_EXIT_SHUTDOWN:  /* How do we trigger it? */
+     case HV_EXIT_SHUTDOWN:  /* How do we trigger it? */
       fprintf(stderr, "fatal: shutdown\n");
       exit(252);
-     case KVM_EXIT_HLT:
+     case HV_EXIT_HLT:
       if (sregs.cs.selector == INT_HLT_PARA && (unsigned)((unsigned)regs.rip - 1) < 0x100) {  /* hlt caused by int through our magic interrupt table. */
         int_num = ((unsigned)regs.rip - 1) & 0xff;
         csip_ptr = (unsigned short*)((char*)mem + ((unsigned)sregs.ss.selector << 4) + (*(unsigned short*)&regs.rsp));  /* !! What if rsp wraps around 64 KiB boundary? Test it. Also calculate int_cs again. */
@@ -469,30 +467,24 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
           goto fatal;
         }
       }
-     case KVM_EXIT_MMIO:
+     case HV_EXIT_MMIO:
       if (mmio_dispatch() == IA_FATAL) goto fatal;
       break;
-     case KVM_EXIT_INTERNAL_ERROR:
-      fprintf(stderr, "fatal: KVM internal error suberror=%u\n", (unsigned)run->internal.suberror);
+     case HV_EXIT_INTERNAL:
+      fprintf(stderr, "fatal: hypervisor internal error\n");
       /* We get this for an int call if we don't map
-       * (KVM_SET_USER_MEMORY_REGION) or initialize the interrupt table
-       * properly. However, we can't continue the emulation, because KVM_RUN
-       * will return the same error again. !! Can we fix it?
+       * the memory regions or initialize the interrupt table
+       * properly. However, we can't continue the emulation, because hv_run
+       * will return the same error again.
        */
-      /* if (run->internal.suberror == KVM_INTERNAL_ERROR_DELIVERY_EV && p[0] == (char)0xcd) {...} */
       goto fatal;
      default:
-      fprintf(stderr, "fatal: unexpected KVM exit: reason=%u\n", run->exit_reason);
+      fprintf(stderr, "fatal: unexpected exit: reason=%u\n", hx.reason);
       goto fatal;
     }
   }
  fatal:
   dump_regs("fatal", &regs, &sregs);
-#if 0  /* The Linux kernel does this at process exit. */
-  close(kvm_fds.vcpu_fd);
-  close(kvm_fds.vm_fd);
-  close(kvm_fds.kvm_fd);
-#endif
   exit(252);
   return 0;  /* Not reached. This is just to pacity owcc. */
 }

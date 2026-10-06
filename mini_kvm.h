@@ -54,6 +54,21 @@ struct kvm_userspace_memory_region {
         __u64 userspace_addr; /* start of the userspace allocated memory */
 };
 
+/* for KVM_GET_SUPPORTED_CPUID / KVM_SET_CPUID2 */
+struct kvm_cpuid_entry2 {
+        __u32 function;
+        __u32 index;
+        __u32 flags;
+        __u32 eax, ebx, ecx, edx;
+        __u32 padding[3];
+};
+
+struct kvm_cpuid2 {
+        __u32 nent;
+        __u32 padding;
+        struct kvm_cpuid_entry2 entries[0];
+};
+
 /* for KVM_RUN, returned by mmap(vcpu_fd, offset=0) */
 __extension__ struct kvm_run {
 	/* in */
@@ -229,20 +244,23 @@ __extension__ struct kvm_run {
 
 #define KVM_GET_API_VERSION       _IO(KVMIO,   0x00)
 #define KVM_CREATE_VM             _IO(KVMIO,   0x01) /* returns a VM fd */
+#define KVM_GET_VCPU_MMAP_SIZE    _IO(KVMIO,   0x04) /* in bytes */
+#define KVM_GET_SUPPORTED_CPUID   _IOWR(KVMIO, 0x05, struct kvm_cpuid2)
+#define KVM_CREATE_VCPU           _IO(KVMIO,   0x41)
 #define KVM_SET_USER_MEMORY_REGION _IOW(KVMIO, 0x46, \
                                         struct kvm_userspace_memory_region)
-#define KVM_CREATE_VCPU           _IO(KVMIO,   0x41)
-#define KVM_GET_VCPU_MMAP_SIZE    _IO(KVMIO,   0x04) /* in bytes */
 #define KVM_RUN                   _IO(KVMIO,   0x80)
 #define KVM_GET_REGS              _IOR(KVMIO,  0x81, struct kvm_regs)
 #define KVM_SET_REGS              _IOW(KVMIO,  0x82, struct kvm_regs)
 #define KVM_GET_SREGS             _IOR(KVMIO,  0x83, struct kvm_sregs)
 #define KVM_SET_SREGS             _IOW(KVMIO,  0x84, struct kvm_sregs)
+#define KVM_SET_CPUID2            _IOW(KVMIO,  0x90, struct kvm_cpuid2)
 
 #define KVM_MEM_LOG_DIRTY_PAGES (1UL << 0)
 #define KVM_MEM_READONLY        (1UL << 1)
 
 #define KVM_EXIT_IO               2
+#define KVM_EXIT_DEBUG            4
 #define KVM_EXIT_HLT              5
 #define KVM_EXIT_MMIO             6
 #define KVM_EXIT_SHUTDOWN         8   

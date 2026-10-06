@@ -40,15 +40,11 @@ int int67_dispatch(void) {
           unsigned short logical = *(unsigned short*)&regs.rbx;
           unsigned short phys = *(unsigned short*)&regs.rdx;
           unsigned short handle = *(unsigned short*)&regs.rsi;
-          struct kvm_userspace_memory_region region;
           if (phys >= 4) {
             ((unsigned char*)&regs.rax)[1] = 0x8a;  /* Invalid physical page. */
           } else if (logical == 0xffff) {  /* Unmap. */
-            memset(&region, 0, sizeof(region));
-            region.slot = 3 + phys;
-            region.guest_phys_addr = 0xe0000 + ((unsigned long)phys << 14);
-            if (ioctl(kvm_fds.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-              perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION ems unmap");
+            if (hv_set_memory(hv, 3 + phys, 0xe0000 + ((unsigned long)phys << 14), 0, NULL, 0) < 0) {
+              perror("fatal: hv_set_memory ems unmap");
               exit(252);
             }
             ems_page_map[phys] = 0;
@@ -62,13 +58,8 @@ int int67_dispatch(void) {
             ((unsigned char*)&regs.rax)[1] = 0x80;
           } else {
             const unsigned pool_page = ems_handle_base[handle] + logical;
-            memset(&region, 0, sizeof(region));
-            region.slot = 3 + phys;
-            region.guest_phys_addr = 0xe0000 + ((unsigned long)phys << 14);
-            region.memory_size = 0x4000;
-            region.userspace_addr = (uintptr_t)(emu->ems_pool + ((unsigned long)pool_page << 14));
-            if (ioctl(kvm_fds.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-              perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION ems map");
+            if (hv_set_memory(hv, 3 + phys, 0xe0000 + ((unsigned long)phys << 14), 0x4000, emu->ems_pool + ((unsigned long)pool_page << 14), 0) < 0) {
+              perror("fatal: hv_set_memory ems map");
               exit(252);
             }
             ems_page_map[phys] = pool_page + 1;
@@ -77,17 +68,13 @@ int int67_dispatch(void) {
           }
         } else if (ah == 0x45) {  /* Release handle. */
           unsigned short handle = *(unsigned short*)&regs.rdx, phys;
-          struct kvm_userspace_memory_region region;
           if (handle == 0 || handle >= EMS_HANDLE_COUNT || ems_pages_by_handle[handle] == 0) {
             ((unsigned char*)&regs.rax)[1] = 0x83;
           } else {
             for (phys = 0; phys < 4; ++phys) {  /* Unmap frame slots owned by this handle. */
               if (ems_phys_handle[phys] == handle) {
-                memset(&region, 0, sizeof(region));
-                region.slot = 3 + phys;
-                region.guest_phys_addr = 0xe0000 + ((unsigned long)phys << 14);
-                if (ioctl(kvm_fds.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
-                  perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION ems free");
+                if (hv_set_memory(hv, 3 + phys, 0xe0000 + ((unsigned long)phys << 14), 0, NULL, 0) < 0) {
+                  perror("fatal: hv_set_memory ems free");
                   exit(252);
                 }
                 ems_page_map[phys] = 0;

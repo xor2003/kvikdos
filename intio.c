@@ -5,7 +5,7 @@
 int i21_io(void) {
   if (ah == 0x40) {
   /* Write using handle or truncate. */
-            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
+            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx);
             if (fd < 0) {
 
               *(unsigned short*)&regs.rax = 6;  /* Invalid handle. */
@@ -44,7 +44,7 @@ int i21_io(void) {
             }
   }   else if (ah == 0x3f) {
   /* Read using handle. */
-            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
+            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx);
             if (fd < 0) {
               return dos_err_ax(6);
             } else {
@@ -62,7 +62,7 @@ int i21_io(void) {
   /* Get/set file date and time using handle. */
             const unsigned char al = (unsigned char)regs.rax;
             if (al < 2) {
-              const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
+              const int fd = get_linux_fd(*(unsigned short*)&regs.rbx);
               if (fd < 0) return dos_err_ax(6);
               if (al == 0) {  /* Get. */
                 struct stat st;
@@ -87,7 +87,7 @@ int i21_io(void) {
   /* Close using handle. */
             const unsigned short handle = *(unsigned short*)&regs.rbx;
             if (handle >= 5) {  /* Don't close the standard handles, just pretend. */
-              const int fd = get_linux_fd(handle, &kvm_fds);
+              const int fd = get_linux_fd(handle);
               if (fd < 0) return dos_err_ax(6);  /* Not strictly needed, close(...) would check. */
               map_handle_close(handle);
               if (close(fd) != 0) return dos_err_linux();
@@ -95,7 +95,7 @@ int i21_io(void) {
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
   }   else if (ah == 0x45) {
   /* Duplicate handle (dup()). */
-            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
+            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx);
             int fd2;
             if (fd < 0) return dos_err_ax(6);
             fd2 = dup(fd);
@@ -115,11 +115,11 @@ int i21_io(void) {
   /* Force duplicate handle (dup2()). */
             const unsigned short src_handle = *(unsigned short*)&regs.rbx;
             const unsigned short dst_handle = *(unsigned short*)&regs.rcx;
-            const int src_fd = get_linux_fd(src_handle, &kvm_fds);
+            const int src_fd = get_linux_fd(src_handle);
             if (src_fd < 0) return dos_err_ax(6);
             if (src_handle != dst_handle) {
               if (dst_handle < 5) {
-                const int dst_fd = get_linux_fd(dst_handle, &kvm_fds);
+                const int dst_fd = get_linux_fd(dst_handle);
                 if (dst_fd < 0 || dup2(src_fd, dst_fd) != dst_fd) return dos_err_linux();
               } else if (dst_handle < 5 + sizeof(mapped_handles) / sizeof(mapped_handles[0])) {
                 const unsigned dst_idx = dst_handle - 5;
@@ -134,7 +134,12 @@ int i21_io(void) {
                 mapped_handles[dst_idx] = new_fd;
               } else {
                 const int dst_fd = (int)(dst_handle - (5 + sizeof(mapped_handles) / sizeof(mapped_handles[0])));
-                if (dst_fd == kvm_fds.kvm_fd || dst_fd == kvm_fds.vm_fd || dst_fd == kvm_fds.vcpu_fd) return dos_err_ax(6);
+                int hv_fds[3];
+                const int hv_fd_count = hv ? hv_get_fds(hv, hv_fds, 3) : 0;
+                int i;
+                for (i = 0; i < hv_fd_count; ++i) {
+                  if (dst_fd == hv_fds[i]) return dos_err_ax(6);  /* Don't let DOS clobber hypervisor fds. */
+                }
                 if (dup2(src_fd, dst_fd) != dst_fd) return dos_err_linux();
               }
             }
@@ -142,7 +147,7 @@ int i21_io(void) {
             *(unsigned short*)&regs.rax = dst_handle;
   }   else if (ah == 0x42) {
   /* Seek using handle. */
-            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
+            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx);
             if (fd < 0) return dos_err_ax(6);
             {
               const unsigned whence = *(unsigned char*)&regs.rax;  /* SEEK_SET == 0, SEEK_CUR == 1, SEEK_END == 2, same in DOS and Linux. */
@@ -164,7 +169,7 @@ int i21_io(void) {
               char ioctl_ok = 1;
               if (al == 1 && (*(unsigned short*)&regs.rdx >> 8)) return dos_err_ax(0x57);
               if (al < 2) {  /* Get device information (1), set device information (2). */
-                const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
+                const int fd = get_linux_fd(*(unsigned short*)&regs.rbx);
                 struct stat st;
                 if (fd < 0) return dos_err_ax(6);
                 if (fstat(fd, &st) != 0) return dos_err_linux();
@@ -187,11 +192,11 @@ int i21_io(void) {
                 if (bl > DRIVE_COUNT || !dir_state->linux_mount_dir[(int)bl - 1]) return dos_err_ax(0xf);
                 *(unsigned char*)&regs.rax = bl > 2;  /* A: (1) and B: (2) are removable (0), C: (3) etc. aren't (1). */
               } else if (al == 0x0a) {  /* Get whether handle is local or remote. */
-                const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
+                const int fd = get_linux_fd(*(unsigned short*)&regs.rbx);
                 if (fd < 0) return dos_err_ax(6);
                 *(unsigned short*)&regs.rdx = 0;  /* Drive is local. */
               } else if (al == 0x06) {  /* Get input status. */
-                const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
+                const int fd = get_linux_fd(*(unsigned short*)&regs.rbx);
                 struct stat st;
                 if (fd < 0) return dos_err_ax(6);
                 if (fstat(fd, &st) != 0) return dos_err_linux();
@@ -209,7 +214,7 @@ int i21_io(void) {
                 }
   #if 0
               } else if (al == 6) {
-                const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
+                const int fd = get_linux_fd(*(unsigned short*)&regs.rbx);
                 if (fd < 0) return dos_err_ax(6);
   #if 0
                 *(unsigned short*)&regs.rax = 0xd;  /* Invalid data. */
@@ -225,7 +230,7 @@ int i21_io(void) {
               else return dos_unknown21();
   }   else if (ah == 0x68 || ah == 0x6a) {
   /* Commit file (fflush). 0x6a is a DOS 4.x alias. */
-            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
+            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx);
             if (fd < 0) return dos_err_ax(6);
             if (fsync(fd) != 0 && errno != EINVAL) return dos_err_linux();  /* EINVAL: not a regular file (e.g. tty). */
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */

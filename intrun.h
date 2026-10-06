@@ -34,9 +34,9 @@ enum {
 };
 
 extern struct EmuState *emu;
-extern struct kvm_fds kvm_fds;
+extern struct hv *hv;
 extern void *mem;
-extern struct kvm_run *run;
+extern struct hv_exit hx;
 extern struct kvm_regs regs;
 extern struct kvm_sregs sregs;
 extern DirState *dir_state;

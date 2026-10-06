@@ -41,6 +41,8 @@ Features at a glance:
   `copy`, `del` ...).
 * Integration: propagates DOS exit codes, passes environment variables,
   runs Linux ELF/scripts natively and delegates PE/NE/LE/LX to wine.
+* Hosts: Linux/KVM natively; the cosmopolitan (APE) build adds
+  Windows/WHPX — a single binary picks its backend at runtime.
 
 Emulated DOS environment in more detail:
 
@@ -77,21 +79,24 @@ Emulated DOS environment in more detail:
 
 Requirements:
 
-* Linux operating system running on i386 (x86, i686) or amd64 (x86_64)
-  architecture.
+* Linux running on i386 (x86, i686) or amd64 (x86_64) with KVM
+  (see below), or Windows 10/11 on x86_64 with the Windows Hypervisor
+  Platform (WHPX) enabled, using the cosmopolitan APE build (see below).
 * Hardware virtualization (Intel VT-x or AMD-V) enabled on the host.
   Modern CPUs (even some in 2008) support it.
-* KVM enabled for your Linux user (see below).
+* KVM enabled for your Linux user (see below); on Windows, the
+  "Windows Hypervisor Platform" optional feature enabled.
 
 Limitations:
 
-* kvikdos needs a Linux i386 or amd64 system with KVM. It has been tested
-  and found working with both: Linux compiled for i386 and Linux compiled
-  for amd64. (Windows and macOS have similar virtualization technologies,
-  but kvikdos hasn't been ported to them yet.  Alternatively, on old Linux
-  i386 systems, the vm86(2) system call could be used, but that's not
-  implemented in kvikdos either.) macOS users should use udosrun instead of
-  kvikdos, others should use DOSBox or DOSBox-X.
+* On Linux, kvikdos runs the virtual CPU through /dev/kvm; it has been
+  tested and found working with both: Linux compiled for i386 and Linux
+  compiled for amd64. The cosmopolitan (APE) build adds a Windows host
+  path: the same single binary loads WinHvPlatform.dll and runs the guest
+  through WHPX when it detects Windows at runtime (the backend layer is
+  in hv.h/hv_kvm.c/hv_whpx.c; WHPX exit completion needs the small
+  instruction decoder in x86dec.c). macOS users should use udosrun
+  instead of kvikdos, others should use DOSBox or DOSBox-X.
 
 * kvikdos can run 16-bit real-mode DOS programs (written for the 8086, 186
   or 286 processors, but not 16-bit 286 protected mode), and it can also
@@ -237,11 +242,29 @@ How to install kvikdos:
 
   If it displays the dot and the `Hello, World!' message, then it's OK.
 
+Building from source:
+
+* Native Linux build (needs gcc, make, and /dev/kvm at runtime):
+
+    $ make kvikdos
+
+* Portable binary (cosmopolitan APE, runs on Linux + Windows + more):
+
+    $ make kvikdos.ape COSMOCC=/path/to/cosmocc
+
+  Get cosmocc from https://cosmo.zip/pub/cosmocc/ (cosmocc-<ver>.zip,
+  unzip anywhere). The resulting kvikdos.ape runs DOS programs through
+  KVM on Linux; rename/copy it to kvikdos.com on Windows, where it loads
+  WinHvPlatform.dll and runs through WHPX (enable the "Windows
+  Hypervisor Platform" optional feature). The backend is selected at
+  runtime, so the same file works on both hosts.
+
 Command-line options (structured):
 
 General:
 
-* `--kvm-check' checks KVM only.
+* `--kvm-check' checks the hypervisor backend only (KVM on Linux, WHPX on
+  Windows) by running a minimal guest.
 * `--strict' enables strict unsupported-interrupt behavior.
 * `--permissive' enables compatibility fallback behavior (default).
 
