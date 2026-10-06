@@ -42,6 +42,39 @@ Features at a glance:
 * Integration: propagates DOS exit codes, passes environment variables,
   runs Linux ELF/scripts natively and delegates PE/NE/LE/LX to wine.
 
+Emulated DOS environment in more detail:
+
+* Process model: PSP with command tail, environment block and program
+  pathname; int 21h AH=4Bh exec for child programs (COM/EXE and
+  overlays); TSRs via int 21h AH=31h; exit-code propagation.
+* Files: create/open/read/write/seek/close, delete/rename, attributes,
+  mkdir/rmdir/chdir/getcwd, findfirst/findnext with FCB and DTA
+  wildcard matching, long-name (int 21h AX=71xx) probes, duplicate and
+  redirected handles (stdout/stderr piping included).
+* Interrupt vectors: get/set via int 21h AH=25h/35h, plus direct writes
+  to the IVT (paired offset+segment writes are buffered correctly, as
+  TASM 3.0 needs).
+* Interrupts served: 10h (video), 11h (equipment), 15h (A20, extended
+  memory), 16h (keyboard), 1ah (timer), 20h/22h (terminate), 21h (DOS),
+  29h (fast console), 2ah (network install query), 2fh (multiplex:
+  XMS/DPMI/redirector/Windows probes), 43h (XMS entry trampoline), 67h
+  (EMS subset), plus fault handlers (00h divide, 03h breakpoint used by
+  TASM 3.0, 0dh general-protection soft-fail for extender probes).
+  Unknown calls either fail gracefully (`--permissive', the default) or
+  abort (`--strict').
+* Hardware: RTC via CMOS ports 70h/71h, BIOS Data Area (keyboard buffer,
+  tick count, video state, memory size), machine-ID and BIOS-date bytes
+  in the F-segment, A20 line, keyboard controller enough for Alt-aware
+  IDE input.
+* EXE loading: MZ with relocations, EXEPACK detection with the
+  DOS 5-style fixed unpacking stub (avoids the `Packed file is corrupt'
+  error), Phar Lap `P3'/TNT bound overlays, and format detection
+  (MZ/NE/LE/LX/PE delegated to wine, Linux ELF/scripts run natively).
+* Diagnostics and test hooks: `--diag=' categories (compat, exec, int,
+  fs, all), `--diag-file=', `--hlt-ok'/`--hlt-dump=' guest RAM dumps,
+  `--call-near'/`--call-far'/`--call-ss'/`--call-set' for running and
+  probing arbitrary guest subroutines, `--poke-word='.
+
 Requirements:
 
 * Linux operating system running on i386 (x86, i686) or amd64 (x86_64)
