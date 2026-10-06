@@ -8,7 +8,10 @@ ALL = kvikdos guest.com slowp.com malloct.com mallocs.com printenv.com cat.com w
 CFLAGS = -ansi -pedantic -s -O2 -W -Wall -Wextra -Wuninitialized -Wmaybe-uninitialized -Werror -fno-strict-aliasing -Wno-overlength-strings $(XCFLAGS)
 XCFLAGS =  # To be overridden from the command-line.
 
-SRCDEPS = kvikdos.c mini_kvm.h
+# Split translation units (was a single kvikdos.c). kvikdos.h is the shared
+# internal header with the common types, constants, externs and prototypes.
+KVIKDOS_SRCS = util.c diag.c resolve.c dospath.c args.c argsparse.c argspost.c batchline.c batchcmd_a.c batchcmd_b.c batchcmd_c.c loader.c mzdetect.c fds.c video.c tty.c vm.c spawn.c runstate.c run.c vmexit.c intmisc.c intdos.c intcon.c intopen.c intio.c intmem.c intfcb.c intfind.c intexec.c intdmisc.c intvid.c intems.c intxms.c batch.c main.c
+SRCDEPS = $(KVIKDOS_SRCS) kvikdos.h mini_kvm.h
 
 all: $(ALL)
 
@@ -47,16 +50,16 @@ test-tooling: test-static test-sanitizers test-valgrind
 	nasm -O0 -f bin -o $@ $<
 
 kvikdos: $(SRCDEPS)
-	gcc $(CFLAGS) -o $@ $<
+	gcc $(CFLAGS) -o $@ $(KVIKDOS_SRCS)
 
 kvikdos32: $(SRCDEPS)
-	gcc -m32 -fno-pic -march=i686 -mtune=generic $(CFLAGS) -o $@ $<
+	gcc -m32 -fno-pic -march=i686 -mtune=generic $(CFLAGS) -o $@ $(KVIKDOS_SRCS)
 
 kvikdos64: $(SRCDEPS)
-	gcc -m64 -march=k8 -mtune=generic $(CFLAGS) -o $@ $<
+	gcc -m64 -march=k8 -mtune=generic $(CFLAGS) -o $@ $(KVIKDOS_SRCS)
 
 kvikdos.static: $(SRCDEPS)
-	xstatic gcc -m32 -fno-pic -D_FILE_OFFSET_BITS=64 -DUSE_MINI_KVM -march=i686 -mtune=generic $(CFLAGS) -o $@ $<
+	xstatic gcc -m32 -fno-pic -D_FILE_OFFSET_BITS=64 -DUSE_MINI_KVM -march=i686 -mtune=generic $(CFLAGS) -o $@ $(KVIKDOS_SRCS)
 
 kvikdos.diet: $(SRCDEPS)
-	minicc --gcc=4.8 --diet -DUSE_MINI_KVM -fno-strict-aliasing -o kvikdos.diet kvikdos.c
+	minicc --gcc=4.8 --diet -DUSE_MINI_KVM -fno-strict-aliasing -o kvikdos.diet $(KVIKDOS_SRCS)
