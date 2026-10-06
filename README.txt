@@ -527,10 +527,10 @@ Quick start for DOS compilers and assemblers:
 * Turbo Pascal IDE (e.g. 5.5) and other text-mode IDEs work in the
   minimal 80x25 text mode.
 
-* Turbo C, Turbo C++ and Borland C++ compilers haven't been tested.
-  (TODO(pts): Test them.)
+* Turbo C 2.0 and Turbo C++ 1.01 are validated (see above); later
+  Borland C++ versions haven't been tested.
 
-* (TODO(pts): Add tutorial for compiling hello-world with the tools above.)
+* (For copy-paste compile-and-link tutorials see TOOLCHAIN.md.)
 
 * (Please note that installers typically don't work. So you should run the
   installer in `udosrun -gui' or DOSBox, and then run the installed programs
@@ -639,7 +639,34 @@ Recommendations on using DOSBox interactively, in a GUI:
 
 * Run `exit' in DOSBox to exit (and destroy the black window).
 
-Future work:
+Future work / TODO:
+
+* Done since the original kvikdos.c TODO list:
+
+  * Run 32-bit (protected-mode) DOS programs: Phar Lap/TNT directly,
+    DPMI clients through an external resident host (`--dpmi=').
+  * More memory: `--mem-mb=' up to 1 GiB, XMS 3.0 and int 15h AH=88h.
+  * Run Linux ELF programs and scripts natively.
+  * Turbo C compatibility (2.0 validated).
+  * Split the single-file source into translation units (~500 lines
+    each).
+
+* Still open:
+
+  * Built-in DPMI server, so `--dpmi=' isn't needed; and VCPI.
+  * Wider extender coverage: DOS4GW, CauseWay, PMODE/W, WDOSX,
+    HX DOS Extender (Win32 console tools) — untested.
+  * 16-bit 286 protected-mode programs.
+  * Filename mapping exceptions (e.g. `a86 long-filename.8' should
+    show LONG-FIL.8 to DOS) and DOSBox-style per-file case fallback
+    (try lowercase, then uppercase).
+  * Make unp_4.11/unp.exe work.
+  * Option to map DOS STDERR to Linux fd 1 (stdout), like nothing else
+    does.
+  * udosrun integration and udosrun command-line flag compatibility.
+  * Graphics modes, mouse, sound and other hardware (use DOSBox if
+    needed).
+  * Speed measurements for the new protected-mode paths.
 
 * Embed an alternative (but slow) CPU emulator, to make kvikdos
   system-independent (i.e. no KVM) on the host. Example such emulators:
@@ -675,7 +702,5 @@ Future work:
     but Linux disallows the mmap(2) of the first 64 KiB for non-root users.
     There may be (slow) workarounds. This effectively redues the memory
     available for the DOS program from 635 KiB to 575 KiB.
-
-!! Speed measurements.
 
 __END__
