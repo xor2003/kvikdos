@@ -1,7 +1,8 @@
 kvikdos: a very fast headless DOS emulator for Linux
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-kvikdos is a very fast emulator for running noninteractive DOS programs on
-Linux. Such programs are old compilers, assemblers and other build tools.
+kvikdos is a very fast emulator for running DOS programs on Linux, both
+real-mode and 32-bit protected-mode. Typical targets are old compilers,
+assemblers and other build tools, plus text-mode IDEs and editors.
 kvikdos implements a very small subset of DOS, BIOS and IBM PC harware, so
 it can keep the overhead low, so it can be very fast. It uses Linux KVM
 under the hood for emulating the CPU, which is also very fast.
@@ -29,10 +30,12 @@ Limitations:
   implemented in kvikdos either.) macOS users should use udosrun instead of
   kvikdos, others should use DOSBox or DOSBox-X.
 
-* kvikdos can run 16-bit DOS programs (written for the 8086, 186 or 286
-  processors, but not 16-bit 286 protected mode), it can't run 32-bit DOS
-  programs (written for 386, 486, Pentium processors or above) or 64-bit
-  programs. Use udosrun if you want to run 32-bit DOS programs.
+* kvikdos can run 16-bit real-mode DOS programs (written for the 8086, 186
+  or 286 processors, but not 16-bit 286 protected mode), and it can also
+  run 32-bit protected-mode DOS programs (written for 386, 486, Pentium
+  processors or above) whose extender uses DPMI or runs in protected mode
+  directly on the KVM CPU. See the protected mode section below for the
+  supported extenders. kvikdos can't run 64-bit programs.
 
 * kvikdos can run a single DOS program at a time. (But you can run multiple
   independent instances of kvikdos in parallel.) Use udosrun (with the
@@ -46,20 +49,25 @@ Limitations:
   (last 768 bytes), BIOS Data Area, helper code, the user code written for
   Linux.
 
-  kvikdos has partial compatibility support for UMB/XMS/EMS probes and
-  common allocator APIs used by DOS toolchains, but it is not a full
-  memory-manager implementation (no full DPMI/VCPI stack).
+  On top of conventional memory, kvikdos provides extended memory (XMS 3.0,
+  including the >64 MiB functions 0x88/0x89, and the int 15h AH=88h
+  interface): 127 MiB by default, configurable with `--mem-mb=<n>' (1 ..
+  1024 MiB of total guest memory). A partial EMS (int 67h) implementation
+  exists for toolchain probes. There is no VCPI.
 
-  If your DOS programs need mre memory, use udosrun or DOSBox instead.
+  For DPMI, kvikdos loads an external resident DPMI host (e.g. CWSDPMI or
+  HDPMI32) into the guest with `--dpmi=<dos-pathname>', then runs the real
+  program on top of it; there is no built-in DPMI server.
 
 * kvikdos doesn't support graphics. Use udosrun or DOSBox instead.
 
-* kvikdos doesn't support interactive text mode (moving the cursor, changing
-  the cursor shape, changing the font), so e.g. Volkov Commander doesn't
-  work. Something could be emulated using ncurses, but it's not the focus of
-  kvikdos. However, kvikdos can supply line-based input (terminated by
-  <Enter>) from the terminal to DOS programs. For interactive text mode
-  programs in DOS, use udosrun or DOSBox.
+* kvikdos has a minimal 80x25 text mode: it renders the text screen
+  (colors, cursor position and shape, blinking) on the Linux terminal, and
+  supports the BIOS/DOS video and keyboard calls needed by text-mode IDEs
+  and editors (e.g. Watcom VI and Turbo Pascal IDEs work). Full-screen
+  programs which need fancy video tricks may still misbehave; use udosrun
+  or DOSBox for those. kvikdos can also supply line-based input (terminated
+  by <Enter>) to programs which don't need the interactive screen.
 
 * kvikdos doesn't emulate any special hardware (e.g. sound card, MIDI,
   joystick, mouse, CD-ROM). Use DOSBox instead.
@@ -67,7 +75,7 @@ Limitations:
 * kvikdos implements a tiny subset of the DOS ABI (int 21h etc.), PC BIOS
   ABI (int 10h etc.) and IBM PC hardware interfaces (in and out
   instructions). Thus random DOS programs won't work out of the box. Simple
-  API calls can be added on the fly to kvikdos.c. However, many famous build
+  API calls can be added on the fly to the int*.c sources. However, many famous build
   tools (e.g. compilers and assemblers) released in the 1980s and 1990s
   already work, see the compatibility list below. To get good chances for
   running any random DOS program, use udosrun or DOSBox instead.
@@ -89,10 +97,10 @@ Features and advantages:
   is about 11.49 times faster than the next emulator. For mixed CPU and I/O
   workload, kvikdos is 4.507 times faster than anything else.
 
-* All features of a modern Intel CPU (such as floating point instructions
-  and 32-bit registers), except for protected mode and using more than 1 MiB
-  of memory, are available for DOS programs, because the host CPU features
-  are used directly
+* All features of a modern Intel CPU (such as floating point instructions,
+  32-bit registers and 16/32-bit protected mode) are available for DOS
+  programs, because the host CPU features are used directly. Guest memory
+  is up to 1 GiB (`--mem-mb=<n>', 128 MiB by default).
 
 * Since very little hardware is emulated, kvikdos starts up very quickly,
   it's possible to run dozens of short-lived kvikdos instances per second.
@@ -105,6 +113,20 @@ Features and advantages:
   exit code to Unix, it can pass environment variables to DOS etc. It also
   works very well headless (i.e. without GUI or interactive text UI), e.g.
   as part of continous build pipelines.
+
+* kvikdos runs 32-bit protected-mode DOS programs: Phar Lap
+  386|DOS-Extender/TNT bound binaries run directly (Watcom compilers,
+  WLINK, VI), and DPMI clients run through an external resident host
+  loaded with `--dpmi=' (CWSDPMI, HDPMI32). Extended memory is provided
+  via XMS 3.0 and int 15h AH=88h on top of the conventional arena.
+
+* kvikdos has a minimal 80x25 text mode for IDEs and editors (colors,
+  cursor position/shape/blink, Alt-aware keyboard), rendered on the Linux
+  terminal.
+
+* kvikdos runs DOS batch files (.bat) with `set`, `%VAR%`, `%1..%9`,
+  `shift`, `call`, `if`, `goto`, `mkdir`, `copy`, `del` etc., enough for
+  compiler driver scripts.
 
 How to install kvikdos:
 
@@ -191,7 +213,13 @@ Diagnostics:
 I/O and memory:
 
 * `--tty-in=<fd>' chooses input source (`-3', `-2', `-1', `>=0').
-* `--mem-mb=<n>' DOS memory size in MiB (currently only `1').
+* `--mem-mb=<n>' total guest memory size in MiB (1 .. 1024). Default: 128.
+  The first MiB is conventional memory, the rest is extended memory
+  available via XMS 3.0 and int 15h AH=88h.
+* `--dpmi=<dos-pathname>' loads the named resident DPMI host
+  (e.g. CWSDPMI.EXE or HDPMI32.EXE) as a TSR first, then runs the real
+  DOS program on top of it. Use this for 32-bit protected-mode tools
+  which need DPMI (e.g. DOS4GW-style programs and the HX loader).
 * `--hlt-ok' and `--hlt-dump=<file>' are low-level debug options.
 
 Best defaults:
@@ -229,15 +257,15 @@ Static analysis and runtime checks:
 
 * cppcheck:
 
-    $ cppcheck --enable=warning,style,performance,portability --std=c89 --force kvikdos.c
+    $ cppcheck --enable=warning,style,performance,portability --std=c89 --force *.c
 
 * clang static analyzer:
 
-    $ clang --analyze -Xanalyzer -analyzer-output=text -std=c89 -Wall -Wextra kvikdos.c
+    $ clang --analyze -Xanalyzer -analyzer-output=text -std=c89 -Wall -Wextra *.c
 
 * ASan+UBSan build and compiler smoke:
 
-    $ gcc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-strict-aliasing -o kvikdos_asan kvikdos.c
+    $ gcc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-strict-aliasing -o kvikdos_asan *.c
     $ /home/xor/kvikdos/kvikdos_asan /home/xor/inertia_player/dos_compilers/Microsoft\ C\ v5/CL.EXE /c HELLO0.C
     $ /home/xor/kvikdos/kvikdos_asan /home/xor/inertia_player/dos_compilers/Microsoft\ MASM\ v5/BIN/MASM.EXE HELLO.ASM,HELLO.OBJ,NUL.LST,NUL.CRF
 
@@ -256,9 +284,9 @@ Readability and stability improvement roadmap (recommended):
   * Prefer bounded copy helpers (`copy_cstr0`) over ad-hoc `strncpy` usage.
 
 * Priority 2 (clarity):
-  * Split large functions (`parse_args`, `run_dos_prog`, `run_dos_batch`)
-    into smaller helpers by responsibility:
-    argument parsing, DOS path translation, int21 dispatch, batch command eval.
+  * (Done: the former kvikdos.c monolith is now split into ~36 translation
+    units of at most ~500 lines, sharing the internal kvikdos.h header;
+    remaining work is intra-file.) Keep new functions small and focused.
   * Replace ambiguous locals (`p`, `q`, `r`) with intent names in new code
     (`requested_drive`, `active_drive`, `resolved_prog`).
   * Keep compatibility fallbacks local and commented at point of use.
@@ -378,8 +406,8 @@ Quick start for DOS compilers and assemblers:
 
 * TLIB library builder 3.01 and 3.02 tlib.exe. There is no newer 16-bit
   real mode TLIB, newer versions of tlib.exe use 32-bit protected
-  mode, which kvikdos doesn't support.  It produces OBF .lib files
-  from OMF .obj files.
+  mode, which should now work through the Phar Lap/DPMI support (not
+  yet verified).  It produces OBF .lib files from OMF .obj files.
 
 * Sphinx C-- compiler 1.04 c--.exe: It produces .com program files.
 
@@ -419,6 +447,23 @@ Quick start for DOS compilers and assemblers:
   * https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/devel/asm/nasm/0.98.39/8086host/nasmlite.zip
   * https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/devel/asm/nasm/0.98.39/nsm09839.zip
 
+* Watcom C/C++ 8.5, 9.5, 10.0, 10.6 and 11(b): wcc/wcc386/wpp/wpp386 and
+  wlink work through the Phar Lap 386|DOS-Extender bound into the binaries
+  (32-bit protected mode). whelp and the VI editor also run; VI renders a
+  full screen editor in the 80x25 text mode.
+
+* Phar Lap SDK tools: tntlite.exe (loads unbound .exp files, e.g.
+  MEMTEST.EXE allocates megabytes through the extender), tellme.exe
+  (full system probe incl. a correct DOS memory map), rebind.exe,
+  cfig386.exe, markphar.exe, dosxnt.exe (Microsoft C 8).
+
+* DPMI hosts (as `--dpmi=' resident hosts): CWSDPMI.EXE (DJGPP r7) and
+  HDPMI32.EXE/HDPMI16.EXE (Microsoft C 7) install, take over int 2fh/int
+  31h and run a 32-bit DPMI client correctly.
+
+* Turbo Pascal IDE (e.g. 5.5) and other text-mode IDEs work in the
+  minimal 80x25 text mode.
+
 * Turbo C, Turbo C++ and Borland C++ compilers haven't been tested.
   (TODO(pts): Test them.)
 
@@ -430,26 +475,41 @@ Quick start for DOS compilers and assemblers:
 
 Protected mode support for running 32-bit DOS programs in kvikdos:
 
-* The CPU emulation in KVM makes it possible to switch to various types of
-  protected modes (16-bit and 32-bit data and code segments) and even 64-bit
-  long mode (not supported by most existing DOS programs).
+* The CPU emulation in KVM runs both 16-bit and 32-bit protected mode
+  natively (and even 64-bit long mode would be possible, but no DOS
+  program uses it).
 
-* However, to take advantage of protected modes, DOS extenders and/or DPMI
-  hosts are needed, and most of the existing ones don't run in kvikdos.
+* DPMI: kvikdos doesn't have a built-in DPMI server. Instead, it loads an
+  external resident DPMI host into the guest (`--dpmi=<dos-pathname>'):
+  the host (e.g. CWSDPMI.EXE, HDPMI32.EXE, or a Borland DPMIRES-style
+  stub) installs itself as a TSR via int 21h AH=31h, then kvikdos
+  preserves low memory and the interrupt vectors and loads the real
+  program above it. The program then uses the host's int 2fh AX=1687h
+  mode switch and int 31h services as usual.
 
-* These programs work:
+* Extenders known to work:
 
+  * Phar Lap 386|DOS-Extender (bound `P3' programs, incl. the TNT
+    variants): Watcom C/C++ 8.5, 9.5, 10, 10.6 and 11(b) compilers and
+    WLINK, the Watcom VI editor, and the Phar Lap SDK tools (TNTLITE,
+    TELLME, MEMTEST, REBIND, CFIG386, MARKPHAR, DOSXNT).
+  * DPMI hosts CWSDPMI and HDPMI32/HDPMI16 (Microsoft C 7) go resident
+    and serve a 32-bit DPMI client correctly.
   * flat assembler 1.73.30 fasmlite.exe.
   * pmode.asm 3.07 example.exe.
 
-* Most existing 32-bit DOS programs don't work.
+* Programs needing DOS4GW, CauseWay, PMODE/W or other extenders may work
+  through the `--dpmi=' host mechanism; coverage is incremental.
 
-* Currently programs running in kvikdos can use less than 640 KiB of memory,
-  and this also applies to protected mode. (This restriction should be easy
-  to lift.)
+* Memory available to protected-mode programs: up to 1 GiB guest memory
+  (`--mem-mb=<n>', 128 MiB by default), exposed through XMS 3.0 (including
+  functions 0x88/0x89 for >64 MiB) and int 15h AH=88h. The conventional
+  DOS arena is fully chained per msdos_player semantics (free `Z' tail,
+  per-PSP MCB owners), which the extenders' DOS-buffer realloc logic
+  relies on.
 
-* Currently there is no XMS, EMS, VCPI or DPMI support implemented in
-  kvikdos.
+* There is no VCPI and no built-in DPMI/EMS hardware emulation beyond the
+  API surface described above.
 
 Alternatives of kvikdos:
 
