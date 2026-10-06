@@ -148,6 +148,34 @@ static void maybe_parse_mem_dump(void) {
   }
 }
 
+static int g_fault_dumped;
+static char g_con_tail[512];
+static unsigned g_con_tail_n;
+
+static int contains_bytes(const char *haystack, unsigned long haystack_size, const char *needle, unsigned long needle_size) {
+  unsigned long i;
+  if (needle_size > haystack_size) return 0;
+  for (i = 0; i + needle_size <= haystack_size; ++i)
+    if (memcmp(haystack + i, needle, needle_size) == 0) return 1;
+  return 0;
+}
+
+static int con_tail_match(const char *data, unsigned long size) {
+  /* Keep a rolling window of the last console bytes, and check whether it
+   * contains an extender error signature (even if written byte-by-byte). */
+  if (size >= sizeof(g_con_tail)) { data += size - sizeof(g_con_tail) + 1; size = sizeof(g_con_tail) - 1; }
+  if (g_con_tail_n + size > sizeof(g_con_tail) - 1) {
+    const unsigned drop = g_con_tail_n + (unsigned)size - (sizeof(g_con_tail) - 1);
+    memmove(g_con_tail, g_con_tail + drop, g_con_tail_n - drop);
+    g_con_tail_n -= drop;
+  }
+  memcpy(g_con_tail + g_con_tail_n, data, size);
+  g_con_tail_n += (unsigned)size;
+  return contains_bytes(g_con_tail, g_con_tail_n, "Phar Lap", 8) ||
+         contains_bytes(g_con_tail, g_con_tail_n, "TNT.", 4) ||
+         contains_bytes(g_con_tail, g_con_tail_n, "exception", 9);
+}
+
 static void maybe_parse_exit_regs(void) {
   const char *value = getenv("KVIKDOS_EXIT_REGS");
   g_exit_regs = (value != NULL && value[0] != '\0' && strcmp(value, "0") != 0);
@@ -787,9 +815,9 @@ typedef struct EmuParams {
   unsigned call_arg_count;
   unsigned short call_set_regs[7];  /* ax,cx,dx,bx,si,di,bp */
   unsigned call_set_mask;
-  unsigned short poke_word_segs[64];
-  unsigned short poke_word_ofs[64];
-  unsigned short poke_word_values[64];
+  unsigned short poke_word_segs[1024];
+  unsigned short poke_word_ofs[1024];
+  unsigned short poke_word_values[1024];
   unsigned poke_word_count;
 } EmuParams;
 
@@ -803,6 +831,7 @@ typedef struct ParsedCmdArgs {
   const char *extra_env[128];
   unsigned extra_env_count;
   const char *dpmi_prog;
+  char force_dos;
 } ParsedCmdArgs;
 
 static void init_parsed_cmd_args(ParsedCmdArgs *cmd_args, char *placeholder_for_default) {
@@ -822,7 +851,7 @@ static void init_parsed_cmd_args(ParsedCmdArgs *cmd_args, char *placeholder_for_
   cmd_args->dpmi_prog = NULL;
   cmd_args->extra_env_count = 0;
   cmd_args->tty_in_fd = -1;
-  cmd_args->emu_params.mem_mb = 1;
+  cmd_args->emu_params.mem_mb = 128;
   cmd_args->emu_params.is_hlt_ok = 0;
   cmd_args->emu_params.hlt_dump_filename = NULL;
   cmd_args->emu_params.diag_filename = NULL;
@@ -894,7 +923,8 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
                     "\n"
                     "I/O and Memory:\n"
                     "  --tty-in=<fd>               -3 fake, -2 buffered stdin, -1 /dev/tty, >=0 fd\n"
-                    "  --mem-mb=<n>                DOS memory in MiB (currently only 1)\n"
+                    "  --mem-mb=<n>                DOS memory in MiB, 1..1024 (128: default; >1 adds extended memory for protected mode)\n"
+                    "  --force-dos                 Always run the program in the DOS emulator, even if it looks like a Windows executable\n"
                     "  --hlt-ok                    Allow hlt instruction\n"
                     "  --hlt-dump=<filename>       Dump guest memory on hlt\n"
                     "\n"
@@ -961,6 +991,8 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
     } else if (0 == strncmp(arg, "--dpmi=", 7)) {
       arg += 7;
       goto do_dpmi;
+    } else if (0 == strcmp(arg, "--force-dos")) {
+      cmd_args.force_dos = 1;
     } else if (0 == strcmp(arg, "--hlt-dump")) {  /* Typical example: --hlt-dump=kvikdos.dmp */
       if (!argv[0]) goto missing_argument;
       arg = *argv++;
@@ -1121,7 +1153,7 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
         char *p1, *p2, *endp;
         unsigned long seg, ofs, value;
         if (cmd_args.emu_params.poke_word_count >= sizeof(cmd_args.emu_params.poke_word_values) / sizeof(cmd_args.emu_params.poke_word_values[0])) {
-          fprintf(stderr, "fatal: too many poke-word values, maximum is 64\n");
+          fprintf(stderr, "fatal: too many poke-word values, maximum is 1024\n");
           exit(1);
         }
         seg = strtoul(arg, &p1, 0);
@@ -1222,8 +1254,8 @@ static void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const ch
         fprintf(stderr, "fatal: mem-mb argument must be poisitive: %s\n", arg);
         exit(1);
       }
-      if (CMD_PARSE_MEM_MB_1 && cmd_args.emu_params.mem_mb != 1) {
-        fprintf(stderr, "fatal: only 1 MiB of memory is supported, requested: %s\n", arg);
+      if (cmd_args.emu_params.mem_mb > 1024) {
+        fprintf(stderr, "fatal: --mem-mb too large (max 1024): %s\n", arg);
         exit(1);
       }
       /* Now we've set cmd_args.mem_mb. */
@@ -1999,8 +2031,8 @@ static const unsigned char fixed_exepack_stub[283] = {
  * detect_dos_executable_program. Returns the Program Segment Prefix (PSP)
  * address.
  */
-static char *load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, struct kvm_regs *regs, struct kvm_sregs *sregs, unsigned short *block_size_para_out) {
-#define MEMSIZE_AVAILABLE_PARA ((DOS_MEM_LIMIT >> 4) - PSP_PARA - 0x10 /* PSP */)
+static char *load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, struct kvm_regs *regs, struct kvm_sregs *sregs, unsigned short *block_size_para_out, unsigned psp_para) {
+#define MEMSIZE_AVAILABLE_PARA ((DOS_MEM_LIMIT >> 4) - psp_para - 0x10 /* PSP */)
   const unsigned memsize_available_para = MEMSIZE_AVAILABLE_PARA;
   char *psp;
   if (header_size >= 24 && (('M' | 'Z' << 8) == ((unsigned short*)header)[EXE_SIGNATURE] || ('M' << 8 | 'Z') == ((unsigned short*)header)[EXE_SIGNATURE])) {
@@ -2011,8 +2043,8 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     const unsigned image_size = exesize - headsize;
     unsigned memsize_min_para = (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MINALLOC];  /* This includes .bss after the image. Please note that this doesn't depend on exehdr[EXE_LASTSIZE]. Formula is same as in MS-DOS 6.22, FreeDOS 1.2, DOSBox 0.74-4. */
     unsigned memsize_max_para = (unsigned short)(exehdr[EXE_MAXALLOC] + 1) < 2 ? 0xffff : (nblocks << 5) - exehdr[EXE_HDRSIZE] + exehdr[EXE_MAXALLOC];
-    char * const image_addr = (char*)mem + (PSP_PARA << 4) + 0x100;
-    const unsigned image_para = PSP_PARA + 0x10;
+    char * const image_addr = (char*)mem + (psp_para << 4) + 0x100;
+    const unsigned image_para = psp_para + 0x10;
     unsigned reloc_count = exehdr[EXE_NRELOC];
     const unsigned stack_end_plus_0x100 = ((unsigned)(unsigned short)(exehdr[EXE_SS] + 0x10) << 4) + (exehdr[EXE_SP] ? exehdr[EXE_SP] : 0x10000);
     if (exehdr[EXE_LASTSIZE] > 0x200) {
@@ -2057,6 +2089,13 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     if ((unsigned)read(img_fd, image_addr, image_size) != image_size) {
       fprintf(stderr, "fatal: error reading image in DOS .exe: %s\n", filename);
       exit(252);
+    }
+    if (getenv("KVIKDOS_DUMP_LOAD")) {  /* Dump conventional mem right after image load. */
+      FILE *df = fopen("/tmp/load-lowmem.bin", "wb");
+      if (df) { fwrite(mem, 1, 0xc0000, df); fclose(df); }
+      fprintf(stderr, "load-dump: image_size=%x loaded to %p-ish, byte@file0x23b70=%02x\n",
+              image_size, (void*)image_addr,
+              (unsigned)*(const unsigned char*)(image_addr + (0x23b70 - headsize)));
     }
     if (reloc_count) {  /* Process relocations. */
       unsigned short reloc[1024]; /* 2048 bytes on the stack. */
@@ -2133,7 +2172,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
     }
   } else {
     /* Load DOS .com program. */
-    char * const p = (char *)mem + (PSP_PARA << 4) + 0x100;
+    char * const p = (char *)mem + (psp_para << 4) + 0x100;
     int r;
     memcpy(p, header, header_size);
     r = img_fd < 0 ? 0 :  /* For --kvm-check. */
@@ -2147,15 +2186,19 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
       fprintf(stderr, "fatal: DOS executable program too long: %s\n", filename);
       exit(252);
     }
-    sregs->cs.selector = sregs->ss.selector = PSP_PARA;
-    psp = (char*)mem + (PSP_PARA << 4);  /* Program Segment Prefix. */
+    sregs->cs.selector = sregs->ss.selector = psp_para;
+    psp = (char*)mem + (psp_para << 4);  /* Program Segment Prefix. */
     *(unsigned short*)&regs->rsp = 0xfffe;
     *(unsigned short*)(psp + *(unsigned short*)&regs->rsp) = 0;  /* Push a 0 byte. */
     *(unsigned short*)(psp + 6) = MAX_DOS_COM_SIZE + 0x100;  /* .COM bytes available in segment (CP/M). DOSBox doesn't initialize it. */
     /*memset(psp, 0, 0x100);*/  /* Not needed, mmap MAP_ANONYMOUS has done it. */
     *(unsigned short*)&regs->rip = 0x100;  /* DOS .com entry point. */
-    /* No need to check for DOS_MEM_LIMIT at runtime, because (PSP_PARA << 4) + 0x100 + MAX_DOS_COM_SIZE + 0x10 < DOS_MEM_LIMIT. */
-    { struct SA { int StaticAssert_MinimumComMemory : MEMSIZE_AVAILABLE_PARA + 0x10 >= 0x1000; }; }
+    /* A .com gets all the rest of conventional memory. Guard against a
+     * load base so high it leaves under 64 KiB (0x1000 paras). */
+    if (memsize_available_para + 0x10 < 0x1000) {
+      fprintf(stderr, "fatal: load base leaves too little conventional memory for .com: %s\n", filename);
+      exit(252);
+    }
     *block_size_para_out = memsize_available_para + 0x10 /* PSP */;  /* Minimum would be 0x1000 paras (65536 bytes), including PSP. */
   }
 
@@ -2163,17 +2206,17 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   *(unsigned short*)&regs->rax = 0;  /* FreeDOS 1.2 sets AH and AL to 0xff or 0x00 according to some FCB value (fcbcode) (https://github.com/FDOS/kernel/blob/8c8d21311974e3274b3c03306f3113ee77ff2f45/kernel/task.c#L339-L341), but most of the time they end up as 0. */
   *(unsigned short*)&regs->rbx = 0;  /* FreeDOS 1.2 and DOSBox 0.74-4 sets BX the same way as AX, i.e. based on some FCB values. */
   *(unsigned short*)&regs->rcx = 0xff;
-  *(unsigned short*)&regs->rdx = PSP_PARA;
+  *(unsigned short*)&regs->rdx = psp_para;
   *(unsigned short*)&regs->rsi = *(unsigned short*)&regs->rip;
   *(unsigned short*)&regs->rdi = *(unsigned short*)&regs->rsp;
   /**(unsigned short*)&regs->rsp = ...;*/  /* Set above. */
   *(unsigned short*)&regs->rbp = 0x91c;
   /* EFLAGS https://en.wikipedia.org/wiki/FLAGS_register */
-  *(unsigned short*)&regs->rflags = 0x7202;  /* DOSBox 0.74-4 sets it to 0x7202 == (reserved|IF|IOPL3|NT) (and so do we), MS-DOS 6.22 sets it to 0x7246 == (reserved|AF|ZF|IF|IOPL3|NT), FreeDOS 1.2 sets it to 0x0200, but will be changed to 0x0202 (reserved|IF). */
+  *(unsigned short*)&regs->rflags = 0x0202;  /* DOSBox 0.74-4 sets it to 0x7202 == (reserved|IF|IOPL3|NT), MS-DOS 6.22 sets it to 0x7246 == (reserved|AF|ZF|IF|IOPL3|NT), FreeDOS 1.2 sets it to 0x0200 == (reserved), but a real 386+ in real mode has IOPL==0 and NT==0 (bits 12..14 clear). Phar Lap DOS extenders detect an 8086 by those bits being set, and report `no 80386' — so we use 0x0202 (reserved|IF). */
   /**(unsigned short*)&regs->rip = ...;*/  /* Set above. */
   /*sregs->cs.selector = ...;*/  /* Set above. */
-  sregs->ds.selector = PSP_PARA;  /* Set above. */
-  sregs->es.selector = PSP_PARA;  /* Set above. */
+  sregs->ds.selector = psp_para;  /* Set above. */
+  sregs->es.selector = psp_para;  /* Set above. */
   /*sregs->ss.selector = ...;*/  /* Set above. */
 
   /* https://stanislavs.org/helppc/program_segment_prefix.html */
@@ -2184,7 +2227,7 @@ static char *load_dos_executable_program(int img_fd, const char *filename, void 
   *(unsigned short*)(psp + 0x40) = 5;  /* DOS version number (DOSBox also reports 5). */
   *(unsigned short*)(psp + 0x50) = 0x21cd;  /* `int 0x21' opcode. */
   *(unsigned short*)(psp + 0x32) = 20;  /* `Number of bytes in JFT. */
-  *(unsigned*)(psp + 0x34) = 0x18 | PSP_PARA << 16;  /* `Far pointer to JFT. */
+  *(unsigned*)(psp + 0x34) = 0x18 | psp_para << 16;  /* `Far pointer to JFT. */
   *(unsigned*)(psp + 0x38) = 0xffffffffU;  /* `Pointer to (lack of) previous PSP. */
   *(unsigned*)(psp + 0x0a) = *((unsigned*)mem + 0x22);  /* Copy of `int 0x22' vector. Program terminate address. Not an interrupt. */
   *(unsigned*)(psp + 0x0e) = *((unsigned*)mem + 0x23);  /* Copy of `int 0x23' vector. Ctrl-<Break> handler address. Not an interrupt.  */
@@ -2266,6 +2309,18 @@ static void dump_regs(const char *prefix, const struct kvm_regs *regs, const str
           prefix, S16(cs), R16(ip),
           R16(ax), R16(bx), R16(cx), R16(dx), R16(si), R16(di), R16(sp), R16(bp), *(unsigned*)&regs->rflags,
           S16(ds), S16(es), S16(fs), S16(gs), S16(ss));
+  if (sregs->cr0 & 1) {  /* Protected mode: also dump 32-bit state, control regs and descriptors. */
+    fprintf(g_diag_file, "%s: pm: eip:%08x eax:%08x ebx:%08x ecx:%08x edx:%08x esi:%08x edi:%08x esp:%08x ebp:%08x cr0:%08x cr2:%08x cr3:%08x cr4:%08x\n",
+            prefix, (unsigned)regs->rip, (unsigned)regs->rax, (unsigned)regs->rbx, (unsigned)regs->rcx, (unsigned)regs->rdx,
+            (unsigned)regs->rsi, (unsigned)regs->rdi, (unsigned)regs->rsp, (unsigned)regs->rbp,
+            (unsigned)sregs->cr0, (unsigned)sregs->cr2, (unsigned)sregs->cr3, (unsigned)sregs->cr4);
+    fprintf(g_diag_file, "%s: pm: cs{base:%08x lim:%08x db:%d g:%d} ss{base:%08x lim:%08x db:%d g:%d} ds{base:%08x lim:%08x} es{base:%08x lim:%08x}\n",
+            prefix,
+            (unsigned)sregs->cs.base, (unsigned)sregs->cs.limit, sregs->cs.db, sregs->cs.g,
+            (unsigned)sregs->ss.base, (unsigned)sregs->ss.limit, sregs->ss.db, sregs->ss.g,
+            (unsigned)sregs->ds.base, (unsigned)sregs->ds.limit,
+            (unsigned)sregs->es.base, (unsigned)sregs->es.limit);
+  }
   fflush(stdout);
 }
 
@@ -2428,12 +2483,85 @@ static void get_dos_abspath_r(const char *p, const DirState *dir_state, char *ou
   if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: get_dos_abspath_r=(%s)\n", out_buf);
 }
 
+/* Builds "X:NAME.EXT" from an FCB (drive byte, 8-char name, 3-char ext).
+ * A drive byte of 0 maps to dos_default_drive.
+ */
+static void fcb_filename(const char *fcb, char dos_default_drive, char *out, unsigned out_size) {
+  unsigned i;
+  char *o = out, * const oend = out + (out_size ? out_size - 1 : 0);
+  if (o == oend) { *o = '\0'; return; }
+  *o++ = fcb[0] ? 'A' + fcb[0] - 1 : dos_default_drive;
+  if (o == oend) { *o = '\0'; return; }
+  *o++ = ':';
+  for (i = 0; i < 8 && o < oend; ++i) {
+    const char c = fcb[1 + i];
+    if (c == ' ' || c == '\0') break;
+    *o++ = c;
+  }
+  for (i = 0; i < 3 && o < oend; ++i) {
+    const char c = fcb[9 + i];
+    if (c == ' ' || c == '\0') break;
+    if (o + 1 >= oend) break;
+    if (i == 0) *o++ = '.';
+    *o++ = c;
+  }
+  *o = '\0';
+}
+
+static unsigned short dos_fat_date(const struct tm *tm) {
+  return (unsigned short)(((tm->tm_year - 80) << 9) | ((tm->tm_mon + 1) << 5) | tm->tm_mday);
+}
+
+static unsigned short dos_fat_time(const struct tm *tm) {
+  return (unsigned short)((tm->tm_hour << 11) | (tm->tm_min << 5) | (tm->tm_sec >> 1));
+}
+
 static char fnbuf[LINUX_PATH_SIZE], fnbuf2[LINUX_PATH_SIZE], argv0_fnbuf[LINUX_PATH_SIZE];
 
 #define get_linux_filename(p) get_linux_filename_r((p), dir_state, fnbuf, NULL)
 
 #define DOS_PATH_SIZE 64  /* See int 0x21 ah == 0x47 (get current directory) */
 static char dosfnbuf[DOS_PATH_SIZE];
+
+/* Resolves "." and ".." components in a DOS pathname after expanding it to
+ * absolute form. out receives "D:\A\B" (no trailing backslash) or "D:\".
+ * On error out[0] == '\0'.
+ */
+static void dos_normalize_abspath(const char *p, const DirState *dir_state, char *out, unsigned out_size) {
+  char abs_path[DOS_PATH_SIZE + 4];
+  char *segs[DOS_PATH_SIZE / 2];
+  unsigned nseg = 0, i;
+  char *r, *e, *w;
+  get_dos_abspath_r(p, dir_state, abs_path, sizeof(abs_path));
+  if (abs_path[0] == '\0' || out_size < 4) { if (out_size) out[0] = '\0'; return; }
+  out[0] = abs_path[0]; out[1] = ':'; out[2] = '\\'; out[3] = '\0';
+  for (r = abs_path + 3; *r; ) {
+    char next;
+    e = r;
+    while (*e && *e != '\\') ++e;
+    next = *e;
+    *e = '\0';
+    if (r[0] == '\0' || (r[0] == '.' && r[1] == '\0')) {
+      /* Skip empty and "." components. */
+    } else if (r[0] == '.' && r[1] == '.' && r[2] == '\0') {
+      if (nseg) --nseg;
+    } else {
+      if (nseg >= sizeof(segs) / sizeof(segs[0])) { out[0] = '\0'; return; }
+      segs[nseg++] = r;
+    }
+    r = next ? e + 1 : e;
+  }
+  w = out + 3;
+  for (i = 0; i < nseg; ++i) {
+    const unsigned n = (unsigned)strlen(segs[i]);
+    if ((unsigned)(w - out) + n + 1 >= out_size) { out[0] = '\0'; return; }
+    memcpy(w, segs[i], n);
+    w += n;
+    *w++ = '\\';
+  }
+  if (w > out + 3) --w;  /* Drop trailing backslash. */
+  *w = '\0';
+}
 
 /* `var' usually looks like `PATH=C:\value'. Everything before the '=' is converted to lowercase. */
 static char *add_env(char *env, char *env_end, const char *var, char do_check) {
@@ -2629,6 +2757,8 @@ typedef struct TtyState {
   int tty_in_fd;
   char is_tty_in_error;
   const unsigned short *next_fake_key;
+  int pending_key;  /* Decoded BIOS keycode buffered by a key-check call; -1 = none. */
+  char raw_on;      /* Nonzero: persistent raw tty mode while text mode is active. */
 } TtyState;
 
 
@@ -2637,7 +2767,224 @@ typedef struct EmuState {
   struct kvm_sregs initial_sregs;
   struct kvm_run *kvm_run;
   void *mem;
+  void *xmem;  /* Extended memory: guest physical [0x100000, 0x100000 + xmem_size). */
+  unsigned long xmem_size;  /* Bytes. 0 if --mem-mb=1. */
+  char *ems_pool;  /* Host backing store for the EMS page frame, lazily allocated. */
+  unsigned ems_pool_pages;
 } EmuState;
+
+/* ---- Minimal 80x25 color text mode, rendered to the host terminal. ----
+ * DOS IDEs and editors draw directly into the text framebuffer at physical
+ * 0xb8000 and read keys via int 0x16.  Framebuffer writes do not trap in
+ * KVM, so we poll a shadow copy and repaint differences as ANSI escapes.
+ * Text mode starts when the program sets an 80-column video mode through
+ * int 0x10 ah == 0x00, or once it has drawn a screenful to 0xb8000.
+ */
+#define VID_BASE   0xb8000
+#define VID_COLS   80
+#define VID_ROWS   25
+#define VID_BUFSZ  (VID_COLS * VID_ROWS * 2)
+
+static unsigned char vid_shadow[VID_BUFSZ];  /* Shadow of the rendered framebuffer. */
+static int vid_last_attr = -1;   /* Last SGR attribute emitted; -1 = none. */
+static char vid_active = 0;      /* Nonzero: render 0xb8000 to the terminal. */
+static char vid_wrap_pend = 0;   /* Nonzero: last cell of a row was written; the wrap is deferred until the next char (avoids a spurious scroll when the bottom-right cell is filled). */
+static char vid_altscreen = 0;   /* Nonzero: the terminal alternate screen is up. */
+static int vid_tty_fd = -1;      /* Host fd holding raw mode, -1 if not taken. */
+static char vid_raw_taken = 0;   /* Nonzero: we put the tty in raw mode. */
+static struct termios vid_saved_tio;  /* Saved lflag/tc state to restore at exit. */
+static char vid_release_registered = 0;
+static int vid_cur_shape = -2;   /* Last emitted DECSCUSR style (0..7) or -1 hidden; -2 = unknown. */
+
+/* CP437 -> Unicode for the upper half (bytes 0x80..0xff). 0xff renders blank. */
+static const unsigned short cp437_high[128] = {
+  0x00c7, 0x00fc, 0x00e9, 0x00e2, 0x00e4, 0x00e0, 0x00e5, 0x00e7,
+  0x00ea, 0x00eb, 0x00e8, 0x00ef, 0x00ee, 0x00ec, 0x00c4, 0x00c5,
+  0x00c9, 0x00e6, 0x00c6, 0x00f4, 0x00f6, 0x00f2, 0x00fb, 0x00f9,
+  0x00ff, 0x00d6, 0x00dc, 0x00a2, 0x00a3, 0x00a5, 0x20a7, 0x0192,
+  0x00e1, 0x00ed, 0x00f3, 0x00fa, 0x00f1, 0x00d1, 0x00aa, 0x00ba,
+  0x00bf, 0x2310, 0x00ac, 0x00bd, 0x00bc, 0x00a1, 0x00ab, 0x00bb,
+  0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556,
+  0x2555, 0x2563, 0x2551, 0x2557, 0x255d, 0x255c, 0x255b, 0x2510,
+  0x2514, 0x2534, 0x252c, 0x251c, 0x2500, 0x253c, 0x255e, 0x255f,
+  0x255a, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256c, 0x2567,
+  0x2568, 0x2564, 0x2565, 0x2559, 0x2558, 0x2552, 0x2553, 0x256b,
+  0x256a, 0x2518, 0x250c, 0x2588, 0x2584, 0x258c, 0x2590, 0x2580,
+  0x03b1, 0x00df, 0x0393, 0x03c0, 0x03a3, 0x03c3, 0x00b5, 0x03c4,
+  0x03a6, 0x0398, 0x03a9, 0x03b4, 0x221e, 0x03c6, 0x03b5, 0x2229,
+  0x2261, 0x00b1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00f7, 0x2248,
+  0x00b0, 0x2219, 0x00b7, 0x221a, 0x207f, 0x00b2, 0x25a0, 0x0020 };
+
+/* Map a CGA 3-bit color index (BGR order: bit0 blue, bit1 green, bit2 red) to
+ * the ANSI palette index (RGB order: 0 black, 1 red, 2 green, 4 blue). */
+static unsigned char cga_to_ansi(unsigned char c) {
+  return (unsigned char)((c & 2) | ((c & 1) << 2) | ((c & 4) >> 2));
+}
+
+static char *vid_utf8(char *o, unsigned cp) {
+  if (cp < 0x80) {
+    *o++ = (char)cp;
+  } else if (cp < 0x800) {
+    *o++ = (char)(0xc0 | (cp >> 6));
+    *o++ = (char)(0x80 | (cp & 0x3f));
+  } else {
+    *o++ = (char)(0xe0 | (cp >> 12));
+    *o++ = (char)(0x80 | ((cp >> 6) & 0x3f));
+    *o++ = (char)(0x80 | (cp & 0x3f));
+  }
+  return o;
+}
+
+static void vid_term_release(void) {  /* Registered via atexit(). */
+  if (vid_raw_taken && vid_tty_fd >= 0) tcsetattr(vid_tty_fd, 0, &vid_saved_tio);
+  vid_raw_taken = 0;
+  if (vid_altscreen) {
+    static const char leave_seq[] = "\x1b[0m\x1b[?12l\x1b[?25h\x1b[0 q\x1b[?1049l";
+    (void)!write(1, leave_seq, sizeof(leave_seq) - 1);
+    vid_altscreen = 0;
+  }
+}
+
+static void vid_enter(void) {  /* Activate text mode (alt screen + fresh repaint). */
+  static const char enter_seq[] = "\x1b[?1049h\x1b[2J\x1b[H\x1b[?12h";  /* ?12h enables a blinking cursor; vid_render() places it at the DOS cursor. */
+  if (!vid_release_registered) { vid_release_registered = 1; atexit(vid_term_release); }
+  if (!vid_altscreen) { (void)!write(1, enter_seq, sizeof(enter_seq) - 1); vid_altscreen = 1; }
+  memset(vid_shadow, 0xff, sizeof(vid_shadow));  /* Force a full repaint. */
+  vid_last_attr = -1;
+  vid_cur_shape = -2;
+  vid_active = 1;
+}
+
+/* Repaint the differences between the guest framebuffer and vid_shadow. */
+static void vid_render(void *mem) {
+  const unsigned char *v = (const unsigned char*)mem + VID_BASE;
+  char out[16384];
+  char *o = out;
+  int i, row, col, at, la, expect;
+  unsigned cur;
+  if (!vid_active) {  /* Auto-detect once the guest draws a real screen. */
+    int filled = 0;
+    for (i = 0; i < VID_COLS * VID_ROWS * 2; i += 2) {
+      const unsigned char ch = v[i];
+      if (ch != 0 && ch != ' ' && ++filled >= 80) break;
+    }
+    if (filled < 80) return;
+    vid_enter();
+  }
+  la = vid_last_attr;
+  expect = -1;  /* Next cell index that needs no cursor-position escape. */
+  for (i = 0; i < VID_COLS * VID_ROWS; ++i) {
+    const unsigned char ch = v[i << 1], at8 = v[(i << 1) + 1];
+    if (ch == vid_shadow[i << 1] && at8 == vid_shadow[(i << 1) + 1]) continue;
+    vid_shadow[i << 1] = ch; vid_shadow[(i << 1) + 1] = at8;
+    if (o > out + sizeof(out) - 64) { (void)!write(1, out, o - out); o = out; la = -1; expect = -1; }
+    if (i != expect) {  /* Not contiguous with the previous cell: move the cursor. */
+      row = i / VID_COLS + 1; col = i % VID_COLS + 1;
+      o += sprintf(o, "\x1b[%d;%dH", row, col);
+    }
+    expect = i + 1;
+    at = at8;
+    if (at != la) {
+      /* CGA attr: bits 0-2 fg, bit3 fg bright, bits 4-6 bg, bit7 bg bright. */
+      const int fg = cga_to_ansi(at & 7), bg = cga_to_ansi((at >> 4) & 7);
+      la = at;
+      o += sprintf(o, "\x1b[0;%d;%dm", ((at & 8) ? 90 : 30) + fg, ((at & 0x80) ? 100 : 40) + bg);
+    }
+    if (ch >= 0x80) o = vid_utf8(o, cp437_high[ch - 0x80]);
+    else if (ch >= 0x20 && ch < 0x7f) *o++ = (char)ch;
+    else *o++ = ' ';
+  }
+  vid_last_attr = la;
+  /* Cursor shape/visibility from the BDA register (set by int 10h AH=01). */
+  {
+    unsigned cx = *(const unsigned short*)((const unsigned char*)mem + 0x460);
+    int shape;
+    if (cx & 0x2000) shape = -1;  /* CH bit5: cursor hidden. */
+    else {
+      unsigned start = (cx >> 8) & 0x1f, end = cx & 0x1f;
+      /* Scan lines 0..7 in a text cell; DOS default underline is 6..7. */
+      shape = (start <= 1 && end >= 6) ? 1 : (start >= 5 ? 3 : 5);  /* block / underline / bar */
+    }
+    if (shape != vid_cur_shape) {
+      vid_cur_shape = shape;
+      if (shape < 0) o += sprintf(o, "\x1b[?25l");              /* Hide. */
+      else o += sprintf(o, "\x1b[?25h\x1b[%d q", shape);          /* Show + blinking style. */
+    }
+  }
+  cur = *(const unsigned short*)((const unsigned char*)mem + 0x450);  /* BDA cursor, page 0. */
+  row = ((cur >> 8) & 0xff) + 1; col = (cur & 0xff) + 1;
+  if (row < 1) row = 1; else if (row > VID_ROWS) row = VID_ROWS;
+  if (col < 1) col = 1; else if (col > VID_COLS) col = VID_COLS;
+  o += sprintf(o, "\x1b[%d;%dH", row, col);
+  if (o != out) { (void)!write(1, out, o - out); }
+}
+
+/* Fill a rectangle of the framebuffer with a character+attribute. */
+static void vid_fill(void *mem, int top, int left, int bottom, int right, unsigned char ch, unsigned char attr) {
+  unsigned char *v = (unsigned char*)mem + VID_BASE;
+  int r, c;
+  if (right >= VID_COLS) right = VID_COLS - 1;
+  if (bottom >= VID_ROWS) bottom = VID_ROWS - 1;
+  if (top > bottom || left > right) return;
+  for (r = top; r <= bottom; ++r) for (c = left; c <= right; ++c) {
+    v[(r * VID_COLS + c) << 1] = ch;
+    v[((r * VID_COLS + c) << 1) + 1] = attr;
+  }
+}
+
+/* int 0x10 ah == 0x06 (up) / ah == 0x07 (down): scroll or clear a window. */
+static void vid_scroll(void *mem, unsigned char al, unsigned char bh, unsigned short cx, unsigned short dx, int down) {
+  unsigned char *v = (unsigned char*)mem + VID_BASE;
+  int top = (cx >> 8) & 0xff, left = cx & 0xff, bottom = (dx >> 8) & 0xff, right = dx & 0xff;
+  int n, r, c, src;
+  if (right >= VID_COLS) right = VID_COLS - 1;
+  if (bottom >= VID_ROWS) bottom = VID_ROWS - 1;
+  if (top > bottom || left > right) return;
+  n = al ? al : bottom - top + 1;  /* al == 0 clears the whole window. */
+  if (down) {
+    for (r = bottom; r >= top; --r) for (c = left; c <= right; ++c) {
+      src = r - n;
+      v[(r * VID_COLS + c) << 1] = src >= top ? v[(src * VID_COLS + c) << 1] : ' ';
+      v[((r * VID_COLS + c) << 1) + 1] = src >= top ? v[((src * VID_COLS + c) << 1) + 1] : bh;
+    }
+  } else {
+    for (r = top; r <= bottom; ++r) for (c = left; c <= right; ++c) {
+      src = r + n;
+      v[(r * VID_COLS + c) << 1] = src <= bottom ? v[(src * VID_COLS + c) << 1] : ' ';
+      v[((r * VID_COLS + c) << 1) + 1] = src <= bottom ? v[((src * VID_COLS + c) << 1) + 1] : bh;
+    }
+  }
+}
+
+/* Teletype-style write of one byte to the framebuffer (tracks BDA cursor). */
+static void vid_putc(void *mem, unsigned char ch) {
+  unsigned char *v = (unsigned char*)mem + VID_BASE;
+  unsigned short *cur = (unsigned short*)((unsigned char*)mem + 0x450);
+  int row = (*cur >> 8) & 0xff, col = *cur & 0xff;
+  if (col >= VID_COLS) col = VID_COLS - 1;   /* Clamp a stray cursor column to the 80-column width. */
+  if (row >= VID_ROWS) row = VID_ROWS - 1;
+  switch (ch) {
+   case '\r': col = 0; vid_wrap_pend = 0; break;
+   case '\n': ++row; vid_wrap_pend = 0; break;
+   case '\b': if (col) --col; vid_wrap_pend = 0; break;
+   case '\t': col = (col + 8) & ~7; vid_wrap_pend = 0; if (col >= VID_COLS) { col = 0; ++row; } break;
+   case 7: break;  /* BEL. */
+   default:
+     if (vid_wrap_pend) { vid_wrap_pend = 0; col = 0; ++row; }  /* Commit a deferred end-of-line wrap. */
+     v[(row * VID_COLS + col) << 1] = ch;  /* Keep the existing attribute byte. */
+     if (++col >= VID_COLS) { vid_wrap_pend = 1; col = VID_COLS - 1; }  /* Stay on the last cell; wrap only when the next char arrives. */
+  }
+  if (row >= VID_ROWS) {
+    vid_scroll(mem, 1, 7, 0, (unsigned short)(VID_ROWS - 1) << 8 | (VID_COLS - 1), 0);
+    row = VID_ROWS - 1;
+    vid_wrap_pend = 0;
+  }
+  *cur = (unsigned short)((row << 8) | col);
+}
+
+static void vid_write_str(void *mem, const char *p, const char *end) {
+  while (p != end) vid_putc(mem, (unsigned char)*p++);
+}
 
 static int run_dos_child_subprocess(const char *dos_filename, const char *dos_args, const char *env, const char *env_end, const DirState *dir_state, unsigned char *exit_code_out) {
   char self_exe[LINUX_PATH_SIZE];
@@ -2662,9 +3009,20 @@ static int run_dos_child_subprocess(const char *dos_filename, const char *dos_ar
   for (i = 0; i < DRIVE_COUNT; ++i) {
     const char *mount = dir_state->linux_mount_dir[i];
     const char case_c = dir_state->case_mode[i] == CASE_MODE_LOWERCASE ? '-' : ':';
+    char cwd_mount[LINUX_PATH_SIZE];
     if (!mount) continue;
-    if (*mount == '\0') snprintf(mount_arg, sizeof(mount_arg), "--mount=%c%c", 'A' + i, case_c);
-    else snprintf(mount_arg, sizeof(mount_arg), "--mount=%c%c%s", 'A' + i, case_c, mount);
+    if (*mount == '\0') {
+      /* An empty mount means "the program's directory" (cwd). A bare
+       * --mount=E: would re-parse to the placeholder and end up unmounted for
+       * a DOS-path child, so serialize the real cwd instead. */
+      char *cw = getcwd(cwd_mount, sizeof(cwd_mount) - 1);
+      size_t n;
+      if (!cw) continue;
+      n = strlen(cw);
+      if (n + 1 < sizeof(cwd_mount) && (n == 0 || cw[n - 1] != '/')) { cw[n++] = '/'; cw[n] = '\0'; }
+      mount = cw;
+    }
+    snprintf(mount_arg, sizeof(mount_arg), "--mount=%c%c%s", 'A' + i, case_c, mount);
     owned_args[owned_count] = xstrdup(mount_arg);
     if (!owned_args[owned_count]) goto alloc_fail;
     argv_child[argc++] = owned_args[owned_count++];
@@ -2719,12 +3077,44 @@ static int run_dos_child_subprocess(const char *dos_filename, const char *dos_ar
 static void init_emu(struct EmuState *emu) {
   emu->kvm_fds.kvm_fd = -1;
   emu->mem = NULL;
+  emu->xmem = NULL;
+  emu->xmem_size = 0;
+  emu->ems_pool = NULL;
+  emu->ems_pool_pages = 0;
+}
+
+/* Translate a guest physical address to a host pointer. Returns NULL for
+ * unmapped regions (VGA hole, BIOS ROM, MMIO stubs).
+ */
+static char *guest_ptr(const EmuState *emu, unsigned long gpa) {
+  if (gpa < GUEST_MEM_LIMIT) return (char*)emu->mem + gpa;
+  if (emu->xmem_size && gpa - 0x100000UL < emu->xmem_size) return (char*)emu->xmem + (gpa - 0x100000UL);
+  return NULL;
+}
+
+/* Translate a guest LINEAR address to physical via the guest's page tables
+ * (dir at cr3_phys). Returns the physical address, or ~0UL if the linear
+ * address is not present in the guest's tables.
+ */
+static unsigned long pm_xlat(const EmuState *emu, unsigned long cr3_phys, unsigned long linear) {
+  const unsigned *pd, *pt;
+  unsigned pde, pte;
+  if (!(cr3_phys & ~0xfffUL)) return ~0UL;
+  pd = (const unsigned*)guest_ptr(emu, cr3_phys & ~0xfffUL);
+  if (!pd) return ~0UL;
+  pde = pd[linear >> 22];
+  if (!(pde & 1)) return ~0UL;
+  pt = (const unsigned*)guest_ptr(emu, pde & ~0xfffUL);
+  if (!pt) return ~0UL;
+  pte = pt[(linear >> 12) & 0x3ff];
+  if (!(pte & 1)) return ~0UL;
+  return (pte & ~0xfffUL) | (linear & 0xfff);
 }
 
 /* Must be preceded by init_emu(emu).
  * After this call, the caller should also call ioctl(kvm_fds.vcpu_fd, KVM_SET_SREGS, &emu->initial_sregs);
  */
-static void reset_emu(struct EmuState *emu) {
+static void reset_emu(struct EmuState *emu, const EmuParams *emu_params) {
   void *mem;
   if (emu->kvm_fds.kvm_fd < 0) {
     int kvm_fd, vm_fd, vcpu_fd;
@@ -2777,9 +3167,38 @@ static void reset_emu(struct EmuState *emu) {
         exit(252);
       }
     }
+    /* Extended memory above 1 MiB, used by protected-mode programs and
+     * reported via int 15h/XMS/CMOS. Lazily faulted by the kernel.
+     */
+    if (emu_params->mem_mb > 1) {
+      emu->xmem_size = ((unsigned long)emu_params->mem_mb - 1) << 20;
+      if ((emu->xmem = mmap(NULL, emu->xmem_size, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0)) == NULL) {
+        perror("fatal: mmap xmem");
+        exit(252);
+      }
+      memset(&region, 0, sizeof(region));
+      region.slot = 2;
+      region.guest_phys_addr = 0x100000;
+      region.memory_size = emu->xmem_size;
+      region.userspace_addr = (uintptr_t)emu->xmem;
+      if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+        perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION xmem");
+        exit(252);
+      }
+    }
     if ((vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
       perror("fatal: can not create KVM vcpu");
       exit(252);
+    }
+    { /* Populate the vCPU's CPUID table so guest CPUID returns real results.
+       * Without this, CPUID exits to the kernel which has no entries and
+       * returns zeros, breaking DOS extender CPU detection (386/486/Pentium). */
+      static struct { struct kvm_cpuid2 hdr; struct kvm_cpuid_entry2 entries[256]; } cpuid_data;
+      cpuid_data.hdr.nent = 256;
+      if (ioctl(kvm_fd, KVM_GET_SUPPORTED_CPUID, &cpuid_data) >= 0) {
+        (void)ioctl(vcpu_fd, KVM_SET_CPUID2, &cpuid_data);  /* Best effort. */
+      }
     }
     kvm_run_mmap_size = ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
     if (kvm_run_mmap_size < 0) {
@@ -2816,6 +3235,127 @@ static void reset_emu(struct EmuState *emu) {
   }
 }
 
+/* Read one byte from the tty with a millisecond timeout (-1 = block). */
+static int tty_getc(TtyState *tty_state, int ms) {
+  struct pollfd pfd;
+  unsigned char c;
+  pfd.fd = (tty_state->tty_in_fd == -2) ? 0 : tty_state->tty_in_fd;
+  pfd.events = POLLIN;
+  if (poll(&pfd, 1, ms) <= 0) return -1;
+  if (read(pfd.fd, &c, 1) < 1) return -1;
+  return c;
+}
+
+/* Decode a terminal escape tail (bytes after a leading 0x1b) into a 16-bit
+ * BIOS keycode (scancode << 8 | ascii); ascii == 0 for extended keys. */
+/* Modified-key BIOS codes for the navigation/function keys. Column order is
+ * [normal, shift, alt, ctrl]; a 0 entry falls back to the normal keycode.
+ * xterm encodes the modifier as CSI param m = 1 + (shift?1)+(alt?2)+(ctrl?4).
+ * Key index order matches K_* below. */
+enum { K_UP, K_DOWN, K_RIGHT, K_LEFT, K_HOME, K_END, K_PGUP, K_PGDN, K_INS, K_DEL,
+       K_F1, K_F2, K_F3, K_F4, K_F5, K_F6, K_F7, K_F8, K_F9, K_F10, K_F11, K_F12 };
+static const unsigned short keymods[22][4] = {
+  {0x4800, 0x4800, 0x9800, 0x8d00},  /* <Up> */
+  {0x5000, 0x5000, 0xa000, 0x9100},  /* <Down> */
+  {0x4d00, 0x4d00, 0x9d00, 0x7400},  /* <Right> */
+  {0x4b00, 0x4b00, 0x9b00, 0x7300},  /* <Left> */
+  {0x4700, 0x4700, 0x9700, 0x7700},  /* <Home> */
+  {0x4f00, 0x4f00, 0x9f00, 0x7500},  /* <End> */
+  {0x4900, 0x4900, 0x9900, 0x8400},  /* <PgUp> */
+  {0x5100, 0x5100, 0xa100, 0x7600},  /* <PgDn> */
+  {0x5200, 0x5200, 0xa200, 0x9200},  /* <Insert> */
+  {0x5300, 0x5300, 0xa300, 0x9300},  /* <Delete> */
+  {0x3b00, 0x5400, 0x6800, 0x5e00},  /* <F1> */
+  {0x3c00, 0x5500, 0x6900, 0x5f00},  /* <F2> */
+  {0x3d00, 0x5600, 0x6a00, 0x6000},  /* <F3> */
+  {0x3e00, 0x5700, 0x6b00, 0x6100},  /* <F4> */
+  {0x3f00, 0x5800, 0x6c00, 0x6200},  /* <F5> */
+  {0x4000, 0x5900, 0x6d00, 0x6300},  /* <F6> */
+  {0x4100, 0x5a00, 0x6e00, 0x6400},  /* <F7> */
+  {0x4200, 0x5b00, 0x6f00, 0x6500},  /* <F8> */
+  {0x4300, 0x5c00, 0x7000, 0x6600},  /* <F9> */
+  {0x4400, 0x5d00, 0x7100, 0x6700},  /* <F10> */
+  {0x8500, 0x8700, 0x8b00, 0x8900},  /* <F11> */
+  {0x8600, 0x8800, 0x8c00, 0x8a00},  /* <F12> */
+};
+
+/* Return the BIOS keycode for key index k under modifier bits mod
+ * (bit0 shift, bit1 alt, bit2 ctrl). */
+static int apply_mod(int k, int mod) {
+  int slot = 0;  /* Prefer alt, then ctrl, then shift, for single-mod combos. */
+  if (mod & 2) slot = 2; else if (mod & 4) slot = 3; else if (mod & 1) slot = 1;
+  if (keymods[k][slot]) return keymods[k][slot];
+  return keymods[k][0];
+}
+
+static int decode_esc(const unsigned char *b, int n) {
+  int num, mod, i;
+  if (n < 1) return 0x011b;  /* Bare <Esc>. */
+  if (b[0] == 'O') {  /* SS3 (application-keypad) sequence. */
+    if (n < 2) return 0x011b;
+    switch (b[1]) {
+     case 'P': return 0x3b00; case 'Q': return 0x3c00; case 'R': return 0x3d00; case 'S': return 0x3e00;  /* <F1>..<F4> */
+     case 'A': return 0x4800; case 'B': return 0x5000; case 'C': return 0x4d00; case 'D': return 0x4b00;  /* Arrow keys. */
+     case 'H': return 0x4700; case 'F': return 0x4f00;  /* <Home>, <End>. */
+    }
+    return 0x011b;
+  }
+  if (b[0] != '[') {  /* <Esc><char> = <Alt><char>. */
+    if (b[0] == 0x1b) return 0x011b;  /* <Esc><Esc>: report as <Esc>. */
+    if (b[0] < 0x80) return (scancodes[b[0]] << 8);  /* <Alt><key>: AH = scancode, AL = 0. */
+    return 0x011b;
+  }
+  /* Parse CSI params: <Esc>[ p1 ; p2 ... <final>. Modifier is the 2nd param. */
+  num = 0; mod = 0;
+  for (i = 1; i < n && b[i] >= '0' && b[i] <= '9'; ++i) num = num * 10 + (b[i] - '0');
+  if (i < n && b[i] == ';') {  /* Modifier param follows. */
+    ++i;
+    for (; i < n && b[i] >= '0' && b[i] <= '9'; ++i) mod = mod * 10 + (b[i] - '0');
+    if (mod > 0) --mod;  /* xterm: param is 1 + modifier bits. */
+  }
+  if (i < n && b[i] >= 'A' && b[i] <= 'Z' && b[i] != '~') {  /* CSI [p1;mod]<letter>. */
+    switch (b[i]) {
+     case 'A': return apply_mod(K_UP, mod); case 'B': return apply_mod(K_DOWN, mod);
+     case 'C': return apply_mod(K_RIGHT, mod); case 'D': return apply_mod(K_LEFT, mod);
+     case 'H': return apply_mod(K_HOME, mod); case 'F': return apply_mod(K_END, mod);
+     case 'Z': return 0x0f09;  /* <Shift><Tab>. */
+    }
+    return 0x011b;
+  }
+  if (i < n && b[i] == '~') {  /* CSI <num>[;mod]~ */
+    switch (num) {
+     case 1: case 7: return apply_mod(K_HOME, mod);
+     case 4: case 8: return apply_mod(K_END, mod);
+     case 2: return apply_mod(K_INS, mod);
+     case 3: return apply_mod(K_DEL, mod);
+     case 5: return apply_mod(K_PGUP, mod);
+     case 6: return apply_mod(K_PGDN, mod);
+     case 11: case 12: case 13: case 14: return apply_mod(K_F1 + num - 11, mod);  /* <F1>..<F4> */
+     case 15: return apply_mod(K_F5, mod);
+     case 17: case 18: case 19: case 20: case 21: return apply_mod(K_F6 + num - 17, mod);  /* <F6>..<F10> */
+     case 23: return apply_mod(K_F11, mod); case 24: return apply_mod(K_F12, mod);
+    }
+  }
+  return 0x011b;
+}
+
+/* Assemble a full keycode from an already-read first byte c, gathering the
+ * escape tail (if c == 0x1b) with a short timeout so a lone <Esc> is kept. */
+static int read_keycode(TtyState *tty_state, int c) {
+  unsigned char b[8];
+  int n = 0, t, done = 0;
+  if (c != 0x1b) return (c & ~0x7f ? 0x3f : scancodes[c]) << 8 | (c & 0xff);
+  while (n < (int)sizeof(b) && !done) {
+    t = tty_getc(tty_state, n ? 6 : 15);  /* The first tail byte gets a bit longer. */
+    if (t < 0) break;
+    b[n++] = (unsigned char)t;
+    if (b[0] == 'O') done = n >= 2;
+    else if (b[0] == '[') done = n >= 2 && ((b[n - 1] >= 'A' && b[n - 1] <= 'Z') || b[n - 1] == '~');
+    else done = 1;  /* Unknown introducer. */
+  }
+  return decode_esc(b, n);
+}
+
 static void process_key(TtyState *tty_state, unsigned char ah, unsigned short *ax, unsigned short *flags) {
   if (tty_state->tty_in_fd == -3) {  /* Fake keys. */
     *ax = *tty_state->next_fake_key;
@@ -2825,9 +3365,7 @@ static void process_key(TtyState *tty_state, unsigned char ah, unsigned short *a
       if (++tty_state->next_fake_key == fake_keys + sizeof(fake_keys) / sizeof(fake_keys[0])) tty_state->next_fake_key = fake_keys;
     }
   } else {
-    /* TODO(pts): Disable line buffering if isatty(0). Enable it again at exit if needed. */
-    int got;
-    struct termios tio;
+    int fd, key, applied = 0;
     tcflag_t old_lflag = 0;
     if (tty_state->tty_in_fd == -1) {
       if ((tty_state->tty_in_fd = open("/dev/tty", O_RDWR)) < 0) {  /* Current controlling terminal. */
@@ -2836,49 +3374,58 @@ static void process_key(TtyState *tty_state, unsigned char ah, unsigned short *a
         tty_state->tty_in_fd = ensure_fd_is_at_least(tty_state->tty_in_fd, 5);
       }
     }
-    if (!tty_state->is_tty_in_error) {
+    fd = (tty_state->tty_in_fd == -2) ? 0 : tty_state->tty_in_fd;
+    if (vid_active && !tty_state->raw_on && !tty_state->is_tty_in_error) {
+      /* While a text-mode program runs, keep the tty in raw mode so each
+       * keypress is delivered at once (canonical mode would hold the input
+       * until <Enter>), and restore it on exit via vid_term_release(). */
+      if (tcgetattr(fd, &vid_saved_tio) == 0) {
+        struct termios rt = vid_saved_tio;
+        rt.c_lflag &= ~(ICANON | ECHO | ISIG | IEXTEN);  /* TODO(pts): Handle Ctrl-<C> and other signals. */
+        rt.c_iflag &= ~(IXON | ICRNL);
+        rt.c_cc[VMIN] = 1;
+        rt.c_cc[VTIME] = 0;
+        if (tcsetattr(fd, 0, &rt) == 0) { vid_tty_fd = fd; vid_raw_taken = 1; tty_state->raw_on = 1; }
+        else tty_state->is_tty_in_error = 1;
+      } else tty_state->is_tty_in_error = 1;
+    }
+    if (!tty_state->raw_on && !tty_state->is_tty_in_error) {  /* Per-call raw mode (non-text-mode path). */
+      struct termios tio;
       if (tcgetattr(tty_state->tty_in_fd, &tio) != 0) {
         tty_state->is_tty_in_error = 1;
       } else {
         old_lflag = tio.c_lflag;
-        /* TODO(pts): Handle Ctrl-<C> and other signals. */
         tio.c_lflag &= ~(ICANON | ECHO);  /* As a side effect, ECHOCTL is also disabled, so Ctrl-<C> won't show up as ^C, but it will still send SIGINT. */
-        if (tcsetattr(tty_state->tty_in_fd, 0, &tio) != 0) {
-          tty_state->is_tty_in_error = 1;
-        }
+        if (tcsetattr(tty_state->tty_in_fd, 0, &tio) != 0) tty_state->is_tty_in_error = 1;
+        else applied = 1;
       }
     }
-    if (ah & 1) {
-      struct pollfd pollfd0;
-      int got;
-      pollfd0.fd = 0;
-      pollfd0.events = POLLIN;
-      got = poll(&pollfd0, 1  /* pollfd count */, 0 /* timeout */);  /* Like select(2), but faster. Easier to setup than epoll(2). */
-      if (got < 0) {
-        perror("poll stdin");
-        exit(252);
-      } else if (got) {
-        *ax =  0x011b;  /* Fake <Esc> in keyboard buffer. */
-        *flags &= ~(1 << 6);  /* ZF=0, key available. */
+    if (tty_state->pending_key >= 0) {
+      *ax = (unsigned short)tty_state->pending_key;
+      if (ah & 1) *flags &= ~(1 << 6);  /* Key-check: report it, keep it buffered. */
+      else tty_state->pending_key = -1;  /* Read: consume it. */
+    } else if (ah & 1) {  /* Check for a key without removing it. */
+      int c = tty_getc(tty_state, 0);
+      if (c < 0) {
+        *flags |= (1 << 6);  /* ZF=1, no key. */
       } else {
-        *flags |= (1 << 6);  /* ZF=1. */
+        key = read_keycode(tty_state, c);
+        tty_state->pending_key = key;
+        *ax = (unsigned short)key;
+        *flags &= ~(1 << 6);  /* ZF=0, key available. */
       }
-    } else {
-      char c;
-      if ((got = read(tty_state->tty_in_fd == -2 ? 0 : tty_state->tty_in_fd, &c, 1)) < 1) c = 26;  /* Ctrl-<Z>, simulate EOF. Most programs won't recognize it. */
-      *ax = (c & ~0x7f ? 0x3f : scancodes[(int)c]) << 8 | (c & 0xff);
+    } else {  /* Wait for and read a key. */
+      int c;
+      if ((c = tty_getc(tty_state, -1)) < 0) c = 26;  /* Ctrl-<Z>, simulate EOF. Most programs won't recognize it. */
+      *ax = (unsigned short)read_keycode(tty_state, c);
     }
-    if (!tty_state->is_tty_in_error) {
-      tio.c_lflag = old_lflag;
-      /* Since we set ECHO back here, a call with ah == 0x01
-       * followed by a call with ah == 0x00 will echo the character
-       * to the Linux terminal.
-       *
-       * TODO(pts): Fix it by not setting ECHO back here, only at exit.
-       */
-      /* TODO(pts): Also change it back upon exit. Even if it's a signal exit. */
-      if (tcsetattr(tty_state->tty_in_fd, 0, &tio) != 0) {
-        tty_state->is_tty_in_error = 1;
+    /* Since we set ECHO back here, a call with ah == 0x01 followed by a call
+     * with ah == 0x00 will echo the character to the Linux terminal. */
+    if (applied) {  /* Restore the saved line flags for the non-text-mode path. */
+      struct termios tio;
+      if (tcgetattr(tty_state->tty_in_fd, &tio) == 0) {
+        tio.c_lflag = old_lflag;
+        if (tcsetattr(tty_state->tty_in_fd, 0, &tio) != 0) tty_state->is_tty_in_error = 1;
       }
     }
   }
@@ -3045,9 +3592,27 @@ static int is_probable_windows_message_stub(const char *path) {
 }
 
 static int is_probable_dos_extender_program(const char *path) {
+  /* DOS-extender signatures: a bound MZ/NE/LE/PE file containing any of
+   * these is meant to run under DOS with a protected-mode extender, not
+   * under Windows/Wine.
+   */
+  static const char * const sigs[] = {
+    "DOSX16", "DOSX32", "dosxnt", "DOSXNT", "MS32KRNL",
+    "Phar Lap", "PHARLAP", "TNT", "TNTDOS", "RUN286",
+    "DOS4GW", "DOS/4GW", "DOS4G", "4GWPRO",
+    "DOS/32", "DOS32A", "DOS/16M", "DOS16M", "D16M",
+    "PMODE", "PMODETSR", "PMODE/W",
+    "CauseWay", "CAUSEWAY", "WDOSX", "PROVM", "X32VM", "ZPM",
+    "go32", "GO32", "CWSDPMI", "HDPMI",
+    "DOS-Extender", "DOSEXTENDER", "DOS Extender", "__DOSEXT16_MODE",
+    "DPMI, VCPI", "DPMI16BI", "32RTM", "RTM.EXE", "POWERPACK",
+    "DPMI host", "DPMI loader", "requires DPMI", "386|DOS",
+    "protected-mode application",
+  };
   int fd;
   unsigned char *buf = NULL;
   ssize_t got;
+  unsigned i;
   int is_ext = 0;
   const size_t scan_size = 1U << 20;  /* Scan first 1 MiB. */
   fd = open(path, O_RDONLY);
@@ -3056,11 +3621,8 @@ static int is_probable_dos_extender_program(const char *path) {
   if (!buf) goto done;
   got = read(fd, buf, scan_size);
   if (got <= 0) goto done;
-  if (memmem(buf, (size_t)got, "DOSX16", 6) ||
-      memmem(buf, (size_t)got, "DPMI, VCPI", 10) ||
-      memmem(buf, (size_t)got, "__DOSEXT16_MODE", 14) ||
-      memmem(buf, (size_t)got, "DOSEXTENDER", 10)) {
-    is_ext = 1;
+  for (i = 0; !is_ext && i < sizeof(sigs) / sizeof(sigs[0]); ++i) {
+    if (memmem(buf, (size_t)got, sigs[i], strlen(sigs[i]))) is_ext = 1;
   }
  done:
   if (buf) free(buf);
@@ -3198,6 +3760,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   unsigned ongoing_set_int;
   unsigned short last_dos_error_code;
   char port_0x40_tick;
+  char port_0x92_a20;
+  char port_0x70_index;
   unsigned char video_write_step;
   char video_byte_written;
   const char *stdout_write_p;
@@ -3205,15 +3769,17 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   char is_stdout_write_cursor;
   char dpmi_warned;
   enum { XMS_HANDLE_COUNT = 64 };
-  void *xms_blocks[XMS_HANDLE_COUNT];
-  unsigned long xms_block_sizes[XMS_HANDLE_COUNT];  /* Bytes. */
+  unsigned long xms_block_kb[XMS_HANDLE_COUNT];  /* KiB offset into xmem; 0 = free handle. */
+  unsigned short xms_block_sizes_kb[XMS_HANDLE_COUNT];
   unsigned short xms_lock_counts[XMS_HANDLE_COUNT];
-  unsigned short xms_free_kb, xms_total_kb;
+  unsigned long xms_free_kb;
   char umb_link_state;
   enum { EMS_HANDLE_COUNT = 64 };
   unsigned short ems_pages_by_handle[EMS_HANDLE_COUNT];
-  unsigned short ems_page_map[4];
-  unsigned short ems_free_pages, ems_total_pages;
+  unsigned short ems_handle_base[EMS_HANDLE_COUNT];  /* First pool page index for the handle. */
+  unsigned short ems_page_map[4];  /* Pool page index + 1; 0 = unmapped. */
+  unsigned short ems_phys_handle[4];  /* Handle occupying the frame slot; 0xffff = free. */
+  unsigned short ems_free_pages, ems_total_pages, ems_pool_next;
   unsigned short call_hlt_cs, call_hlt_ip;
   enum malloc_strategy_t { MS_FIRST_FIT = 0, MS_BEST_FIT = 1, MS_LAST_FIT = 2 };
   unsigned malloc_strategy;
@@ -3224,6 +3790,23 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   unsigned short find_attrs;
   unsigned char last_exec_return_code;
   unsigned hlt_spin_count;
+  enum { FCB_FILE_COUNT = 32 };
+  unsigned fcb_lin_table[FCB_FILE_COUNT];  /* Guest linear address of the FCB; 0 = free slot. */
+  int fcb_fd_table[FCB_FILE_COUNT];  /* Host fd backing the FCB; -1 = unused. */
+  unsigned current_psp_para;  /* PSP segment of the current DOS process. */
+  char was_in_pm;  /* Track real<->protected mode transitions for diagnostics. */
+  char err_dumped;  /* One-shot stack dump on first 'E' console char. */
+  unsigned long last_cr2, last_cr3;  /* Last seen guest paging state. */
+  char saw_paging;  /* Set when guest PM run had cr0.PG=1 at an exit. */
+  char pm_step;  /* KVIKDOS_PM_STEP: single-step all instructions, keep ring. */
+  unsigned long pm_eip_ring[16384];  /* Ring of linear fetch addrs (bit63 = in-PM). */
+  unsigned long pm_cr3_ring[16384];
+  unsigned pm_ring_n;  /* Total steps recorded. */
+  char kframe_armed;  /* Set once the TNT kernel copy completes (diagnostics). */
+  unsigned long kframe_phys, kframe_val;  /* Last seen mapping+content of lin 0x93a000. */
+  unsigned long prev_cr2;  /* Track cr2 changes to detect guest #PF delivery. */
+  char pf_trapped;  /* One-shot full-speed post-#PF state dump (KVIKDOS_PF_TRAP). */
+  unsigned vid_tick;  /* Throttle counter for text-mode repaints. */
 
   { struct SA { int StaticAssert_AllocParaLimits : DOS_ALLOC_PARA_LIMIT <= (DOS_MEM_LIMIT >> 4); }; }
   { struct SA { int StaticAssert_CountryInfoSize : sizeof(country_info) == 0x18; }; }
@@ -3245,16 +3828,37 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
   stdout_write_p = NULL;  /* Pacify uninitialized warnings. */
   stdout_write_end = NULL;  /* Pacify uninitialized warnings. */
   dpmi_warned = 0;
-  memset(xms_blocks, 0, sizeof(xms_blocks));
-  memset(xms_block_sizes, 0, sizeof(xms_block_sizes));
+  memset(xms_block_kb, 0, sizeof(xms_block_kb));
+  memset(xms_block_sizes_kb, 0, sizeof(xms_block_sizes_kb));
   memset(xms_lock_counts, 0, sizeof(xms_lock_counts));
-  xms_total_kb = xms_free_kb = 16 * 1024;  /* Minimal practical XMS pool for toolchains. */
   umb_link_state = 0;
   memset(ems_pages_by_handle, 0, sizeof(ems_pages_by_handle));
-  ems_page_map[0] = ems_page_map[1] = ems_page_map[2] = ems_page_map[3] = 0xffff;
+  memset(ems_handle_base, 0, sizeof(ems_handle_base));
+  ems_page_map[0] = ems_page_map[1] = ems_page_map[2] = ems_page_map[3] = 0;
+  ems_phys_handle[0] = ems_phys_handle[1] = ems_phys_handle[2] = ems_phys_handle[3] = 0xffff;
   ems_total_pages = ems_free_pages = 256;  /* 4 MiB EMS in 16 KiB pages. */
+  ems_pool_next = 0;
+  pm_step = getenv("KVIKDOS_PM_STEP") != NULL;
+  pm_ring_n = 0;
+  kframe_armed = 0;
+  kframe_phys = kframe_val = 0;
+  port_0x92_a20 = 1;  /* A20 enabled by default; programs may toggle it. */
+  port_0x70_index = 0;
   call_hlt_cs = call_hlt_ip = 0;
   cleanup_fn[0] = '\0';
+  memset(fcb_lin_table, 0, sizeof(fcb_lin_table));
+  { unsigned fi; for (fi = 0; fi < FCB_FILE_COUNT; ++fi) fcb_fd_table[fi] = -1; }
+  current_psp_para = PSP_PARA;
+  was_in_pm = 0;
+  err_dumped = 0;
+  vid_tick = 0;
+  vid_active = 0;  /* Each program starts in plain stdout mode. */
+  vid_wrap_pend = 0;
+  vid_cur_shape = -2;
+  last_cr2 = last_cr3 = 0;
+  prev_cr2 = 0;
+  pf_trapped = 0;
+  saw_paging = 0;
   find_dirp = NULL;
   find_linux_dir[0] = '\0';
   find_dos_pattern[0] = '\0';
@@ -3264,7 +3868,8 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
 
  do_exec:
   header_size = detect_dos_executable_program(img_fd, prog_filename, header);
-  reset_emu(emu);
+  reset_emu(emu, emu_params);
+  xms_free_kb = emu->xmem_size >= (64 << 10) ? (emu->xmem_size >> 10) - 64 : 0;
   sregs = emu->initial_sregs;
   kvm_fds = emu->kvm_fds;
   mem = emu->mem;
@@ -3280,17 +3885,33 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
     ((unsigned char*)mem)[(INT_HLT_PARA << 4) + 0x201] = 0x43;
     ((unsigned char*)mem)[(INT_HLT_PARA << 4) + 0x202] = 0xcb;  /* retf */
   }
-  /* !! Initialize more BIOS data area until 0x534, move magic interrupt table later.
+  /* Populate the BIOS data area (0x400-0x500). It lives in the read-only
+   * first page, so guest reads come straight from mem[]; guest writes to it
+   * are applied via the KVM_EXIT_MMIO handler. Only the fields programs
+   * actually probe are set.
    * https://stanislavs.org/helppc/bios_data_area.html
    */
-  *(unsigned short*)((char*)mem + 0x410) = 0x22;  /* BIOS equipment flags. https://stanislavs.org/helppc/int_11.html */
+  memset((char*)mem + 0x400, 0, 0x100);  /* Clear stale BDA on exec. */
+  *(unsigned short*)((char*)mem + 0x410) = 0x21;  /* Equipment word: IPL from diskette, 80x25 color text. */
+  *(unsigned short*)((char*)mem + 0x413) = DOS_MEM_LIMIT >> 10;  /* Base memory in KiB. */
+  *(unsigned short*)((char*)mem + 0x41a) = 0x1e1e;  /* Keyboard buffer head=tail (empty). */
+  *(unsigned short*)((char*)mem + 0x480) = 0x1e;   /* Keyboard buffer start offset. */
+  *(unsigned short*)((char*)mem + 0x482) = 0x3e;   /* Keyboard buffer end offset. */
+  ((char*)mem)[0x449] = 0x03;  /* Current video mode: 80x25 text. */
+  *(unsigned short*)((char*)mem + 0x44a) = 80;     /* Columns. */
+  *(unsigned short*)((char*)mem + 0x44c) = 0x1000; /* Video page size. */
+  ((char*)mem)[0x460] = 0x0d;  /* Cursor end scan line. */
+  ((char*)mem)[0x461] = 0x0e;  /* Cursor start scan line. */
+  *(unsigned short*)((char*)mem + 0x463) = 0x3d4;  /* CRT controller base (color). */
+  ((char*)mem)[0x484] = 24;    /* Rows - 1. */
+  *(unsigned short*)((char*)mem + 0x485) = 16;     /* Character height. */
   ((char*)mem)[(INT_HLT_PARA << 4) - 1] = (char)0xcb;  /* `retf' opcode used by country case map. */
 
   /*memcpy(initial_sregs, &sregs, sizeof(sregs));*/  /* Not completely 0, but sregs.Xs.selector is 0. */
   sregs.fs.selector = sregs.gs.selector = ENV_PARA;  /* Random value after magic interrupt table. */
 
   memcpy((char*)mem + (PROGRAM_MCB_PARA << 4), default_program_mcb, 16);
-  { char *psp_args = load_dos_executable_program(img_fd, prog_filename, mem, header, header_size, &regs, &sregs, &MCB_SIZE_PARA((char*)mem + (PROGRAM_MCB_PARA << 4))) + 0x80;
+  { char *psp_args = load_dos_executable_program(img_fd, prog_filename, mem, header, header_size, &regs, &sregs, &MCB_SIZE_PARA((char*)mem + (PROGRAM_MCB_PARA << 4)), current_psp_para) + 0x80;
     if (args) {
       copy_args_to_dos_args(psp_args, args);
       args = NULL;  /* DOS exec() shouldn't copy them later. */
@@ -3493,6 +4114,23 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
     perror("fatal: KVM_SET_REGS\n");
     exit(252);
   }
+  if (pm_step) {
+    struct kvm_guest_debug dbg;
+    memset(&dbg, 0, sizeof(dbg));
+    dbg.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP;
+    if (ioctl(kvm_fds.vcpu_fd, KVM_SET_GUEST_DEBUG, &dbg) < 0) perror("warn: KVM_SET_GUEST_DEBUG");
+  }
+  { const char *bp = getenv("KVIKDOS_BP");  /* Hex linear addr -> DR0 exec breakpoint. */
+    if (bp) {
+      struct kvm_guest_debug dbg;
+      memset(&dbg, 0, sizeof(dbg));
+      dbg.arch.debugreg[0] = strtoul(bp, NULL, 16);
+      dbg.arch.debugreg[7] = 0x1;  /* L0 local enable, RW0=00 exec, LEN0=00. */
+      dbg.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP;
+      if (ioctl(kvm_fds.vcpu_fd, KVM_SET_GUEST_DEBUG, &dbg) < 0) perror("warn: KVM_SET_GUEST_DEBUG bp");
+      else fprintf(stderr, "bp armed at lin %lx\n", (unsigned long)dbg.arch.debugreg[0]);
+    }
+  }
 
   /* !! Trap it if it tries to enter protected mode (cr0 |= 1). Is this possible? */
   for (;;) {
@@ -3509,14 +4147,142 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       perror("fatal: KVM_GET_REGS");
       exit(252);
     }
+    { const char in_pm = (sregs.cr0 & 1) != 0;
+      if (sregs.cr2) last_cr2 = sregs.cr2;
+      if (sregs.cr3) last_cr3 = sregs.cr3;
+      if (in_pm && (sregs.cr0 & 0x80000000UL)) saw_paging = 1;
+      if (sregs.cr2 && !pf_trapped && getenv("KVIKDOS_PF_TRAP")) {  /* First post-#PF exit: dump state before teardown. */
+        int ffd;
+        pf_trapped = 1;
+        fprintf(stderr, "pf-trap: eip=%08x cs=%04x cr0=%08x cr2=%08x cr3=%08x esp=%08x ss=%04x idt=%08x\n",
+                (unsigned)regs.rip, sregs.cs.selector, (unsigned)sregs.cr0, (unsigned)sregs.cr2,
+                (unsigned)sregs.cr3, (unsigned)regs.rsp, sregs.ss.selector, (unsigned)sregs.idt.base);
+        { const unsigned char *gd = (const unsigned char*)guest_ptr(emu, sregs.gdt.base);
+          unsigned i;
+          fprintf(stderr, "  gdt=%08x.%x", (unsigned)sregs.gdt.base, (unsigned)sregs.gdt.limit);
+          for (i = 1; i <= 4; ++i) {  /* decode GDT selectors 8,10,18,20 */
+            const unsigned char *d = gd + i * 8;
+            unsigned base = d[2] | (d[3] << 8) | (d[4] << 16) | (d[7] << 24);
+            unsigned lim = (d[0] | (d[1] << 8) | ((d[6] & 0xf) << 16));
+            if (d[6] & 0x80) lim = (lim << 12) | 0xfff;
+            fprintf(stderr, "  [sel%x]b=%08x l=%08x a=%02x", i * 8, base, lim, d[5]); }
+          fprintf(stderr, "\n"); }
+        ffd = open("/tmp/pf-lowmem.bin", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (ffd >= 0) { (void)!write(ffd, mem, GUEST_MEM_LIMIT); close(ffd); }
+        if (emu->xmem) { ffd = open("/tmp/pf-xmem.bin", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+          if (ffd >= 0) { (void)!write(ffd, emu->xmem, emu->xmem_size); close(ffd); } }
+      }
+      if (pm_step) {  /* Record linear fetch address of every instruction. */
+        unsigned long lin = sregs.cs.base + (unsigned long)regs.rip;
+        pm_eip_ring[pm_ring_n & 16383] = lin | (in_pm ? 0x8000000000000000UL : 0);
+        pm_cr3_ring[pm_ring_n & 16383] = sregs.cr3;
+        ++pm_ring_n;
+        if (in_pm && sregs.cr2 && sregs.cr2 != prev_cr2) {  /* A #PF was just delivered. */
+          unsigned long fa = sregs.cr2;
+          unsigned long feip = pm_ring_n >= 2 ? (pm_eip_ring[(pm_ring_n - 2) & 16383] & 0xffffffffUL) : 0;
+          unsigned long fphys = pm_xlat(emu, sregs.cr3, feip);
+          const unsigned char *fb = fphys != ~0UL ? (const unsigned char*)guest_ptr(emu, fphys) : NULL;
+          fprintf(stderr, "PFOCCUR eip=%08x cs=%04x cr2=%08x xlat(cr2)=%08x idt=%08x fault_insn[%02x %02x %02x %02x %02x %02x %02x %02x]\n",
+                  (unsigned)regs.rip, sregs.cs.selector, (unsigned)fa, (unsigned)pm_xlat(emu, sregs.cr3, fa),
+                  (unsigned)sregs.idt.base,
+                  fb?fb[0]:0, fb?fb[1]:0, fb?fb[2]:0, fb?fb[3]:0, fb?fb[4]:0, fb?fb[5]:0, fb?fb[6]:0, fb?fb[7]:0);
+          fprintf(stderr, "  fault_eip=%08x xlat=%08x\n", (unsigned)feip, (unsigned)fphys);
+        }
+        prev_cr2 = sregs.cr2;
+        if (in_pm && sregs.cr3) {  /* Catch the kernel rep-movs and watch its dest frame. */
+          unsigned long gpa = pm_xlat(emu, sregs.cr3, lin);
+          const unsigned char *op = gpa != ~0UL ? (const unsigned char*)guest_ptr(emu, gpa) : NULL;
+          unsigned opc = op ? op[0] : 0;
+          if ((opc == 0xf3 || opc == 0xf2) && lin == 0x17c0c && regs.rcx <= 1 && !kframe_armed) {
+            kframe_armed = 1;  /* Kernel copy just finished. */
+            kframe_phys = pm_xlat(emu, sregs.cr3, 0x93a000);
+            { const unsigned char *kb = kframe_phys != ~0UL ? (const unsigned char*)guest_ptr(emu, kframe_phys) : NULL;
+              kframe_val = kb ? *(const unsigned long*)kb : 0xdead0000; }
+            fprintf(stderr, "KCOPY-DONE lin93a000->phys %x val %08x\n", (unsigned)kframe_phys, (unsigned)kframe_val);
+          }
+          if (kframe_armed) {  /* Report when lin 0x93a000's mapping or content changes. */
+            unsigned long dphys = pm_xlat(emu, sregs.cr3, 0x93a000);
+            const unsigned char *kb = dphys != ~0UL ? (const unsigned char*)guest_ptr(emu, dphys) : NULL;
+            unsigned long w = kb ? *(const unsigned long*)kb : 0xdead0000;
+            if (dphys != kframe_phys || w != kframe_val) {
+              fprintf(stderr, "KPTECHG eip=%x cr3=%x: lin93a000 phys %x->%x val %08x->%08x\n",
+                      (unsigned)lin, (unsigned)sregs.cr3, (unsigned)kframe_phys, (unsigned)dphys, (unsigned)kframe_val, (unsigned)w);
+              kframe_phys = dphys; kframe_val = w;
+            }
+          }
+        }
+      }
+      if (in_pm != was_in_pm) {
+        if (DEBUG || DIAG_ON(DIAG_BIT_EXEC) || getenv("KVIKDOS_TRACE_PM")) {
+          fprintf(g_diag_file, "debug: %s protected mode (cr0=%08x pg=%d) at eip=%08x cs=%04x\n",
+                  in_pm ? "enter" : "leave", (unsigned)sregs.cr0, (unsigned)((sregs.cr0 >> 31) & 1), (unsigned)regs.rip, sregs.cs.selector);
+          dump_regs("pm", &regs, &sregs);
+        }
+        if (!in_pm && pm_step && pm_ring_n) {  /* PM->RM: print last PM instructions. */
+          unsigned i = pm_ring_n, shown = 0;
+          fprintf(stderr, "pm tail @%u:\n", pm_ring_n);
+          while (i-- && !(pm_eip_ring[i & 16383] >> 63)) {  /* Skip trailing RM instrs. */
+            if (pm_ring_n - i >= 16384) goto tail_done;
+          }
+          while (shown < 80) {
+            unsigned long e = pm_eip_ring[i & 16383];
+            if (!(e >> 63)) break;
+            fprintf(stderr, "  lin=%08x cr3=%08x\n", (unsigned)(e & 0xffffffffUL), (unsigned)pm_cr3_ring[i & 16383]);
+            ++shown;
+            if (i-- == 0) break;
+          }
+         tail_done:;
+        }
+        was_in_pm = in_pm;
+      }
+    }
     if (DEBUG || DIAG_ON(DIAG_BIT_VERBOSE)) dump_regs("debug", &regs, &sregs);
+    if (getenv("KVIKDOS_TRACE_EXIT")) fprintf(stderr, "exit_reason=%d rip=%x cr0=%x cs=%x:%x lim=%x db=%d\n", run->exit_reason, (unsigned)regs.rip, (unsigned)sregs.cr0, (unsigned)sregs.cs.selector, (unsigned)sregs.cs.base, (unsigned)sregs.cs.limit, sregs.cs.db);
 
     if (run->exit_reason != KVM_EXIT_HLT) hlt_spin_count = 0;
+    if (++vid_tick >= 512) { vid_tick = 0; vid_render(mem); }  /* Periodic repaint of the guest text screen. */
     switch (run->exit_reason) {
      case KVM_EXIT_IO:
       { char *p = (char*)run + run->io.data_offset;
         if (run->io.port == 0x40 && run->io.size == 1 && run->io.direction == 0) {
           *p = port_0x40_tick++;  /* Simulate some timer ticks. */
+          trace_guest_io(run->io.port, run->io.direction, run->io.size, run->io.count, p);
+          break;
+        } else if (run->io.port == 0x92 && run->io.size == 1) {  /* PS/2 system control port: A20 gate + fast reset. */
+          trace_guest_io(run->io.port, run->io.direction, run->io.size, run->io.count, p);
+          if (run->io.direction == 0) {  /* IN: bit 1 = A20 enabled, bit 0 = fast reset. */
+            *p = (port_0x92_a20 << 1);
+          } else {  /* OUT: track A20 state; bit 0 (fast reset) ignored. */
+            port_0x92_a20 = (*p >> 1) & 1;
+          }
+          break;
+        } else if (run->io.port == 0x70 && run->io.size == 1 && run->io.direction == 1) {  /* CMOS index select. */
+          port_0x70_index = *p;
+          trace_guest_io(run->io.port, run->io.direction, run->io.size, run->io.count, p);
+          break;
+        } else if (run->io.port == 0x71 && run->io.size == 1 && run->io.direction == 0) {  /* CMOS data read. */
+          const unsigned long ext_kb = emu->xmem_size >> 10;
+          *p = 0;
+          switch (port_0x70_index & 0x7f) {
+           case 0x17: *p = ext_kb > 0xffffUL ? 0xff : (char)ext_kb; break;  /* Extended memory KB low (legacy). */
+           case 0x18: *p = ext_kb > 0xffffUL ? 0xff : (char)(ext_kb >> 8); break;  /* Extended memory KB high. */
+           case 0x30: *p = (char)(ext_kb & 0xff); break;  /* Extended memory KB low (AT). */
+           case 0x31: *p = (char)((ext_kb >> 8) & 0xff); break;  /* Extended memory KB high. */
+           case 0x00: case 0x02: case 0x04: case 0x06: case 0x07: case 0x08: case 0x09: {  /* RTC registers, BCD. */
+            time_t t = time(NULL);
+            struct tm *tm = localtime(&t);
+            if (tm) {
+              int v = port_0x70_index == 0x00 ? tm->tm_sec : port_0x70_index == 0x02 ? tm->tm_min : port_0x70_index == 0x04 ? tm->tm_hour :
+                      port_0x70_index == 0x07 ? tm->tm_mday : port_0x70_index == 0x08 ? tm->tm_mon + 1 : tm->tm_year % 100;
+              *p = (char)(((v / 10) << 4) | (v % 10));
+            }
+            break;
+           }
+           default: *p = 0; break;
+          }
+          trace_guest_io(run->io.port, run->io.direction, run->io.size, run->io.count, p);
+          break;
+        } else if (run->io.port == 0x71 && run->io.size == 1 && run->io.direction == 1) {  /* CMOS data write: ignore. */
           trace_guest_io(run->io.port, run->io.direction, run->io.size, run->io.count, p);
           break;
         } else if (!emu_params->strict_mode) {
@@ -3565,6 +4331,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
          do_stdout_write1:
           stdout_write_end = stdout_write_p + 1;
          do_stdout_write:
+          if (vid_active) {  /* Text mode: draw the console output into the framebuffer. */
+            vid_write_str(mem, stdout_write_p, stdout_write_end);
+            vid_render(mem);
+          } else {
           if (is_stdout_write_cursor) {
             const char *p = stdout_write_p;
             unsigned short *cursor = (unsigned short*)((char*)mem + 0x450) + 0 /* page */;  /* DH := row (0..24); DL := column (0..79). Both 0 by default. */
@@ -3580,6 +4350,30 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             }
           }
           (void)!write(1, stdout_write_p, stdout_write_end - stdout_write_p);
+          }
+          if (getenv("KVIKDOS_FAULT_DUMP") && !g_fault_dumped &&
+              con_tail_match(stdout_write_p, stdout_write_end - stdout_write_p)) {
+            int ffd;
+            g_fault_dumped = 1;
+            ioctl(kvm_fds.vcpu_fd, KVM_GET_REGS, &regs);
+            ioctl(kvm_fds.vcpu_fd, KVM_GET_SREGS, &sregs);
+            fprintf(stderr, "fault-dump: eip=%08x cs=%04x(b%08x,l%08x,db%d) eflags=%08x cr0=%08x cr2=%08x cr3=%08x cr4=%08x\n",
+                    (unsigned)regs.rip, sregs.cs.selector, (unsigned)sregs.cs.base, (unsigned)sregs.cs.limit, sregs.cs.db,
+                    (unsigned)regs.rflags, (unsigned)sregs.cr0, (unsigned)sregs.cr2, (unsigned)sregs.cr3, (unsigned)sregs.cr4);
+            fprintf(stderr, "fault-dump: eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x esp=%08x\n",
+                    (unsigned)regs.rax, (unsigned)regs.rbx, (unsigned)regs.rcx, (unsigned)regs.rdx,
+                    (unsigned)regs.rsi, (unsigned)regs.rdi, (unsigned)regs.rbp, (unsigned)regs.rsp);
+            fprintf(stderr, "fault-dump: ds=%04x(b%08x) es=%04x(b%08x) fs=%04x(b%08x) gs=%04x(b%08x) ss=%04x(b%08x) idt=%08x.%x\n",
+                    sregs.ds.selector, (unsigned)sregs.ds.base, sregs.es.selector, (unsigned)sregs.es.base,
+                    sregs.fs.selector, (unsigned)sregs.fs.base, sregs.gs.selector, (unsigned)sregs.gs.base,
+                    sregs.ss.selector, (unsigned)sregs.ss.base, (unsigned)sregs.idt.base, (unsigned)sregs.idt.limit);
+            fprintf(stderr, "fault-dump: xlat(cr2)=%08x xlat(eip)=%08x\n",
+                    (unsigned)pm_xlat(emu, sregs.cr3, sregs.cr2), (unsigned)pm_xlat(emu, sregs.cr3, (unsigned)regs.rip));
+            ffd = open("/tmp/fault-lowmem.bin", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (ffd >= 0) { (void)!write(ffd, mem, GUEST_MEM_LIMIT); close(ffd); }
+            if (emu->xmem) { ffd = open("/tmp/fault-xmem.bin", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+              if (ffd >= 0) { (void)!write(ffd, emu->xmem, emu->xmem_size); close(ffd); } }
+          }
         } else if (int_num == 0x20) {
           *(unsigned char*)&regs.rax = 0;  /* EXIT_SUCCESS. */
           goto do_exit;
@@ -3590,6 +4384,41 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           if (ah == 0x4c) {  /* Exit to DOS. */
             if (cleanup_fn[0] != '\0') unlink(get_linux_filename(cleanup_fn));
            do_exit:
+            if (vid_active) vid_render(mem);  /* Flush the final frame before the screen is torn down. */
+            if (getenv("KVIKDOS_TRACE_PM") != NULL &&
+                (last_cr2 || last_cr3 || saw_paging || was_in_pm))
+              fprintf(g_diag_file, "debug: exit: pm_state cr2=%08x cr3=%08x pg=%d eip=%08x cs=%04x\n",
+                      (unsigned)last_cr2, (unsigned)last_cr3, saw_paging, (unsigned)regs.rip, sregs.cs.selector);
+            if (pm_step && pm_ring_n) {
+              /* Find the start of the final PM run (last RM->PM boundary), then
+               * print it forward chronologically to see where it entered zeros. */
+              unsigned i = pm_ring_n, start;
+              while (i && (pm_eip_ring[(i - 1) & 16383] >> 63)) --i;  /* back over PM */
+              start = i;
+              /* If the whole ring is PM, the slide filled it; the run began earlier. */
+              fprintf(stderr, "pm-eip tail (%u steps, run_start=%u):\n", pm_ring_n, start);
+              i = start;
+              while (i < pm_ring_n && i - start < 4200) {
+                unsigned long e = pm_eip_ring[i & 16383];
+                fprintf(stderr, "  %c lin=%08x cr3=%08x\n", (e >> 63) ? 'P' : 'r', (unsigned)(e & 0x7fffffffffffffffUL), (unsigned)pm_cr3_ring[i & 16383]);
+                ++i;
+              }
+            }
+            if (last_cr3 && getenv("KVIKDOS_TRACE_PM") != NULL) {  /* Report the guest's final page-table coverage. */
+              const unsigned *pd = (const unsigned*)guest_ptr(emu, last_cr3 & ~0xfffUL);
+              unsigned npde = 0, npte = 0, first_np = ~0u, last_np = 0, i;
+              if (pd) {
+                for (i = 0; i < 1024; ++i) if (pd[i] & 1) {
+                  const unsigned *pt = (const unsigned*)guest_ptr(emu, pd[i] & ~0xfffUL);
+                  unsigned j;
+                  ++npde;
+                  if (pt) for (j = 0; j < 1024; ++j) if (pt[j] & 1) { ++npte; if (first_np == ~0u) first_np = (i << 22) | (j << 12); last_np = (i << 22) | (j << 12); }
+                }
+                fprintf(stderr, "ptab: pde=%u pte=%u first=%08x last=%08x xlat(10fff)=%08x xlat(93b000)=%08x xlat(13000)=%08x\n",
+                        npde, npte, first_np, last_np,
+                        (unsigned)pm_xlat(emu, last_cr3, 0x10fff), (unsigned)pm_xlat(emu, last_cr3, 0x93b000), (unsigned)pm_xlat(emu, last_cr3, 0x13000));
+              }
+            }
             if (find_dirp) { closedir(find_dirp); find_dirp = NULL; }
             if (g_exit_regs) {
               fprintf(stderr, "info: exit regs cs=%04x ds=%04x es=%04x ss=%04x ip=%04x sp=%04x ax=%04x\n",
@@ -3597,6 +4426,10 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                       (unsigned short)regs.rip, (unsigned short)regs.rsp, (unsigned short)regs.rax);
             }
             maybe_dump_guest_mem(mem, GUEST_MEM_LIMIT);
+            if (getenv("KVIKDOS_XMEM_DUMP") && emu->xmem) {
+              int xfd = open(getenv("KVIKDOS_XMEM_DUMP"), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+              if (xfd >= 0) { (void)!write(xfd, emu->xmem, emu->xmem_size); close(xfd); }
+            }
             return (unsigned char)regs.rax;
           } else if (ah == 0x06) {  /* Direct console I/O. */
            func_0x06:
@@ -3621,6 +4454,17 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             process_key(tty_state, 0, &result_ax, (unsigned short*)&regs.rflags);  /* Read. */
             *(unsigned char*)&regs.rax = (unsigned char)result_ax;  /* Return only the keycode. */
           } else if (ah == 0x02) {  /* Display output. */
+            if (getenv("KVIKDOS_TRACE_ERR") && (unsigned char)regs.rdx == 'E' && !err_dumped) {
+              unsigned char *m = (unsigned char*)mem;
+              unsigned sb = ((unsigned)sregs.ss.selector << 4) + (*(unsigned short*)&regs.rsp);
+              int k;
+              err_dumped = 1;
+              fprintf(g_diag_file, "  ERR-PRINT ctx: caller cs:%04x ip:%04x ss:%04x sp:%04x\n",
+                  int_cs, int_ip, sregs.ss.selector, (unsigned short)regs.rsp);
+              fprintf(g_diag_file, "  stack words:");
+              for (k = 0; k < 96; k += 2) fprintf(g_diag_file, " %04x", (unsigned)(m[(sb + k) & 0x1fffff] | (m[(sb + k + 1) & 0x1fffff] << 8)));
+              fprintf(g_diag_file, "\n");
+            }
             stdout_write_p = (const char*)&regs.rdx;
             goto do_stdout_write1;
           } else if (ah == 0x04) {  /* Output to STDAUX. */
@@ -3667,6 +4511,29 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 }
               } else {
                 got = write(fd, p, size);
+                if (got >= 0 && getenv("KVIKDOS_FAULT_DUMP") && !g_fault_dumped &&
+                    con_tail_match(p, got)) {
+                  int ffd;
+                  g_fault_dumped = 1;
+                  ioctl(kvm_fds.vcpu_fd, KVM_GET_REGS, &regs);
+                  ioctl(kvm_fds.vcpu_fd, KVM_GET_SREGS, &sregs);
+                  fprintf(stderr, "fault-dump: eip=%08x cs=%04x(b%08x,l%08x,db%d) eflags=%08x cr0=%08x cr2=%08x cr3=%08x cr4=%08x\n",
+                          (unsigned)regs.rip, sregs.cs.selector, (unsigned)sregs.cs.base, (unsigned)sregs.cs.limit, sregs.cs.db,
+                          (unsigned)regs.rflags, (unsigned)sregs.cr0, (unsigned)sregs.cr2, (unsigned)sregs.cr3, (unsigned)sregs.cr4);
+                  fprintf(stderr, "fault-dump: eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x esp=%08x\n",
+                          (unsigned)regs.rax, (unsigned)regs.rbx, (unsigned)regs.rcx, (unsigned)regs.rdx,
+                          (unsigned)regs.rsi, (unsigned)regs.rdi, (unsigned)regs.rbp, (unsigned)regs.rsp);
+                  fprintf(stderr, "fault-dump: ds=%04x(b%08x) es=%04x(b%08x) fs=%04x(b%08x) gs=%04x(b%08x) ss=%04x(b%08x) idt=%08x.%x\n",
+                          sregs.ds.selector, (unsigned)sregs.ds.base, sregs.es.selector, (unsigned)sregs.es.base,
+                          sregs.fs.selector, (unsigned)sregs.fs.base, sregs.gs.selector, (unsigned)sregs.gs.base,
+                          sregs.ss.selector, (unsigned)sregs.ss.base, (unsigned)sregs.idt.base, (unsigned)sregs.idt.limit);
+                  fprintf(stderr, "fault-dump: xlat(cr2)=%08x xlat(eip)=%08x\n",
+                          (unsigned)pm_xlat(emu, sregs.cr3, sregs.cr2), (unsigned)pm_xlat(emu, sregs.cr3, (unsigned)regs.rip));
+                  ffd = open("/tmp/fault-lowmem.bin", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                  if (ffd >= 0) { (void)!write(ffd, mem, GUEST_MEM_LIMIT); close(ffd); }
+                  if (emu->xmem) { ffd = open("/tmp/fault-xmem.bin", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                    if (ffd >= 0) { (void)!write(ffd, emu->xmem, emu->xmem_size); close(ffd); } }
+                }
                 if (got < 0) { write_fault:  /* errno may not be valid now, fstat(2) after lseek(3) failure may have reset it. */
                   *(unsigned short*)&regs.rax = 0x1d;  /* Write fault. */
                   goto error_on_21;
@@ -3684,6 +4551,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               char *p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
               const int size = (int)*(unsigned short*)&regs.rcx;
               const int got = read(fd, p, size);
+              if (getenv("KVIKDOS_TRACE_READ")) fprintf(stderr, "read: h=%u off=%ld size=%d got=%d dst=%05x\n", *(unsigned short*)&regs.rbx, (long)lseek(fd,0,SEEK_CUR)-got, size, got, (unsigned)(((unsigned)sregs.ds.selector<<4)+(*(unsigned short*)&regs.rdx)));
               if (got < 0) {
                 *(unsigned short*)&regs.rax = 0x1e;  /* Read fault. */
                 goto error_on_21;
@@ -3719,6 +4587,17 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned short*)&regs.rcx = tm->tm_year + 1900;
             *(unsigned short*)&regs.rdx = (tm->tm_mon + 1) << 8 | tm->tm_mday;
             tasm30_bitset |= 0x20;
+          } else if (ah == 0x2b) {  /* Set date. We don't set the host clock, just validate. */
+            /* CX=year, DH=month, DL=day. AL=0 on success, 0xff on invalid.
+             * This doubles as the DESQview presence probe (AX=2b01, CX='DE',
+             * DX='SQ'): reporting 0xff means "not DESQview", which extenders
+             * (e.g. Phar Lap) need to see.
+             */
+            const unsigned y = *(unsigned short*)&regs.rcx, mo = ((unsigned char*)&regs.rdx)[1], d = *(unsigned char*)&regs.rdx;
+            *(unsigned char*)&regs.rax = (y >= 1980 && y <= 2099 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31) ? 0 : 0xff;
+          } else if (ah == 0x2d) {  /* Set time. We don't set the host clock, just validate. */
+            const unsigned h = ((unsigned char*)&regs.rcx)[1], mi = *(unsigned char*)&regs.rcx, s = ((unsigned char*)&regs.rdx)[1];
+            *(unsigned char*)&regs.rax = (h < 24 && mi < 60 && s < 60) ? 0 : 0xff;
           } else if (ah == 0x19) {  /* Get current drive. */
             *(unsigned char*)&regs.rax = dir_state->drive - 'A';
           } else if (ah == 0x47) {  /* Get current directory. */
@@ -4007,6 +4886,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               int got;
               if (whence > 2) goto error_invalid_parameter;
               got = lseek(fd, offset, whence);
+              if (getenv("KVIKDOS_TRACE_READ")) fprintf(stderr, "seek: h=%u off=%x whence=%u -> %d\n", *(unsigned short*)&regs.rbx, offset, whence, got);
               if (got < 0) {
                 *(unsigned short*)&regs.rax = 0x19;  /* Seek error. (Is this the relevant code?) */
                 goto error_on_21;
@@ -4400,6 +5280,313 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               if (DEBUG || DIAG_ON(DIAG_BIT_COMPAT)) fprintf(g_diag_file, "debug: unsupported switch-character subcall: al=%02x\n", al);
               goto nonfatal_unknown_int_21_call;
             }
+          } else if (ah == 0x36) {  /* Get disk free space. */
+            /* Borrowed from ntvdm: report believable constants for lots of free space. */
+            const unsigned dl = *(unsigned char*)&regs.rdx;
+            const unsigned drv = dl ? dl - 1 : (unsigned)(dir_state->drive - 'A');
+            if (drv >= DRIVE_COUNT || !dir_state->linux_mount_dir[drv]) {
+              *(unsigned short*)&regs.rax = 0xffff;  /* Invalid drive. */
+            } else {
+              *(unsigned short*)&regs.rax = 8;       /* Sectors per cluster. */
+              *(unsigned short*)&regs.rbx = 0x6fff;  /* Available clusters: ~224 MiB free. */
+              *(unsigned short*)&regs.rcx = 512;     /* Bytes per sector. */
+              *(unsigned short*)&regs.rdx = 0x7fff;  /* Total clusters: ~256 MiB. */
+            }
+          } else if (ah == 0x3b) {  /* Change current directory (chdir). */
+            const char * const p = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
+            char abs_path[DOS_PATH_SIZE + 4];
+            struct stat st;
+            if (*(const unsigned char*)p == 0x1a) {  /* Turbo Prolog 1.1 sends ^Z as drive letter. */
+              *(unsigned short*)&regs.rax = 3;  /* Path not found. */
+              goto error_on_21;
+            }
+            dos_normalize_abspath(p, dir_state, abs_path, sizeof(abs_path));
+            if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: chdir normalized (%s) -> (%s)\n", p, abs_path);
+            if (abs_path[0] == '\0') {
+              *(unsigned short*)&regs.rax = 3;  /* Path not found. */
+              goto error_on_21;
+            }
+            {
+              const char * const linux_dir = get_linux_filename_r(abs_path, dir_state, fnbuf, NULL);
+              if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: chdir linux_dir (%s)\n", linux_dir);
+              if (abs_path[3] == '\0') {  /* Drive root "D:\". */
+                if (!dir_state->linux_mount_dir[abs_path[0] - 'A']) {
+                  *(unsigned short*)&regs.rax = 3;  /* Path not found. */
+                  goto error_on_21;
+                }
+              } else if (*linux_dir == '\0' || stat(linux_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                *(unsigned short*)&regs.rax = 3;  /* Path not found. */
+                goto error_on_21;
+              }
+            }
+            /* abs_path is "D:\" or "D:\A\B"; current_dir[] stores "A\B\" or "". */
+            {
+              const char *s = abs_path + 3;
+              char *t = dir_state->current_dir[abs_path[0] - 'A'];
+              char * const tend = t + sizeof(dir_state->current_dir[0]) - 1;
+              while (*s && t < tend) *t++ = *s++;
+              if (t != dir_state->current_dir[abs_path[0] - 'A'] && t < tend && t[-1] != '\\') *t++ = '\\';
+              *t = '\0';
+            }
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x55) {  /* Create new PSP (undocumented DOS 2.x+). */
+            /* Borrowed from ntvdm: DX is the caller-provided segment for the new
+             * PSP, SI is the value for the top-of-memory field. The new PSP
+             * becomes the current process. Used by Turbo Pascal 5.5. */
+            const unsigned new_psp_para = *(unsigned short*)&regs.rdx;
+            char * const psp = (char*)mem + (new_psp_para << 4);
+            if (!is_linear_byte_user_writable(new_psp_para << 4) || !is_linear_byte_user_writable((new_psp_para << 4) + 0xff)) goto error_invalid_parameter;
+            memcpy(psp, (const char*)mem + (current_psp_para << 4), 0x100);  /* Inherit JFT and vectors. */
+            *(unsigned short*)(psp + 0) = 0x20cd;  /* `int 0x20' opcode. */
+            *(unsigned short*)(psp + 2) = *(unsigned short*)&regs.rsi;  /* Top of memory. */
+            *(unsigned*)(psp + 0x0a) = *(unsigned*)((char*)mem + (0x22 << 2));  /* int 0x22 vector copy. */
+            *(unsigned*)(psp + 0x0e) = *(unsigned*)((char*)mem + (0x23 << 2));  /* int 0x23 vector copy. */
+            *(unsigned*)(psp + 0x12) = *(unsigned*)((char*)mem + (0x24 << 2));  /* int 0x24 vector copy. */
+            *(unsigned short*)(psp + 0x16) = (unsigned short)current_psp_para;  /* Parent PSP. */
+            *(unsigned short*)(psp + 6) = 0xffff;  /* .COM bytes available in segment. */
+            current_psp_para = new_psp_para;
+          } else if (ah == 0x65) {  /* Get extended country information (DOS 3.3+). */
+            const unsigned char al = (unsigned char)regs.rax;
+            char * const p = (char*)mem + ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rdi);  /* !! Security: check bounds. */
+            if (al == 1) {  /* General country info. */
+              p[0] = 1;  /* Info ID. */
+              *(unsigned short*)(p + 1) = 0x26;  /* Buffer size. */
+              *(unsigned short*)(p + 3) = 1;     /* Country: USA. */
+              *(unsigned short*)(p + 5) = 437;   /* Code page. */
+              memcpy(p + 7, &country_info, 0x18);
+              *(unsigned short*)&regs.rcx = 7 + 0x18;  /* Bytes written. */
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            } else if (al == 2) {  /* Uppercase table. */
+              unsigned i;
+              p[0] = 2;  /* Info ID. */
+              *(unsigned short*)(p + 1) = 32;  /* Table size. */
+              for (i = 0; i < 32; ++i) p[3 + i] = (char)(0x80 + i);  /* Identity. */
+              p[3 + 0x01] = (char)0x9a;  /* ü -> Ü */
+              p[3 + 0x04] = (char)0x8e;  /* ä -> Ä */
+              p[3 + 0x06] = (char)0x8f;  /* å -> Å */
+              p[3 + 0x07] = (char)0x80;  /* ç -> Ç */
+              p[3 + 0x0e] = (char)0x92;  /* æ -> Æ */
+              p[3 + 0x14] = (char)0x99;  /* ö -> Ö */
+              p[3 + 0x1b] = (char)0x9a;  /* ü -> Ü */
+              *(unsigned short*)&regs.rcx = 3 + 32;
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            } else {
+              *(unsigned short*)&regs.rax = 2;  /* File not found (bad info id). */
+              goto error_on_21;
+            }
+          } else if (ah == 0x68 || ah == 0x6a) {  /* Commit file (fflush). 0x6a is a DOS 4.x alias. */
+            const int fd = get_linux_fd(*(unsigned short*)&regs.rbx, &kvm_fds);
+            if (fd < 0) goto error_invalid_handle;
+            if (fsync(fd) != 0 && errno != EINVAL) goto error_from_linux;  /* EINVAL: not a regular file (e.g. tty). */
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x0f || ah == 0x16) {  /* Open (0x0f) / create (0x16) file via FCB. */
+            /* Borrowed from ntvdm. FCB layout: 0:drive 1:8:name 9:3:ext 0xc:u16 curBlock
+             * 0xe:u16 recSize 0x10:u32 fileSize 0x14:u16 date 0x16:u16 time
+             * 0x20:u8 curRecord 0x21:u32 recNumber (low 3 bytes if recSize >= 64). */
+            const unsigned fcb_lin = ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);
+            char * const fcb = (char*)mem + fcb_lin;
+            char fcbname[16];
+            int fd = -1;
+            unsigned fi;
+            struct stat st;
+            *(unsigned char*)&regs.rax = 0xff;  /* Failure. */
+            if (is_linear_byte_user_writable(fcb_lin) && is_linear_byte_user_writable(fcb_lin + 0x24)) {
+              fcb_filename(fcb, dir_state->drive, fcbname, sizeof(fcbname));
+              /* Close it if already open at this FCB address. */
+              for (fi = 0; fi < FCB_FILE_COUNT; ++fi) {
+                if (fcb_lin_table[fi] == fcb_lin) { close(fcb_fd_table[fi]); fcb_lin_table[fi] = 0; fcb_fd_table[fi] = -1; break; }
+              }
+              fd = open(get_linux_filename(fcbname), ah == 0x16 ? (O_RDWR | O_CREAT | O_TRUNC) : O_RDWR, 0644);
+              if (fd < 0 && ah == 0x0f) fd = open(get_linux_filename(fcbname), O_RDONLY);
+              if (fd >= 0) {
+                for (fi = 0; fi < FCB_FILE_COUNT; ++fi) if (!fcb_lin_table[fi]) break;
+                if (fi == FCB_FILE_COUNT) { close(fd); goto fcb_done; }
+                fcb_lin_table[fi] = fcb_lin;
+                fcb_fd_table[fi] = fd;
+                if (!fcb[0]) fcb[0] = dir_state->drive - 'A' + 1;
+                *(unsigned short*)(fcb + 0x0c) = 0;     /* curBlock. */
+                *(unsigned short*)(fcb + 0x0e) = 0x80;  /* recSize = 128. */
+                if (fstat(fd, &st) == 0) {
+                  struct tm *tm = localtime(&st.st_mtime);
+                  *(unsigned*)(fcb + 0x10) = (unsigned)st.st_size;
+                  *(unsigned short*)(fcb + 0x14) = dos_fat_date(tm);
+                  *(unsigned short*)(fcb + 0x16) = dos_fat_time(tm);
+                } else {
+                  *(unsigned*)(fcb + 0x10) = 0;
+                  *(unsigned short*)(fcb + 0x14) = *(unsigned short*)(fcb + 0x16) = 0;
+                }
+                fcb[0x20] = 0;  /* curRecord. */
+                /* recNumber deliberately not initialized: sequential-only apps may
+                 * not allocate the full FCB (ntvdm comment, PLI.EXE). */
+                *(unsigned char*)&regs.rax = 0;  /* Success. */
+              }
+            }
+           fcb_done:;
+          } else if (ah == 0x10 || ah == 0x13) {  /* Close (0x10) / delete (0x13) file via FCB. */
+            const unsigned fcb_lin = ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);
+            const char * const fcb = (const char*)mem + fcb_lin;
+            unsigned fi;
+            *(unsigned char*)&regs.rax = 0xff;  /* Failure. */
+            for (fi = 0; fi < FCB_FILE_COUNT; ++fi) {
+              if (fcb_lin_table[fi] == fcb_lin) { close(fcb_fd_table[fi]); fcb_lin_table[fi] = 0; fcb_fd_table[fi] = -1; *(unsigned char*)&regs.rax = 0; break; }
+            }
+            if (ah == 0x10) {
+              /* AL already reflects whether the FCB was found open. */
+            } else {  /* 0x13 delete: remove the file too. */
+              char fcbname[16];
+              fcb_filename(fcb, dir_state->drive, fcbname, sizeof(fcbname));
+              *(unsigned char*)&regs.rax = unlink(get_linux_filename(fcbname)) == 0 ? 0 : 0xff;
+            }
+          } else if (ah == 0x17) {  /* Rename file via FCB. */
+            const unsigned fcb_lin = ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);
+            const char * const fcb = (const char*)mem + fcb_lin;
+            char oldname[16], newname[16];
+            *(unsigned char*)&regs.rax = 0xff;
+            if (is_linear_byte_user_writable(fcb_lin) && is_linear_byte_user_writable(fcb_lin + 0x1c)) {
+              fcb_filename(fcb, dir_state->drive, oldname, sizeof(oldname));
+              fcb_filename(fcb + 0x10, dir_state->drive, newname, sizeof(newname));  /* New name at FCB+0x11; drive at +0x10. */
+              newname[0] = oldname[0];  /* Rename stays on the same drive. */
+              if (rename(get_linux_filename(oldname), get_linux_filename_r(newname, dir_state, fnbuf2, NULL)) == 0) *(unsigned char*)&regs.rax = 0;
+            }
+          } else if (ah == 0x14 || ah == 0x15) {  /* Sequential read (0x14) / write (0x15) via FCB. */
+            const unsigned fcb_lin = ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);
+            char * const fcb = (char*)mem + fcb_lin;
+            const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
+            unsigned fi;
+            int fd = -1;
+            *(unsigned char*)&regs.rax = 1;  /* EOF / error. */
+            for (fi = 0; fi < FCB_FILE_COUNT; ++fi) if (fcb_lin_table[fi] == fcb_lin) { fd = fcb_fd_table[fi]; break; }
+            if (fd >= 0) {
+              const unsigned recsize = *(unsigned short*)(fcb + 0x0e) ? *(unsigned short*)(fcb + 0x0e) : 0x80;
+              unsigned long seq_rec = ((unsigned long)*(unsigned short*)(fcb + 0x0c) << 7) + *(unsigned char*)(fcb + 0x20);
+              const unsigned long fpos = seq_rec * recsize;
+              if (ah == 0x14) {  /* Read. */
+                memset((char*)mem + dta_linear, 0, recsize);
+                if (lseek(fd, (off_t)fpos, SEEK_SET) >= 0) {
+                  const int got = read(fd, (char*)mem + dta_linear, recsize);
+                  if (got > 0) {
+                    ++seq_rec;
+                    *(unsigned short*)(fcb + 0x0c) = (unsigned short)(seq_rec >> 7);
+                    fcb[0x20] = (char)(seq_rec & 0x7f);
+                    *(unsigned char*)&regs.rax = got == (int)recsize ? 0 : 3;
+                  }
+                }
+              } else {  /* Write. */
+                if (lseek(fd, (off_t)fpos, SEEK_SET) >= 0) {
+                  const int got = write(fd, (const char*)mem + dta_linear, recsize);
+                  if (got == (int)recsize) {
+                    ++seq_rec;
+                    *(unsigned short*)(fcb + 0x0c) = (unsigned short)(seq_rec >> 7);
+                    fcb[0x20] = (char)(seq_rec & 0x7f);
+                    *(unsigned char*)&regs.rax = 0;
+                  } else if (got >= 0) {
+                    *(unsigned char*)&regs.rax = 1;  /* Disk full (partial write). */
+                  }
+                }
+              }
+            }
+          } else if (ah == 0x21 || ah == 0x22) {  /* Random read (0x21) / write (0x22) via FCB. */
+            const unsigned fcb_lin = ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);
+            char * const fcb = (char*)mem + fcb_lin;
+            const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
+            unsigned fi;
+            int fd = -1;
+            *(unsigned char*)&regs.rax = 1;
+            for (fi = 0; fi < FCB_FILE_COUNT; ++fi) if (fcb_lin_table[fi] == fcb_lin) { fd = fcb_fd_table[fi]; break; }
+            if (fd >= 0) {
+              const unsigned recsize = *(unsigned short*)(fcb + 0x0e) ? *(unsigned short*)(fcb + 0x0e) : 0x80;
+              const unsigned long recnum = recsize >= 64 ? (*(unsigned*)(fcb + 0x21) & 0xffffff) : *(unsigned*)(fcb + 0x21);
+              const unsigned long fpos = recnum * recsize;
+              /* Set sequential position from random (Digital Research PL/I depends on this). */
+              *(unsigned short*)(fcb + 0x0c) = (unsigned short)(recnum >> 7);
+              fcb[0x20] = (char)(recnum & 0x7f);
+              if (ah == 0x21) {  /* Read. */
+                memset((char*)mem + dta_linear, 0, recsize);
+                if (lseek(fd, (off_t)fpos, SEEK_SET) >= 0) {
+                  const int got = read(fd, (char*)mem + dta_linear, recsize);
+                  if (got > 0) *(unsigned char*)&regs.rax = got == (int)recsize ? 0 : 3;
+                }
+              } else {  /* Write. */
+                if (lseek(fd, (off_t)fpos, SEEK_SET) >= 0) {
+                  const int got = write(fd, (const char*)mem + dta_linear, recsize);
+                  if (got == (int)recsize) *(unsigned char*)&regs.rax = 0;
+                  else if (got >= 0) *(unsigned char*)&regs.rax = 1;  /* Disk full. */
+                }
+              }
+            }
+          } else if (ah == 0x23) {  /* Get file size via FCB. */
+            const unsigned fcb_lin = ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);
+            char * const fcb = (char*)mem + fcb_lin;
+            char fcbname[16];
+            struct stat st;
+            *(unsigned char*)&regs.rax = 0xff;
+            if (is_linear_byte_user_writable(fcb_lin) && is_linear_byte_user_writable(fcb_lin + 0x24)) {
+              fcb_filename(fcb, dir_state->drive, fcbname, sizeof(fcbname));
+              if (stat(get_linux_filename(fcbname), &st) == 0) {
+                const unsigned recsize = *(unsigned short*)(fcb + 0x0e) ? *(unsigned short*)(fcb + 0x0e) : 0x80;
+                const unsigned long nrec = ((unsigned long)st.st_size + recsize - 1) / recsize;
+                if (recsize >= 64) *(unsigned*)(fcb + 0x21) = (*(unsigned*)(fcb + 0x21) & 0xff000000U) | (nrec & 0xffffff);
+                else *(unsigned*)(fcb + 0x21) = nrec;
+                *(unsigned*)(fcb + 0x10) = (unsigned)st.st_size;
+                *(unsigned char*)&regs.rax = 0;
+              }
+            }
+          } else if (ah == 0x24) {  /* Set random record field from sequential position. */
+            const unsigned fcb_lin = ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);
+            char * const fcb = (char*)mem + fcb_lin;
+            if (is_linear_byte_user_writable(fcb_lin) && is_linear_byte_user_writable(fcb_lin + 0x24)) {
+              const unsigned recsize = *(unsigned short*)(fcb + 0x0e);
+              if (recsize) {
+                const unsigned long seq_rec = ((unsigned long)*(unsigned short*)(fcb + 0x0c) << 7) + *(unsigned char*)(fcb + 0x20);
+                const unsigned long recnum = seq_rec;
+                if (recsize >= 64) *(unsigned*)(fcb + 0x21) = (*(unsigned*)(fcb + 0x21) & 0xff000000U) | (recnum & 0xffffff);
+                else *(unsigned*)(fcb + 0x21) = recnum;
+              }
+            }
+          } else if (ah == 0x27 || ah == 0x28) {  /* Random block read (0x27) / write (0x28) via FCB. */
+            const unsigned fcb_lin = ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);
+            char * const fcb = (char*)mem + fcb_lin;
+            const unsigned dta_linear = (dta_seg_ofs & 0xffff) + (dta_seg_ofs >> 16 << 4);
+            unsigned nrec_req = *(unsigned short*)&regs.rcx;
+            unsigned fi;
+            int fd = -1;
+            *(unsigned short*)&regs.rcx = 0;
+            *(unsigned char*)&regs.rax = 1;
+            for (fi = 0; fi < FCB_FILE_COUNT; ++fi) if (fcb_lin_table[fi] == fcb_lin) { fd = fcb_fd_table[fi]; break; }
+            if (fd >= 0 && nrec_req) {
+              const unsigned recsize = *(unsigned short*)(fcb + 0x0e) ? *(unsigned short*)(fcb + 0x0e) : 0x80;
+              const unsigned long recnum = recsize >= 64 ? (*(unsigned*)(fcb + 0x21) & 0xffffff) : *(unsigned*)(fcb + 0x21);
+              const unsigned long fpos = recnum * recsize;
+              unsigned long done_bytes = 0;
+              if (lseek(fd, (off_t)fpos, SEEK_SET) >= 0) {
+                const unsigned long want = (unsigned long)nrec_req * recsize;
+                if (ah == 0x27) {  /* Block read: fill partial record area with ^Z like CP/M. */
+                  memset((char*)mem + dta_linear, 0x1a, want < 0x8000 ? (unsigned)want : 0x8000);
+                  { const int got = read(fd, (char*)mem + dta_linear, want < 0x8000 ? (unsigned)want : 0x8000);
+                    if (got > 0) done_bytes = (unsigned long)got; }
+                } else {  /* Block write. */
+                  unsigned long remain = want;
+                  while (remain) {
+                    const int chunk = remain > 0x8000 ? 0x8000 : (int)remain;
+                    const int got = write(fd, (const char*)mem + dta_linear + done_bytes, chunk);
+                    if (got <= 0) break;
+                    done_bytes += got;
+                    remain -= got;
+                  }
+                }
+              }
+              { const unsigned nrec_done = (unsigned)((done_bytes + recsize - 1) / recsize);
+                const unsigned long newrec = recnum + nrec_done;
+                *(unsigned short*)&regs.rcx = (unsigned short)nrec_done;
+                if (recsize >= 64) *(unsigned*)(fcb + 0x21) = (*(unsigned*)(fcb + 0x21) & 0xff000000U) | (newrec & 0xffffff);
+                else *(unsigned*)(fcb + 0x21) = newrec;
+                *(unsigned short*)(fcb + 0x0c) = (unsigned short)(newrec >> 7);
+                fcb[0x20] = (char)(newrec & 0x7f);
+                if (done_bytes) *(unsigned char*)&regs.rax = done_bytes == (unsigned long)nrec_req * recsize ? 0 : (ah == 0x27 ? 3 : 1);
+              }
+            } else if (nrec_req == 0) {
+              *(unsigned char*)&regs.rax = 0;  /* Writing/reading 0 records succeeds. */
+            }
           } else if (ah == 0x4e) {  /* Find first matching file (findfirst). */
             const unsigned short attrs = *(unsigned short*)&regs.rcx;
             const char * const pattern = (char*)mem + ((unsigned)sregs.ds.selector << 4) + (*(unsigned short*)&regs.rdx);  /* !! Security: check bounds. */
@@ -4503,7 +5690,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
              done_findnext2:;
             }
           } else if (ah == 0x51 || ah == 0x62) {  /* Get process ID (PSP) (0x51). Get PSP (0x62). */
-            *(unsigned short*)&regs.rbx = PSP_PARA;
+            *(unsigned short*)&regs.rbx = (unsigned short)current_psp_para;
           } else if (ah == 0x59) {  /* Get extended error information. */
             *(unsigned short*)&regs.rax = last_dos_error_code;
             if (last_dos_error_code == 0)  {  /* No error. */
@@ -4859,7 +6046,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
                 const int got = read(0, q, 1);  /* STDIN_FILENO. */
                 char c;
                 if (got <= 0) break;
-                if ((c = *q) == '\n') {
+                if ((c = *q) == '\n' || c == '\r') {  /* '\n' in cooked mode, '\r' in raw text mode. */
                   *q++ = '\r'; break;
                 } else if (c == '\0') {
                   *q = '\1';  /* Never report control keys: '\0' + another character. */
@@ -4939,6 +6126,76 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
           }
         } else if (int_num == 0x10) {  /* Video output. */
+          if (ah == 0x00 && !vid_active) {  /* Set video mode; a text mode starts the renderer. */
+            const unsigned char mode = (unsigned char)regs.rax;
+            if (mode <= 3 || mode == 7) {  /* 40x25 or 80x25 text modes. */
+              ((unsigned char*)mem)[0x449] = mode;  /* BDA current video mode. */
+              vid_enter();
+              vid_fill(mem, 0, 0, VID_ROWS - 1, VID_COLS - 1, ' ', 7);  /* Clear screen. */
+              *(unsigned short*)((char*)mem + 0x450) = 0;  /* Cursor to 0,0. */
+              *(unsigned short*)((char*)mem + 0x460) = 0x0607;  /* Default DOS underline cursor shape. */
+              vid_wrap_pend = 0;
+              vid_render(mem);
+              goto done_int_call;
+            }
+          }
+          if (vid_active) {  /* Text mode: operate directly on the framebuffer. */
+            unsigned short * const cur = (unsigned short*)((char*)mem + 0x450);  /* BDA cursor, page 0. */
+            unsigned char * const vram = (unsigned char*)mem + VID_BASE;
+            if (ah == 0x02) {  /* Set cursor position. */
+              if (((unsigned char*)&regs.rbx)[1] == 0) *cur = *(unsigned short*)&regs.rdx;
+            } else if (ah == 0x03) {  /* Read cursor position and size. */
+              *(unsigned short*)&regs.rcx = *(unsigned short*)((char*)mem + 0x460);
+              *(unsigned short*)&regs.rdx = *cur;
+            } else if (ah == 0x01) {  /* Set cursor shape. */
+              *(unsigned short*)((char*)mem + 0x460) = *(unsigned short*)&regs.rcx;
+            } else if (ah == 0x08) {  /* Read character and attribute at cursor. */
+              const unsigned char curcol = (*cur & 0xff) < VID_COLS ? (*cur & 0xff) : (VID_COLS - 1);
+              const unsigned cell = (((*cur >> 8) & 0xff) * VID_COLS + curcol) << 1;
+              *(unsigned short*)&regs.rax = (vram[cell + 1] << 8) | vram[cell];
+            } else if (ah == 0x09 || ah == 0x0a) {  /* Write character(+attribute) at cursor, CX times. */
+              unsigned n = *(unsigned short*)&regs.rcx;
+              const unsigned char curcol = (*cur & 0xff) < VID_COLS ? (*cur & 0xff) : (VID_COLS - 1);
+              unsigned cell = (((*cur >> 8) & 0xff) * VID_COLS + curcol) << 1;
+              const unsigned char at8 = (unsigned char)regs.rbx;
+              while (n-- && cell < VID_BUFSZ) {
+                vram[cell] = (unsigned char)regs.rax;
+                if (ah == 0x09) vram[cell + 1] = at8;
+                cell += 2;
+              }
+            } else if (ah == 0x06) {  /* Scroll window up / clear. */
+              vid_scroll(mem, (unsigned char)regs.rax, (unsigned char)(regs.rbx >> 8), *(unsigned short*)&regs.rcx, *(unsigned short*)&regs.rdx, 0);
+            } else if (ah == 0x07) {  /* Scroll window down. */
+              vid_scroll(mem, (unsigned char)regs.rax, (unsigned char)(regs.rbx >> 8), *(unsigned short*)&regs.rcx, *(unsigned short*)&regs.rdx, 1);
+            } else if (ah == 0x0e) {  /* Teletype output. */
+              vid_putc(mem, (unsigned char)regs.rax);
+            } else if (ah == 0x13) {  /* Write string ES:BP at row DH, column DL. */
+              const unsigned char *str = (const unsigned char*)mem + (((unsigned)sregs.es.selector) << 4) + (*(unsigned short*)&regs.rbp);
+              unsigned n = *(unsigned short*)&regs.rcx, i;
+              const unsigned char strcol = ((unsigned char)regs.rdx) < VID_COLS ? (unsigned char)regs.rdx : (VID_COLS - 1);
+              unsigned cell = ((((unsigned char*)&regs.rdx)[1] & 0xff) * VID_COLS + strcol) << 1;
+              const unsigned char al = (unsigned char)regs.rax, at8 = (unsigned char)regs.rbx;
+              for (i = 0; i < n && cell < VID_BUFSZ; ++i) {
+                if (al & 2) { vram[cell] = str[i << 1]; vram[cell + 1] = str[(i << 1) + 1]; }
+                else { vram[cell] = str[i]; if (!(al & 1)) vram[cell + 1] = at8; }
+                cell += 2;
+              }
+              if (al & 1) *cur = (unsigned short)((((unsigned char*)&regs.rdx)[1] << 8) | (((unsigned char)regs.rdx + n) & 0xff));  /* Move cursor past the string. */
+            } else if (ah == 0x0f) {  /* Get video state. */
+              *(unsigned short*)&regs.rax = 80 << 8 | ((unsigned char*)mem)[0x449];
+              ((unsigned char*)&regs.rbx)[1] = 0;
+            } else if (ah == 0x05 || ah == 0x10 || ah == 0x11 || ah == 0x1a) {
+              /* Display page, palette, font, combination code: ignored in minimal text mode. */
+            } else if (ah == 0x12) {  /* Video subsystem configuration. */
+              *(unsigned short*)&regs.rbx = 1 << 8;
+              *(unsigned short*)&regs.rcx = 0;
+              *(unsigned short*)&regs.rax = 80 << 8 | 3;
+              ((unsigned char*)&regs.rbx)[1] = 0;
+            }
+            /* Any other int 0x10 call is a harmless no-op in text mode. */
+            vid_render(mem);
+            goto done_int_call;
+          }
           if (ah != 0x03 && ah != 0x02) video_write_step = 0;
           if (ah == 0x0e) {  /* Teletype output. */
             goto do_stdout_write_al;
@@ -5034,6 +6291,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned char*)&regs.rax = *(const unsigned char*)((const char*)mem + 0x417);  /* In BDA, 0 by default, no modifier keys pressed. */
           } else if (ah == 0x01 || ah == 0x11 ||  /* Check buffer, do not clear. */
                      ah == 0x00 || ah == 0x10) {  /* Wait for keystroke and read. */
+            vid_render(mem);  /* The program is idle waiting for input: repaint now. */
             process_key(tty_state, ah, (unsigned short*)&regs.rax, (unsigned short*)&regs.rflags);
           } else {
             goto fatal_int;
@@ -5088,11 +6346,52 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
           }
         } else if (int_num == 0x15) {  /* System BIOS. */
           const unsigned short ax = (unsigned short)regs.rax;
+          const unsigned long ext_kb = emu->xmem_size >> 10;
           if (ax == 0xe801) {  /* Check for large free extended memory (XMS). */
-            *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */  /* No large free extended memory. */
+            if (ext_kb) {
+              *(unsigned short*)&regs.rax = *(unsigned short*)&regs.rbx = ext_kb > 0x3c00UL ? 0x3c00 : (unsigned short)ext_kb;  /* KiB between 1 MiB and 16 MiB. */
+              *(unsigned short*)&regs.rcx = *(unsigned short*)&regs.rdx = ext_kb > 0x3c00UL ? (unsigned short)((ext_kb - 0x3c00UL) >> 6) : 0;  /* 64 KiB units above 16 MiB. */
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            } else {
+              *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1: no extended memory. */
+            }
           } else if (ah == 0x88) {  /* Get extended memory (XMS) size. */
-            *(unsigned short*)&regs.rax = 0;  /* No extended memory. */
+            *(unsigned short*)&regs.rax = ext_kb > 0xffffUL ? 0xffff : (unsigned short)ext_kb;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+          } else if (ah == 0x87) {  /* Move block (to/from extended memory), 286+. */
+            /* ES:SI points to a pseudo-GDT; descriptor 2 (offset 0x10) is the
+             * source and descriptor 3 (offset 0x18) is the destination; CX is a
+             * word count. Descriptor base = bytes 2,3,4 and byte 7 (bits 24-31). */
+            const unsigned gdt_lin = ((unsigned)sregs.es.selector << 4) + (*(unsigned short*)&regs.rsi);
+            const unsigned char * const gdt = (const unsigned char*)guest_ptr(emu, gdt_lin);
+            unsigned long src_lin = 0, dst_lin = 0;
+            unsigned words;
+            char *src, *dst;
+            if (gdt) {
+              src_lin = (unsigned)gdt[0x12] | ((unsigned)gdt[0x13] << 8) | ((unsigned)gdt[0x14] << 16) | ((unsigned)gdt[0x17] << 24);
+              dst_lin = (unsigned)gdt[0x1a] | ((unsigned)gdt[0x1b] << 8) | ((unsigned)gdt[0x1c] << 16) | ((unsigned)gdt[0x1f] << 24);
+            }
+            words = *(unsigned short*)&regs.rcx;
+            src = gdt ? guest_ptr(emu, src_lin) : NULL;
+            dst = gdt ? guest_ptr(emu, dst_lin) : NULL;
+            if (getenv("KVIKDOS_TRACE_INT15")) fprintf(stderr, "int15/87: words=%x src=%08x dst=%08x gdt_lin=%08x\n", words, (unsigned)src_lin, (unsigned)dst_lin, (unsigned)gdt_lin);
+            if (!src || !dst) {
+              *(unsigned short*)&regs.rax = 0x02 | (unsigned)ah << 8;  /* AH=2: invalid GDT/segment. */
+              *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
+            } else {
+              memmove(dst, src, (size_t)words << 1);
+              *(unsigned short*)&regs.rax = 0;  /* AH=0: success. */
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            }
+          } else if (ah == 0x89) {  /* Switch to protected mode (obsolete 286 BIOS call). */
+            *(unsigned short*)&regs.rax = 0x86 | (unsigned)ah << 8;  /* AH=0x86: function not supported. */
+            *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
+          } else if (ah == 0xbf || ax == 0x1022) {  /* DESQview multitasker API probes: not running under DESQview. */
+            *(unsigned short*)&regs.rax = 0x86 | (unsigned)ah << 8;
+            *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
+          } else if (ah == 0xc0 || ax == 0xe820) {  /* Get configuration / memory map. */
+            *(unsigned short*)&regs.rax = 0x86 | (unsigned)ah << 8;  /* Not supported. */
+            *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
           } else {
             goto fatal_uic;
           }
@@ -5111,34 +6410,83 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             *(unsigned short*)&regs.rdx = ems_total_pages;
           } else if (ah == 0x43) {  /* Allocate pages. */
             unsigned short req = *(unsigned short*)&regs.rbx, hi;
-            if (!req || req > ems_free_pages) {
+            if (!req || req > ems_free_pages || (unsigned)ems_pool_next + req > ems_total_pages) {
               ((unsigned char*)&regs.rax)[1] = 0x88;  /* Insufficient pages. */
             } else {
               for (hi = 1; hi < EMS_HANDLE_COUNT; ++hi) if (ems_pages_by_handle[hi] == 0) break;
               if (hi >= EMS_HANDLE_COUNT) {
                 ((unsigned char*)&regs.rax)[1] = 0x85;  /* No handles. */
               } else {
-                ems_pages_by_handle[hi] = req;
-                ems_free_pages -= req;
-                *(unsigned short*)&regs.rdx = hi;
-                ((unsigned char*)&regs.rax)[1] = 0;
+                if (!emu->ems_pool && !(emu->ems_pool = (char*)calloc((size_t)ems_total_pages << 14, 1))) {
+                  ((unsigned char*)&regs.rax)[1] = 0x80;  /* Internal error. */
+                } else {
+                  ems_pages_by_handle[hi] = req;
+                  ems_handle_base[hi] = ems_pool_next;
+                  ems_pool_next += req;
+                  ems_free_pages -= req;
+                  *(unsigned short*)&regs.rdx = hi;
+                  ((unsigned char*)&regs.rax)[1] = 0;
+                }
               }
             }
-          } else if (ah == 0x44) {  /* Map page. */
+          } else if (ah == 0x44) {  /* Map page (or unmap if BX=0xffff). */
             unsigned short logical = *(unsigned short*)&regs.rbx;
             unsigned short phys = *(unsigned short*)&regs.rdx;
             unsigned short handle = *(unsigned short*)&regs.rsi;
-            if (phys >= 4 || handle >= EMS_HANDLE_COUNT || ems_pages_by_handle[handle] == 0 || logical >= ems_pages_by_handle[handle]) {
-              ((unsigned char*)&regs.rax)[1] = 0x83;  /* Invalid handle/page. */
+            struct kvm_userspace_memory_region region;
+            if (phys >= 4) {
+              ((unsigned char*)&regs.rax)[1] = 0x8a;  /* Invalid physical page. */
+            } else if (logical == 0xffff) {  /* Unmap. */
+              memset(&region, 0, sizeof(region));
+              region.slot = 3 + phys;
+              region.guest_phys_addr = 0xe0000 + ((unsigned long)phys << 14);
+              if (ioctl(kvm_fds.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+                perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION ems unmap");
+                exit(252);
+              }
+              ems_page_map[phys] = 0;
+              ems_phys_handle[phys] = 0xffff;
+              ((unsigned char*)&regs.rax)[1] = 0;
+            } else if (handle >= EMS_HANDLE_COUNT || ems_pages_by_handle[handle] == 0) {
+              ((unsigned char*)&regs.rax)[1] = 0x83;  /* Invalid handle. */
+            } else if (logical >= ems_pages_by_handle[handle]) {
+              ((unsigned char*)&regs.rax)[1] = 0x8a;  /* Invalid logical page. */
+            } else if (!emu->ems_pool) {
+              ((unsigned char*)&regs.rax)[1] = 0x80;
             } else {
-              ems_page_map[phys] = logical;
+              const unsigned pool_page = ems_handle_base[handle] + logical;
+              memset(&region, 0, sizeof(region));
+              region.slot = 3 + phys;
+              region.guest_phys_addr = 0xe0000 + ((unsigned long)phys << 14);
+              region.memory_size = 0x4000;
+              region.userspace_addr = (uintptr_t)(emu->ems_pool + ((unsigned long)pool_page << 14));
+              if (ioctl(kvm_fds.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+                perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION ems map");
+                exit(252);
+              }
+              ems_page_map[phys] = pool_page + 1;
+              ems_phys_handle[phys] = handle;
               ((unsigned char*)&regs.rax)[1] = 0;
             }
           } else if (ah == 0x45) {  /* Release handle. */
-            unsigned short handle = *(unsigned short*)&regs.rdx;
+            unsigned short handle = *(unsigned short*)&regs.rdx, phys;
+            struct kvm_userspace_memory_region region;
             if (handle == 0 || handle >= EMS_HANDLE_COUNT || ems_pages_by_handle[handle] == 0) {
               ((unsigned char*)&regs.rax)[1] = 0x83;
             } else {
+              for (phys = 0; phys < 4; ++phys) {  /* Unmap frame slots owned by this handle. */
+                if (ems_phys_handle[phys] == handle) {
+                  memset(&region, 0, sizeof(region));
+                  region.slot = 3 + phys;
+                  region.guest_phys_addr = 0xe0000 + ((unsigned long)phys << 14);
+                  if (ioctl(kvm_fds.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+                    perror("fatal: ioctl KVM_SET_USER_MEMORY_REGION ems free");
+                    exit(252);
+                  }
+                  ems_page_map[phys] = 0;
+                  ems_phys_handle[phys] = 0xffff;
+                }
+              }
               ems_free_pages += ems_pages_by_handle[handle];
               ems_pages_by_handle[handle] = 0;
               ((unsigned char*)&regs.rax)[1] = 0;
@@ -5167,45 +6515,97 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             goto fatal_uic;
           }
         } else if (int_num == 0x43) {  /* XMS entry point pseudo interrupt (from INT 2F AX=4310 ES:BX). */
+          /* EMBs are KiB-granule offsets into xmem; offset 0..63 is reserved for the HMA. */
+          const unsigned long xms_pool_kb = emu->xmem_size >> 10;
           if (ah == 0x00) {  /* Get XMS version. */
+            *(unsigned short*)&regs.rax = 0x0300;  /* XMS version 3.00. */
+            *(unsigned short*)&regs.rbx = 0x0001;  /* Internal revision. */
+            *(unsigned short*)&regs.rdx = 1;  /* HMA exists. */
+          } else if (ah == 0x01 || ah == 0x02) {  /* Request/release HMA: always available (real memory). */
             *(unsigned short*)&regs.rax = 1;
-            *(unsigned short*)&regs.rbx = 0x0300;  /* XMS version 3.00. */
-            *(unsigned short*)&regs.rdx = 0;  /* No HMA handle. */
-          } else if (ah == 0x08) {  /* Query free extended memory. */
+            *(unsigned char*)&regs.rbx = 0;
+          } else if (ah == 0x03 || ah == 0x05) {  /* Global/local A20 enable. */
+            port_0x92_a20 = 1;
             *(unsigned short*)&regs.rax = 1;
-            *(unsigned short*)&regs.rdx = xms_free_kb;  /* Largest free block in KiB. */
-            *(unsigned short*)&regs.rbx = xms_total_kb;  /* Total free in KiB. */
+            *(unsigned char*)&regs.rbx = 0;
+          } else if (ah == 0x04 || ah == 0x06) {  /* Global/local A20 disable. */
+            port_0x92_a20 = 0;
+            *(unsigned short*)&regs.rax = 1;
+            *(unsigned char*)&regs.rbx = 0;
+          } else if (ah == 0x07) {  /* Query A20. */
+            *(unsigned short*)&regs.rax = port_0x92_a20;
+            *(unsigned char*)&regs.rbx = 0;
+          } else if (ah == 0x08) {  /* Query free extended memory: AX=largest block, DX=total free. */
+            unsigned long largest = 0, i, j;
+            for (i = 0; i < XMS_HANDLE_COUNT; ++i) {  /* i==0: tail gap; else gap ending at block i. */
+              unsigned long gap_end = i == 0 ? xms_pool_kb : xms_block_kb[i];
+              unsigned long gap_start = 64;  /* Above the HMA reserve. */
+              if (i && !xms_block_sizes_kb[i]) continue;
+              for (j = 1; j < XMS_HANDLE_COUNT; ++j) {
+                if (xms_block_sizes_kb[j]) {
+                  unsigned long be = xms_block_kb[j] + xms_block_sizes_kb[j];
+                  if (be > gap_start && be <= gap_end) gap_start = be;
+                }
+              }
+              if (gap_end > gap_start && gap_end - gap_start > largest) largest = gap_end - gap_start;
+            }
+            *(unsigned short*)&regs.rax = largest > 0xffffUL ? 0xffff : (unsigned short)largest;
+            *(unsigned short*)&regs.rdx = xms_free_kb > 0xffffUL ? 0xffff : (unsigned short)xms_free_kb;
+            *(unsigned char*)&regs.rbx = 0;
+            if (DEBUG || DIAG_ON(DIAG_BIT_EXEC) || getenv("KVIKDOS_TRACE_XMS")) fprintf(g_diag_file, "xms: query free -> largest=%uKB total=%uKB\n", (unsigned)*(unsigned short*)&regs.rax, (unsigned)*(unsigned short*)&regs.rdx);
           } else if (ah == 0x09) {  /* Allocate EMB. */
             unsigned short kb = *(unsigned short*)&regs.rdx, hi;
-            unsigned long bytes = (unsigned long)kb << 10;
+            unsigned long cand, i;
+            char fits;
             if (!kb || kb > xms_free_kb) {
               *(unsigned short*)&regs.rax = 0;
               *(unsigned char*)&regs.rbx = 0xa0;  /* Out of space. */
-            } else {
-              for (hi = 1; hi < XMS_HANDLE_COUNT; ++hi) if (xms_blocks[hi] == NULL) break;
-              if (hi >= XMS_HANDLE_COUNT || !(xms_blocks[hi] = malloc(bytes))) {
-                *(unsigned short*)&regs.rax = 0;
-                *(unsigned char*)&regs.rbx = 0xa1;  /* No handles / alloc failure. */
-              } else {
-                memset(xms_blocks[hi], 0, bytes);
-                xms_block_sizes[hi] = bytes;
-                xms_lock_counts[hi] = 0;
-                xms_free_kb -= kb;
-                *(unsigned short*)&regs.rdx = hi;
-                *(unsigned short*)&regs.rax = 1;
-                *(unsigned char*)&regs.rbx = 0;
+              goto done_int_call;
+            }
+            for (hi = 1; hi < XMS_HANDLE_COUNT; ++hi) if (xms_block_sizes_kb[hi] == 0) break;
+            if (hi >= XMS_HANDLE_COUNT) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xa1;  /* No handles. */
+              goto done_int_call;
+            }
+            /* First-fit search over [64, xms_pool_kb). */
+            cand = 64;
+            fits = 0;
+            for (;;) {
+              unsigned long end = cand + kb;
+              if (end > xms_pool_kb) break;
+              fits = 1;
+              for (i = 1; i < XMS_HANDLE_COUNT; ++i) {
+                if (xms_block_sizes_kb[i] && xms_block_kb[i] < end && cand < xms_block_kb[i] + xms_block_sizes_kb[i]) {
+                  cand = xms_block_kb[i] + xms_block_sizes_kb[i];
+                  fits = 0;
+                  break;
+                }
               }
+              if (fits) break;
+            }
+            if (!fits) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xa0;  /* Out of contiguous space. */
+            } else {
+              xms_block_kb[hi] = cand;
+              xms_block_sizes_kb[hi] = kb;
+              xms_lock_counts[hi] = 0;
+              xms_free_kb -= kb;
+              *(unsigned short*)&regs.rdx = hi;
+              *(unsigned short*)&regs.rax = 1;
+              *(unsigned char*)&regs.rbx = 0;
+              if (DEBUG || DIAG_ON(DIAG_BIT_EXEC) || getenv("KVIKDOS_TRACE_XMS")) fprintf(g_diag_file, "xms: alloc %uKB -> handle %u phys %05x\n", (unsigned)kb, hi, (unsigned)(0x100000 + (cand << 10)));
             }
           } else if (ah == 0x0a) {  /* Free EMB. */
             unsigned short hi = *(unsigned short*)&regs.rdx;
-            if (hi == 0 || hi >= XMS_HANDLE_COUNT || xms_blocks[hi] == NULL) {
+            if (hi == 0 || hi >= XMS_HANDLE_COUNT || !xms_block_sizes_kb[hi]) {
               *(unsigned short*)&regs.rax = 0;
               *(unsigned char*)&regs.rbx = 0xa2;  /* Invalid handle. */
             } else {
-              free(xms_blocks[hi]);
-              xms_free_kb += (unsigned short)(xms_block_sizes[hi] >> 10);
-              xms_blocks[hi] = NULL;
-              xms_block_sizes[hi] = 0;
+              xms_free_kb += xms_block_sizes_kb[hi];
+              xms_block_kb[hi] = 0;
+              xms_block_sizes_kb[hi] = 0;
               xms_lock_counts[hi] = 0;
               *(unsigned short*)&regs.rax = 1;
               *(unsigned char*)&regs.rbx = 0;
@@ -5223,13 +6623,20 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned char*)&regs.rbx = 0;
               goto done_int_call;
             }
-            if (sh == 0) sp = (char*)mem + so;
-            else if (sh < XMS_HANDLE_COUNT && xms_blocks[sh] && so + len <= xms_block_sizes[sh]) sp = (char*)xms_blocks[sh] + so;
-            else sp = NULL;
-            if (dh == 0) dp = (char*)mem + doff;
-            else if (dh < XMS_HANDLE_COUNT && xms_blocks[dh] && doff + len <= xms_block_sizes[dh]) dp = (char*)xms_blocks[dh] + doff;
-            else dp = NULL;
-            if (!sp || !dp || sp < (char*)mem || dp < (char*)mem || (sh == 0 && so + len > DOS_MEM_LIMIT) || (dh == 0 && doff + len > DOS_MEM_LIMIT)) {
+            /* Handle 0: offset is a real-mode seg:off far pointer. Nonzero handle: byte offset into the EMB. */
+            if (sh == 0) {
+              unsigned lin = ((so >> 16) << 4) + (so & 0xffff);
+              sp = lin + len <= GUEST_MEM_LIMIT ? (char*)mem + lin : NULL;
+            } else if (sh < XMS_HANDLE_COUNT && xms_block_sizes_kb[sh] && so + len <= ((unsigned long)xms_block_sizes_kb[sh] << 10)) {
+              sp = (char*)emu->xmem + ((xms_block_kb[sh] << 10) + so);
+            } else sp = NULL;
+            if (dh == 0) {
+              unsigned lin = ((doff >> 16) << 4) + (doff & 0xffff);
+              dp = lin + len <= GUEST_MEM_LIMIT ? (char*)mem + lin : NULL;
+            } else if (dh < XMS_HANDLE_COUNT && xms_block_sizes_kb[dh] && doff + len <= ((unsigned long)xms_block_sizes_kb[dh] << 10)) {
+              dp = (char*)emu->xmem + ((xms_block_kb[dh] << 10) + doff);
+            } else dp = NULL;
+            if (!sp || !dp || !emu->xmem) {
               *(unsigned short*)&regs.rax = 0;
               *(unsigned char*)&regs.rbx = 0xa3;  /* Invalid source/dest. */
             } else {
@@ -5237,13 +6644,13 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
               *(unsigned short*)&regs.rax = 1;
               *(unsigned char*)&regs.rbx = 0;
             }
-          } else if (ah == 0x0c) {  /* Lock EMB. */
+          } else if (ah == 0x0c) {  /* Lock EMB: returns the 32-bit guest physical address. */
             unsigned short hi = *(unsigned short*)&regs.rdx;
-            if (hi == 0 || hi >= XMS_HANDLE_COUNT || xms_blocks[hi] == NULL) {
+            if (hi == 0 || hi >= XMS_HANDLE_COUNT || !xms_block_sizes_kb[hi]) {
               *(unsigned short*)&regs.rax = 0;
               *(unsigned char*)&regs.rbx = 0xa2;
             } else {
-              unsigned long addr = (unsigned long)(size_t)xms_blocks[hi];
+              unsigned long addr = 0x100000 + (xms_block_kb[hi] << 10);
               if (xms_lock_counts[hi] != 0xffff) ++xms_lock_counts[hi];
               *(unsigned short*)&regs.rbx = (unsigned short)addr;
               *(unsigned short*)&regs.rdx = (unsigned short)(addr >> 16);
@@ -5251,7 +6658,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             }
           } else if (ah == 0x0d) {  /* Unlock EMB. */
             unsigned short hi = *(unsigned short*)&regs.rdx;
-            if (hi == 0 || hi >= XMS_HANDLE_COUNT || xms_blocks[hi] == NULL || xms_lock_counts[hi] == 0) {
+            if (hi == 0 || hi >= XMS_HANDLE_COUNT || !xms_block_sizes_kb[hi] || xms_lock_counts[hi] == 0) {
               *(unsigned short*)&regs.rax = 0;
               *(unsigned char*)&regs.rbx = 0xaa;  /* Not locked. */
             } else {
@@ -5261,16 +6668,44 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
             }
           } else if (ah == 0x0e) {  /* Get EMB handle information. */
             unsigned short hi = *(unsigned short*)&regs.rdx, free_handles = 0, i;
-            if (hi == 0 || hi >= XMS_HANDLE_COUNT || xms_blocks[hi] == NULL) {
+            if (hi == 0 || hi >= XMS_HANDLE_COUNT || !xms_block_sizes_kb[hi]) {
               *(unsigned short*)&regs.rax = 0;
               *(unsigned char*)&regs.rbx = 0xa2;
             } else {
-              for (i = 1; i < XMS_HANDLE_COUNT; ++i) if (xms_blocks[i] == NULL) ++free_handles;
+              for (i = 1; i < XMS_HANDLE_COUNT; ++i) if (!xms_block_sizes_kb[i]) ++free_handles;
               *(unsigned short*)&regs.rax = 1;
               ((unsigned char*)&regs.rbx)[1] = (unsigned char)xms_lock_counts[hi];  /* BH lock count. */
-              *(unsigned short*)&regs.rdx = (unsigned short)(xms_block_sizes[hi] >> 10);  /* Size in KiB. */
+              *(unsigned short*)&regs.rdx = xms_block_sizes_kb[hi];  /* Size in KiB. */
               *(unsigned char*)&regs.rbx = free_handles > 255 ? 255 : (unsigned char)free_handles;  /* BL free handles. */
             }
+          } else if (ah == 0x0f) {  /* Reallocate EMB. */
+            unsigned short hi = *(unsigned short*)&regs.rdx;
+            unsigned short new_kb = *(unsigned short*)&regs.rbx, i;
+            if (hi == 0 || hi >= XMS_HANDLE_COUNT || !xms_block_sizes_kb[hi] || !new_kb) {
+              *(unsigned short*)&regs.rax = 0;
+              *(unsigned char*)&regs.rbx = 0xa2;
+            } else if (new_kb <= xms_block_sizes_kb[hi]) {  /* Shrink in place. */
+              xms_free_kb += xms_block_sizes_kb[hi] - new_kb;
+              xms_block_sizes_kb[hi] = new_kb;
+              *(unsigned short*)&regs.rax = 1;
+            } else {  /* Grow: only into the free gap right after the block. */
+              unsigned long end = xms_block_kb[hi] + new_kb;
+              char fits = end <= xms_pool_kb;
+              for (i = 1; fits && i < XMS_HANDLE_COUNT; ++i) {
+                if (xms_block_sizes_kb[i] && xms_block_kb[i] < end && xms_block_kb[hi] < xms_block_kb[i] + xms_block_sizes_kb[i]) fits = 0;
+              }
+              if (!fits || (unsigned long)(new_kb - xms_block_sizes_kb[hi]) > xms_free_kb) {
+                *(unsigned short*)&regs.rax = 0;
+                *(unsigned char*)&regs.rbx = 0xa0;
+              } else {
+                xms_free_kb -= new_kb - xms_block_sizes_kb[hi];
+                xms_block_sizes_kb[hi] = new_kb;
+                *(unsigned short*)&regs.rax = 1;
+              }
+            }
+          } else if (ah == 0x10 || ah == 0x11) {  /* Request/release UMB: none provided. */
+            *(unsigned short*)&regs.rax = 0;
+            *(unsigned char*)&regs.rbx = 0xb0;
           } else {
             *(unsigned short*)&regs.rax = 0;
             *(unsigned char*)&regs.rbx = 0x80;  /* Function not implemented. */
@@ -5356,6 +6791,7 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       { const unsigned mmio_len = run->mmio.len;
         const unsigned addr = (unsigned)run->mmio.phys_addr;
         char highmsg[2];
+        if (getenv("KVIKDOS_TRACE_MMIO")) fprintf(stderr, "mmio: %s phys=%08x len=%u rip=%x wr=%d\n", run->mmio.is_write ? "wr" : "rd", addr, mmio_len, (unsigned)regs.rip, (int)run->mmio.is_write);
         /* CS:IP points to the instruction doing the memory operation (not after). */
         if (!(mmio_len == 1 || mmio_len == 2 || mmio_len == 4 || mmio_len == 8)) {
           highmsg[0] = '\0';
@@ -5412,11 +6848,23 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
         } else if (addr == 0x501 && addr + mmio_len <= 0x504 && run->mmio.is_write) {
           /* Microsoft Macro Assembler 1.00 m.exe only writes byte at 0x501. */
           memcpy((char*)mem + addr, run->mmio.data, mmio_len);
+        } else if (addr >= 0x400 && addr + mmio_len <= 0x500 && run->mmio.is_write) {
+          /* BIOS data area writes (keyboard flags, tick count, video state). */
+          memcpy((char*)mem + addr, run->mmio.data, mmio_len);
+        } else if (addr >= 0x400 && addr + mmio_len <= 0x500 && !run->mmio.is_write) {
+          /* BIOS data area reads: served from the (read-only) page, but an
+           * access may have been reported as MMIO anyway; return the data. */
+          memcpy(run->mmio.data, (char*)mem + addr, mmio_len);
         } else {
           highmsg[0] = '\0';
          bad_memory_access:
           if (!emu_params->strict_mode) {
-            if (!run->mmio.is_write) memset(run->mmio.data, 0, mmio_len);
+            /* Reads of unmapped physical memory return 0xff (floating ISA bus),
+             * so memory-sizing probes that write a signature and read it back
+             * reliably detect the end of RAM.
+             */
+            if (!run->mmio.is_write) memset(run->mmio.data, 0xff, mmio_len);
+            if (getenv("KVIKDOS_TRACE_MMIO") && addr >= 0x80000) fprintf(stderr, "mmio: %s phys=%08x len=%u\n", run->mmio.is_write ? "wr" : "rd", addr, mmio_len);
             break;
           }
           fprintf(stderr, "fatal: KVM memory access denied phys_addr=%08x%s value=%08x%08x size=%u is_write=%u\n", addr, highmsg, ((unsigned*)run->mmio.data)[1], ((unsigned*)run->mmio.data)[0], mmio_len, run->mmio.is_write);
@@ -5425,6 +6873,27 @@ static unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filenam
       }
       ongoing_set_int = 0;  /* No set_int operation ongoing. */
       break;  /* Just continue at following cs:ip. */
+     case KVM_EXIT_DEBUG:  /* Single-step (KVIKDOS_PM_STEP) or HW breakpoint (KVIKDOS_BP). */
+      if (getenv("KVIKDOS_BP")) {  /* Breakpoint fired: dump PM state + faulting insn. */
+        unsigned long flin = sregs.cs.base + (unsigned long)regs.rip;
+        unsigned long fph = pm_xlat(emu, sregs.cr3, flin);
+        const unsigned char *fb = fph != ~0UL ? (const unsigned char*)guest_ptr(emu, fph) : NULL;
+        fprintf(stderr, "BP-HIT eip=%08x cs=%04x(b%08x) cr0=%08x cr2=%08x cr3=%08x efl=%08x\n",
+                (unsigned)regs.rip, sregs.cs.selector, (unsigned)sregs.cs.base,
+                (unsigned)sregs.cr0, (unsigned)sregs.cr2, (unsigned)sregs.cr3, (unsigned)regs.rflags);
+        fprintf(stderr, "  eax=%08x ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x ebp=%08x esp=%08x\n",
+                (unsigned)regs.rax,(unsigned)regs.rbx,(unsigned)regs.rcx,(unsigned)regs.rdx,
+                (unsigned)regs.rsi,(unsigned)regs.rdi,(unsigned)regs.rbp,(unsigned)regs.rsp);
+        fprintf(stderr, "  ds=%04x(b%08x) es=%04x(b%08x) fs=%04x(b%08x) gs=%04x(b%08x) ss=%04x(b%08x) linsn lin=%08x insn=%02x %02x %02x %02x %02x %02x\n",
+                sregs.ds.selector,(unsigned)sregs.ds.base, sregs.es.selector,(unsigned)sregs.es.base,
+                sregs.fs.selector,(unsigned)sregs.fs.base, sregs.gs.selector,(unsigned)sregs.gs.base,
+                sregs.ss.selector,(unsigned)sregs.ss.base,(unsigned)flin,
+                fb?fb[0]:0,fb?fb[1]:0,fb?fb[2]:0,fb?fb[3]:0,fb?fb[4]:0,fb?fb[5]:0);
+        fprintf(stderr, "  gdt=%08x.%x idt=%08x.%x tr=%04x ldt=%04x\n",
+                (unsigned)sregs.gdt.base,(unsigned)sregs.gdt.limit,(unsigned)sregs.idt.base,(unsigned)sregs.idt.limit,
+                sregs.tr.selector, sregs.ldt.selector);
+      }
+      break;
      case KVM_EXIT_INTERNAL_ERROR:
       fprintf(stderr, "fatal: KVM internal error suberror=%u\n", (unsigned)run->internal.suberror);
       /* We get this for an int call if we don't map
@@ -6543,7 +8012,7 @@ static unsigned char run_dos_batch(struct EmuState *emu, const char *prog_filena
                 exit_code = run_dos_batch(emu, prog_filename, child_args, dir_state, tty_state, emu_params, envp0, batch_extra_env, batch_extra_env_count);
               } else {
                 const enum mz_subformat_t subfmt = detect_mz_subformat(prog_filename);
-                if (subfmt == MZ_SUBFMT_PE && has_wine_in_path()) {
+                if (subfmt == MZ_SUBFMT_PE && has_wine_in_path() && !is_probable_dos_extender_program(prog_filename)) {
                   const char *child_argv[64];
                   char *ab = args_buf, *ae;
                   unsigned ac = 0;
@@ -6624,6 +8093,8 @@ static void init_tty_state(TtyState *tty_state, int tty_in_fd) {
   tty_state->tty_in_fd = tty_in_fd;
   tty_state->is_tty_in_error = 0;
   tty_state->next_fake_key = fake_keys;
+  tty_state->pending_key = -1;
+  tty_state->raw_on = 0;
 }
 
 static void free_extra_env_args(ParsedCmdArgs *cmd_args) {
@@ -6707,11 +8178,12 @@ int main(int argc, char **argv) {
   }
   {
     const enum mz_subformat_t subfmt = detect_mz_subformat(cmd_args.prog_filename);
-    if (subfmt == MZ_SUBFMT_PE ||
-        is_probable_dos_extender_program(cmd_args.prog_filename) ||
-        ((subfmt == MZ_SUBFMT_NE || subfmt == MZ_SUBFMT_LE || subfmt == MZ_SUBFMT_LX) &&
-         !is_probable_borland_dual_mode_ne(cmd_args.prog_filename) &&
-         is_probable_windows_message_stub(cmd_args.prog_filename))) {
+    const int is_ext = is_probable_dos_extender_program(cmd_args.prog_filename);
+    if (!cmd_args.force_dos && !is_ext &&
+        (subfmt == MZ_SUBFMT_PE ||
+         ((subfmt == MZ_SUBFMT_NE || subfmt == MZ_SUBFMT_LE || subfmt == MZ_SUBFMT_LX) &&
+          !is_probable_borland_dual_mode_ne(cmd_args.prog_filename) &&
+          is_probable_windows_message_stub(cmd_args.prog_filename)))) {
     if (!has_wine_in_path()) {
         fprintf(stderr, "error: detected Windows executable, but 'wine' is not in PATH: %s\n", cmd_args.prog_filename);
         free_extra_env_args(&cmd_args);

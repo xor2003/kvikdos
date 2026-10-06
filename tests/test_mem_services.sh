@@ -42,11 +42,11 @@ start:
   or si, 0002h
 .xms_ptr_ok:
 
-  ; XMS AH=08h: query free memory
+  ; XMS AH=08h: query free memory (AX=largest free block KB, DX=total free KB)
   mov ah, 08h
   call far [xms_off]
-  cmp ax, 1
-  je .xms_q_ok
+  test ax, ax        ; nonzero largest block means free extended memory exists
+  jnz .xms_q_ok
   or si, 0004h
 .xms_q_ok:
 
