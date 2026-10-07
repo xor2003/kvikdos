@@ -51,12 +51,26 @@ static int kvm_create_vcpu(struct hv *hv) {
   }
   { /* Populate the vCPU's CPUID table so guest CPUID returns real results.
      * Without this, CPUID exits to the kernel which has no entries and
-     * returns zeros, breaking DOS extender CPU detection (386/486/Pentium). */
+     * returns zeros, breaking DOS extender CPU detection (386/486/Pentium).
+     * However, modern feature bitmaps actively break DOS-era code: e.g.
+     * DOS/32A's fpu_detect does `mov cx,8' then a 32-bit `dec ecx; jnz'
+     * delay loop, so the leaf-1 ECX feature mask (nonzero on every
+     * post-Pentium-III CPU) turns an 8-iteration FPU-stack cleanup into a
+     * ~4-billion-iteration hang.  Report leaf-1 ECX and the leaf-7
+     * structured features as zero, like a Pentium II would. */
     struct kvm_cpuid2 *cpuid_data = (struct kvm_cpuid2*)calloc(
         1, sizeof(*cpuid_data) + 256 * sizeof(struct kvm_cpuid_entry2));
     if (cpuid_data) {
       cpuid_data->nent = 256;
       if (kvm_ioctl(ki->kvm_fd, KVM_GET_SUPPORTED_CPUID, cpuid_data) >= 0) {
+        unsigned i;
+        for (i = 0; i < cpuid_data->nent; ++i) {
+          struct kvm_cpuid_entry2 *e = &cpuid_data->entries[i];
+          if (e->function == 1)
+            e->ecx = 0;
+          else if (e->function == 7)
+            e->ebx = e->ecx = e->edx = 0;
+        }
         (void)kvm_ioctl(ki->vcpu_fd, KVM_SET_CPUID2, cpuid_data);  /* Best effort. */
       }
       free(cpuid_data);
