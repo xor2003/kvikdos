@@ -222,6 +222,7 @@ extern char exec_tail_buf[0x80];  /* Command tail for an in-VM exec child. */
 extern char linux_prog_buf[LINUX_PATH_SIZE];
 extern unsigned short load_env_para;          /* PSP env_seg override; 0 = default ENV_PARA. */
 extern unsigned short load_block_limit_para;  /* Cap on the child's block; 0 = rest of conventional memory. */
+extern unsigned short load_parent_para;       /* PSP[0x16] parent seg for an in-VM exec child; 0 = none. */
 /* Text-mode renderer state shared between video.c (rendering) and tty.c (raw
  * tty takeover when text mode is active). */
 extern char vid_active;

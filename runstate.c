@@ -31,6 +31,7 @@ ExecSave exec_stack[EXEC_SAVE_MAX];
 unsigned exec_depth;
 unsigned short load_env_para;
 unsigned short load_block_limit_para;
+unsigned short load_parent_para;
 unsigned int_num;
 unsigned short int_cs, int_ip;
 unsigned short *csip_ptr;

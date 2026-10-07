@@ -286,23 +286,73 @@ int i21_exec(void) {
                     if (g_prog_filename[0] != '\0' &&
                         (img_fd = open_with_case_fallback(g_prog_filename, O_RDONLY, 0666)) >= 0) {
                       ExecSave * const sv = &exec_stack[exec_depth++];
+                      unsigned env_paras = 0, env_prefix = 0;
+                      unsigned child_psp = bp;
+                      unsigned short child_env_seg = env_para;
+                      const char *vp = env;
+                      /* Build a private env block for the child (DOS EXEC allocs a
+                       * new block, copies the parent's env vars, then stores the
+                       * child's own program name as argv[0]).  Without this a
+                       * Borland tool that execs RTM.EXE passes env argv[0] = the
+                       * *top* program's name, so RTM loads the wrong image. */
+                      if (env != NULL) {
+                        while (vp < env_end && *vp) {
+                          const char *nul = memchr(vp, 0, env_end - vp);
+                          if (!nul) { vp = env_end; break; }
+                          vp = nul + 1;
+                        }
+                      }
+                      if (env != NULL && vp < env_end) {
+                        env_prefix = (unsigned)(vp - env) + 1;  /* vars + empty terminator */
+                        env_paras = (env_prefix + 2 + strlen(dos_exec_name) + 1 + 15) >> 4;
+                        if (free_size < env_paras + 1 + 0x40) env_paras = 0;  /* Need room for env+PSP. */
+                      }
+                      if (env_paras) {
+                        char * const dst = (char*)mem + (bp << 4);
+                        char * const prog_mcb = fmcb + ((env_paras + 1) << 4);
+                        const char prog_type = MCB_TYPE(fmcb);
+                        child_psp = bp + env_paras + 1;
+                        child_env_seg = (unsigned short)bp;
+                        MCB_TYPE(fmcb) = 'M';
+                        MCB_PID(fmcb) = (unsigned short)child_psp;
+                        MCB_SIZE_PARA(fmcb) = (unsigned short)env_paras;
+                        memcpy(prog_mcb, default_program_mcb, 16);
+                        MCB_TYPE(prog_mcb) = prog_type;
+                        MCB_PID(prog_mcb) = (unsigned short)child_psp;
+                        MCB_PSIZE_PARA(prog_mcb) = (unsigned short)env_paras;
+                        MCB_SIZE_PARA(prog_mcb) = (unsigned short)(free_size - env_paras - 1);
+                        /* The block after the program still records the old free
+                         * block's size as its psize; retarget it to the program
+                         * block so the MCB chain stays consistent. */
+                        if (prog_type != 'Z') {
+                          char * const next_mcb = prog_mcb + 16 + ((free_size - env_paras - 1) << 4);
+                          MCB_PSIZE_PARA(next_mcb) = (unsigned short)(free_size - env_paras - 1);
+                        }
+                        memcpy(dst, env, env_prefix);
+                        dst[env_prefix] = 1;
+                        dst[env_prefix + 1] = 0;
+                        memcpy(dst + env_prefix + 2, dos_exec_name, strlen(dos_exec_name) + 1);
+                        free_size -= env_paras + 1;
+                      } else {
+                        MCB_PID(fmcb) = (unsigned short)bp;  /* Claim the block for the child. */
+                      }
                       sv->regs = regs;
                       sv->sregs = sregs;
                       sv->int_cs = int_cs;
                       sv->int_ip = int_ip;
                       sv->int_flags = csip_ptr[2];
                       sv->psp_para = (unsigned short)current_psp_para;
-                      sv->child_psp_para = (unsigned short)bp;
-                      MCB_PID(fmcb) = (unsigned short)bp;  /* Claim the block for the child. */
-                      load_psp_para = bp;
+                      sv->child_psp_para = (unsigned short)child_psp;
+                      load_psp_para = child_psp;
                       load_prog = g_prog_filename;
                       load_args = NULL;
                       memcpy(exec_tail_buf, safe_args, args_size + 1);
                       load_args_str = exec_tail_buf;
-                      load_env_para = env_para;
+                      load_env_para = child_env_seg;
+                      load_parent_para = (unsigned short)current_psp_para;  /* DOS EXEC sets the child's PSP[0x16] to the parent PSP; Borland RTM verifies this link to find the bound app image. */
                       load_block_limit_para = (unsigned short)free_size;  /* Cap the child's MCB at the free block's size. */
                       preserve_low = 1;
-                      if (DEBUG || DIAG_ON(DIAG_BIT_EXEC)) fprintf(g_diag_file, "debug: exec: in-VM child PSP at 0x%04x parent 0x%04x (%s)\n", bp, current_psp_para, dos_exec_name);
+                      if (DEBUG || DIAG_ON(DIAG_BIT_EXEC)) fprintf(g_diag_file, "debug: exec: in-VM child PSP at 0x%04x parent 0x%04x env 0x%04x (%s)\n", child_psp, current_psp_para, child_env_seg, dos_exec_name);
                       return IA_EXEC;
                     }
                   }

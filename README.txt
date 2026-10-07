@@ -317,6 +317,10 @@ I/O and memory:
   (e.g. CWSDPMI.EXE or HDPMI32.EXE) as a TSR first, then runs the real
   DOS program on top of it. Use this for 32-bit protected-mode tools
   which need DPMI (e.g. DOS4GW-style programs and the HX loader).
+  As a shortcut, when a program's real-mode loader is a Borland 32STUB
+  (e.g. BCC32.EXE or TLINK32.EXE), kvikdos-ng auto-loads the sibling
+  32RTM.EXE/RTM.EXE as the resident host when no `--dpmi=' is given,
+  so those tools can be run directly without a flag.
 * `--hlt-ok' and `--hlt-dump=<file>' are low-level debug options.
 
 Best defaults:
@@ -563,6 +567,24 @@ Quick start for DOS compilers and assemblers:
 
 * Turbo C 2.0 and Turbo C++ 1.01 are validated (see above); later
   Borland C++ versions haven't been tested.
+
+* Borland C++ 4.52 compiles and links: BCC32.EXE auto-loads its sibling
+  32RTM.EXE resident host, compiles C to a valid OMF .obj, and drives
+  TLINK32.EXE to a valid PE32 .exe (give it access to c0x32.obj and
+  import32.lib/cw32.lib, e.g. on the program's drive). The run ends with a
+  cosmetic `32loader runtime error: Unhandled exception Exception 0E'
+  register dump during the RTM's module teardown -- the output files are
+  already written and valid and the process still exits 0.
+
+* Borland C++ 4.5 (16-bit) also compiles and links: BCC.EXE is a 16-bit
+  `16STUB' program that loads its own DPMI16BI.OVL DPMI layer and drives
+  RTM.EXE -- no `--dpmi=' flag is needed. `BCC.EXE -c file.c' produces a
+  valid OMF .obj, and `BCC.EXE file.c' additionally drives the nested
+  TLINK.EXE to a valid real-mode .exe (each exec'd tool gets its own
+  environment block with argv[0] = its own path, matching DOS EXEC
+  semantics, so RTM resolves the right image). Give it access to the
+  model's startup object and runtime libraries (e.g. c0s.obj + cs.lib +
+  emu.lib + maths.lib for the small model) on the tool's drive.
 
 * (For copy-paste compile-and-link tutorials see TOOLCHAIN.md.)
 

@@ -16,6 +16,42 @@ static int irq0_due(unsigned long ticks_now) {
   return 1;
 }
 
+/* Borland's 32-bit DPMI tools (BCC32.EXE, TLINK32.EXE, ...) carry a real-mode
+ * "32STUB" loader that registers with a resident 32RTM.EXE DPMI host via int
+ * 2f FB42. When the host is not already resident the stub merely installs and
+ * exits -- the client's ah=4c then never matches the registered PSP and the
+ * 32loader never runs (the program just prints "32rtm resident"). Rather than
+ * require an explicit --dpmi=<.../32RTM.EXE>, sniff the program for the stub
+ * signature and auto-load a sibling 32RTM.EXE/RTM.EXE from the same directory
+ * as the resident host. Returns a load_prog path, or NULL when the program is
+ * not a Borland stub or no usable host exists next to it. */
+static const char *borland_stub_host(const char *prog_filename) {
+  static const char * const host_names[] = { "32RTM.EXE", "RTM.EXE" };
+  static char host_buf[LINUX_PATH_SIZE];
+  char buf[8192];
+  const char *slash;
+  ssize_t n;
+  unsigned i;
+  int fd;
+  if (!prog_filename) return NULL;
+  fd = open_with_case_fallback(prog_filename, O_RDONLY, 0666);  /* prog_filename may be case-folded by DOS-path resolution. */
+  if (fd < 0) return NULL;
+  n = read(fd, buf, sizeof(buf));
+  close(fd);
+  if (n <= 4 || buf[0] != 'M' || buf[1] != 'Z') return NULL;  /* MZ .exe only: 32STUB lives in real-mode EXE loaders, not .com/.bat. */
+  if (!memmem(buf, (size_t)n, "32STUB", 6)) return NULL;
+  slash = strrchr(prog_filename, '/');
+  for (i = 0; i < sizeof(host_names) / sizeof(host_names[0]); ++i) {
+    size_t len = slash ? (size_t)(slash - prog_filename) + 1 : 0;
+    int hfd;
+    if (len) memcpy(host_buf, prog_filename, len);
+    strcpy(host_buf + len, host_names[i]);
+    hfd = open_with_case_fallback(host_buf, O_RDONLY, 0666);
+    if (hfd >= 0) { close(hfd); return host_buf; }
+  }
+  return NULL;
+}
+
 unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, const char *dpmi_host, const char *args_str, const char* const *args, DirState *dir_state0, TtyState *tty_state0, const EmuParams *emu_params0, const char* const *envp0, const char* const *extra_env, unsigned extra_env_count) {
   emu = emu0;
   dir_state = dir_state0;
@@ -29,6 +65,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
   { struct SA { int StaticAssert_ShortSize : sizeof(short) == 2; }; }  /* Assumed by *(unsigned short*)... in many places. */
   { struct SA { int StaticAssert_IntSize : sizeof(int) == 4; }; }  /* Assumed by *(unsigned*)... in many places. */
 
+  if (!dpmi_host) dpmi_host = borland_stub_host(prog_filename);  /* Auto-load a sibling 32RTM.EXE/RTM.EXE for Borland DPMI stubs. */
   dpmi_host_active = (dpmi_host != NULL);
   preserve_low = 0;
   load_psp_para = PSP_PARA;
@@ -177,6 +214,10 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
       *(unsigned short*)((char*)mem + (load_psp_para << 4) + 0x2c) = load_env_para;
       load_env_para = 0;
     }
+    if (load_parent_para) {  /* In-VM exec child: PSP[0x16] = parent PSP seg. */
+      *(unsigned short*)((char*)mem + (load_psp_para << 4) + 0x16) = load_parent_para;
+      load_parent_para = 0;
+    }
   }
   if (load_block_limit_para) {  /* Free the unused tail of an exec child's block. */
     char * const cmcb = (char*)mem + ((load_psp_para << 4) - 16);
@@ -268,6 +309,26 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
     if (dos_prog_abs[0] == '\0') dos_prog_abs = "C:\\KVIKPROG.COM";  /* Not the same as in default_program_mcb. */
     env = add_env(env, env_end, dos_prog_abs, 0);  /* Full program pathname. */
     if (do_clear_after_env) memset(env, '\0', env_end - env);
+    {  /* Stamp a DOS env-block MCB at env_seg-1 (segment 0x93) so that DOS
+        * extenders which size the environment through the MCB can read it.
+        * Borland's RTM.EXE/32RTM loader copies env_size (MCB+3) paragraphs
+        * before scanning the block for the argv[0] trailer; without a valid
+        * MCB here it copies 0 bytes and reports `Can't find <empty>'.
+        *
+        * The env block sits in the DOS-owned data space (0x700..0x93f), not
+        * the allocatable MCB arena (which starts at PROGRAM_MCB_PARA=0xff),
+        * so this is a header only -- it is below PSP_PARA and thus never
+        * reached by is_mcb_bad or the check_all_mcbs chain walk. Only the
+        * type/owner/size fields are written; bytes 0x938..0x93f (the MCB
+        * name field) are left alone because 0x93e..0x93f holds the sysvars
+        * current-PSP mirror maintained by set_current_psp. */
+      char * const env_mcb = (char*)mem + ((ENV_PARA - 1) << 4);
+      env_mcb[0] = 'M';
+      *(unsigned short*)(env_mcb + 1) = PSP_PARA;  /* Owner = program PSP. */
+      *(unsigned short*)(env_mcb + 3) = (unsigned short)((env - env0 + 15) >> 4);  /* Size in paragraphs. */
+      *(unsigned short*)(env_mcb + 5) = 0;  /* psize: no previous block. */
+      env_mcb[7] = 0;  /* Reserved. */
+    }
   }
 
 /* We have to set both selector and base, otherwise it won't work. A `mov
@@ -455,6 +516,13 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
         int_ip = csip_ptr[0]; int_cs = csip_ptr[1];  /* Return address. */  /* !! Security: check bounds, also check that rsp <= 0xfffe. */
         ah = ((unsigned)regs.rax >> 8) & 0xff;
         if (DEBUG || DEBUG_INT || DIAG_ON(DIAG_BIT_INT)) fprintf(g_diag_file, "debug: int 0x%02x ah:%02x al:%02x cs:%04x ip:%04x\n", int_num, ah, (unsigned char)regs.rax, int_cs, int_ip);
+        if (getenv("KVIKDOS_TR21") && int_num == 0x21) {  /* Temp trace: resolve ds:dx for bridge calls. */
+          const char * const bp = (const char*)mem + (((unsigned)sregs.ds.selector << 4) & 0xfffff) + (*(unsigned short*)&regs.rdx);
+          char tbuf[64]; unsigned ti;
+          for (ti = 0; ti < 60; ++ti) { const char c = bp[ti]; tbuf[ti] = (c >= 32 && c < 127) ? c : (c == 0 ? 0 : '.'); if (!c) break; }
+          tbuf[ti] = 0;
+          fprintf(g_diag_file, "tr21: ah=%02x al=%02x bx=%04x cx=%04x dx=%04x ds=%04x es=%04x si=%04x di=%04x ds:dx='%s'\n", ah, (unsigned char)regs.rax, *(unsigned short*)&regs.rbx, *(unsigned short*)&regs.rcx, *(unsigned short*)&regs.rdx, (unsigned short)sregs.ds.selector, (unsigned short)sregs.es.selector, *(unsigned short*)&regs.rsi, *(unsigned short*)&regs.rdi, tbuf);
+        }
         fflush(stdout);
         (void)ah;
         /* Documentation about DOS and BIOS int calls: https://stanislavs.org/helppc/idx_interrupt.html */
@@ -507,6 +575,8 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
           goto fatal;
         }
        done_int_call:
+        if (getenv("KVIKDOS_TR21") && int_num == 0x21 && (ah == 0x51 || ah == 0x62 || ah == 0x3d || ah == 0x4e || ah == 0x50))
+          fprintf(g_diag_file, "tr21-ret: ah=%02x ret_bx=%04x ret_ax=%04x cf=%d\n", ah, *(unsigned short*)&regs.rbx, *(unsigned short*)&regs.rax, (unsigned char)regs.rflags & 1);
         /* Return from the interrupt. */
         SET_SREG(cs, int_cs);
         regs.rip = int_ip;
