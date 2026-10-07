@@ -92,4 +92,5 @@ void reset_emu(struct EmuState *emu, const EmuParams *emu_params) {
     memset(mem, '\0', ENV_PARA << 4);
     memset((char*)mem + ENV_LIMIT, '\0', (PSP_PARA << 4) - ENV_LIMIT);
   }
+  mouse_reset();  /* int 33h driver state is per-program, like a real MOUSE.COM reload. */
 }

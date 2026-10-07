@@ -113,7 +113,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
     /* Fill magic interrupt table. */
     { unsigned u;
       for (u = 0; u < 0x100; ++u) { ((unsigned*)mem)[u] = MAGIC_INT_VALUE(u); }
-      memset((char*)mem + (INT_HLT_PARA << 4), 0xf4, 0x100);  /* 256 hlt instructions, one for each int. TODO(pts): Is hlt+iret faster? */
+      memset((char*)mem + (INT_HLT_PARA << 4), 0xf4, 0x101);  /* 256 hlt instructions, one for each int, plus an extra at offset 0x100: the mouse-event far-call trampoline (guest handler RETF lands there). TODO(pts): Is hlt+iret faster? */
       /* Far-callable XMS stub. It must live in the read-only first page at an
        * address no guest write can reach: 0x502 sits in the gap between the
        * BIOS data area (ends 0x500) and the int stubs (start 0x540), and is
@@ -444,6 +444,10 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
      case HV_EXIT_HLT:
       /* Match by linear address: extenders (e.g. Borland RTM) may re-encode
        * vector far-pointers as a different seg:off alias of our stub page. */
+      if ((unsigned)(sregs.cs.base + (unsigned)regs.rip - 1 - (INT_HLT_PARA << 4)) == 0x100) {  /* Mouse-event far-call trampoline: the int33 AX=0x0c handler RETF'd here. */
+        mouse_cbk_return();
+        goto set_sregs_regs_and_continue;
+      }
       if ((unsigned)(sregs.cs.base + (unsigned)regs.rip - 1 - (INT_HLT_PARA << 4)) < 0x100) {  /* hlt caused by int through our magic interrupt table. */
         int_num = (unsigned)(sregs.cs.base + (unsigned)regs.rip - 1 - (INT_HLT_PARA << 4)) & 0xff;
         csip_ptr = (unsigned short*)((char*)mem + ((unsigned)sregs.ss.base & 0xfffff) + (*(unsigned short*)&regs.rsp));  /* !! What if rsp wraps around 64 KiB boundary? Test it. Also calculate int_cs again. */
@@ -509,8 +513,10 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
         *(unsigned short*)&regs.rsp += 6;  /* pop ip, pop cs, pop flags. */
         /* New keys drained during a device-idle int (16h/17h/28h-style):
          * inject IRQ1 now — regs hold the real post-int state, so the ISR
-         * sees a proper interrupt frame. */
+         * sees a proper interrupt frame.  Likewise deliver a queued int33
+         * mouse event to the guest's callback, if one is registered. */
         kbd_maybe_inject_irq();
+        mouse_maybe_call_handler();
         goto set_sregs_regs_and_continue;
       } else {  /* hlt instruction in user code. */
         if (getenv("KD_HLT_TRACE")) {
@@ -576,6 +582,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
                * its ISR reads port 0x60 and fills the BDA buffer itself —
                * this is what wakes QuickBASIC's sti;hlt idle loop. */
               kbd_maybe_inject_irq();
+              mouse_maybe_call_handler();
             }
             /* PIT IRQ0 for guests halted in sti;hlt (see the TICK case):
              * protected-mode extenders such as Borland RTM sleep here waiting
@@ -593,7 +600,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
             }
             usleep(1000);  /* Prevent busy loop if guest issues tight hlt with IF=0. */
           }
-          break;
+          goto set_sregs_regs_and_continue;  /* Push regs: injection may have changed them. */
         } else {
           fprintf(stderr, "fatal: unexpected hlt\n");
           goto fatal;
@@ -609,6 +616,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
       { const int isr = guest_int9_hooked(mem);
         (void)tty_drain(tty_state, mem, !isr);
         kbd_maybe_inject_irq();
+        mouse_maybe_call_handler();
       }
       /* PIT IRQ0 (~18.2 Hz): protected-mode guests need the real interrupt
        * path (hv_interrupt walks the guest IDT in PM) to run their timer

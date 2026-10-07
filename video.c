@@ -24,6 +24,8 @@ static char vid_release_registered = 0;
 
 int vid_cur_shape = -2;   /* Last emitted DECSCUSR style (0..7) or -1 hidden; -2 = unknown. */
 
+static int vid_mouse_cell = -1;   /* Screen cell holding the int 33h software cursor; -1 = hidden. */
+
 static const unsigned short cp437_high[128] = {
   0x00c7, 0x00fc, 0x00e9, 0x00e2, 0x00e4, 0x00e0, 0x00e5, 0x00e7,
   0x00ea, 0x00eb, 0x00e8, 0x00ef, 0x00ee, 0x00ec, 0x00c4, 0x00c5,
@@ -73,20 +75,31 @@ void vid_term_release(void) {  /* Registered via atexit(). */
   if (vid_raw_taken && vid_tty_fd >= 0) tcsetattr(vid_tty_fd, 0, &vid_saved_tio);
   vid_raw_taken = 0;
   if (vid_altscreen) {
-    static const char leave_seq[] = "\x1b[0m\x1b[?12l\x1b[?25h\x1b[0 q\x1b[?1049l";
+    /* Mouse reporting off, kitty-keyboard stack pop, then leave alt screen.
+     * Terminals without those modes ignore the sequences. */
+    static const char leave_seq[] = "\x1b[0m\x1b[?12l\x1b[?25h\x1b[0 q\x1b[?1003l\x1b[?1006l\x1b[<u\x1b[?1049l";
     (void)!write(1, leave_seq, sizeof(leave_seq) - 1);
     vid_altscreen = 0;
   }
 }
 
 void vid_enter(void) {  /* Activate text mode (alt screen + fresh repaint). */
-  static const char enter_seq[] = "\x1b[?1049h\x1b[2J\x1b[H\x1b[?12h";  /* ?12h enables a blinking cursor; vid_render() places it at the DOS cursor. */
+  /* ?12h enables a blinking cursor; vid_render() places it at the DOS cursor.
+   * CSI >31u pushes kitty-keyboard flags 1+2+4+8+16 (disambiguate, event
+   * types, alternate keys, all keys as escapes, associated text): that is
+   * the only terminal protocol reporting bare-modifier key events, which
+   * DOS IDEs need for press-and-release Alt (menu activation) plus real
+   * make/break scancodes.  ?1003h/?1006h request any-motion SGR mouse
+   * reports for the int 33h driver.  Unsupported terminals ignore all of
+   * these, falling back to legacy ESC-prefix decoding. */
+  static const char enter_seq[] = "\x1b[?1049h\x1b[2J\x1b[H\x1b[?12h\x1b[>31u\x1b[?1003h\x1b[?1006h";
   if (!vid_release_registered) { vid_release_registered = 1; atexit(vid_term_release); }
   if (!vid_altscreen) { (void)!write(1, enter_seq, sizeof(enter_seq) - 1); vid_altscreen = 1; }
   memset(vid_shadow, 0xff, sizeof(vid_shadow));  /* Force a full repaint. */
   vid_last_attr = -1;
   vid_last_cur = ~0u;
   vid_cur_shape = -2;
+  vid_mouse_cell = -1;
   vid_active = 1;
 }
 
@@ -133,12 +146,32 @@ void vid_render(void *mem) {
     if (filled < 80) return;
     vid_enter();
   }
+  /* The int 33h software cursor is drawn on top of vram like the real text
+   * cursor (the cell is emitted masked, vram itself untouched).  When it
+   * appears or moves, both the old and new cells must repaint. */
+  {
+    const int mc = (((const unsigned char*)mem)[0x449] <= 3 ||
+                    ((const unsigned char*)mem)[0x449] == 7)
+                       ? mouse_cursor_cell()
+                       : -1;
+    if (mc != vid_mouse_cell) {
+      if (vid_mouse_cell >= 0) { vid_shadow[vid_mouse_cell << 1] = 0xff; vid_shadow[(vid_mouse_cell << 1) + 1] = 0xff; }
+      if (mc >= 0) { vid_shadow[mc << 1] = 0xff; vid_shadow[(mc << 1) + 1] = 0xff; }
+      vid_mouse_cell = mc;
+    }
+  }
   la = vid_last_attr;
   expect = -1;  /* Next cell index that needs no cursor-position escape. */
   for (i = 0; i < VID_COLS * VID_ROWS; ++i) {
-    const unsigned char ch = v[i << 1], at8 = v[(i << 1) + 1];
-    if (ch == vid_shadow[i << 1] && at8 == vid_shadow[(i << 1) + 1]) continue;
-    vid_shadow[i << 1] = ch; vid_shadow[(i << 1) + 1] = at8;
+    const unsigned char ch0 = v[i << 1], at0 = v[(i << 1) + 1];
+    unsigned char ch = ch0, at8 = at0;
+    if (ch0 == vid_shadow[i << 1] && at0 == vid_shadow[(i << 1) + 1]) continue;
+    if (i == vid_mouse_cell) {  /* Apply the (cell & AND) ^ XOR text cursor on emit; the shadow keeps raw vram. */
+      const unsigned w = ((((unsigned)at0 << 8) | ch0) & mouse_cursor_and()) ^ mouse_cursor_xor();
+      ch = (unsigned char)w;
+      at8 = (unsigned char)(w >> 8);
+    }
+    vid_shadow[i << 1] = ch0; vid_shadow[(i << 1) + 1] = at0;
     if (o > out + sizeof(out) - 64) { (void)!write(1, out, o - out); o = out; la = -1; expect = -1; }
     /* A row boundary always needs a fresh cursor-position escape, even
      * when the cell index is contiguous: without it the terminal wraps

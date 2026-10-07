@@ -158,6 +158,7 @@ int int29_dispatch(void);
 int int20_dispatch(void);
 int int22_dispatch(void);
 int int0d_dispatch(void);
+int int33_dispatch(void);
 int int00_dispatch(void);
 int int03_dispatch(void);
 

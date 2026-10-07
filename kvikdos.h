@@ -361,9 +361,14 @@ int open_dos_file(const char *dos_filename, const char *dos_prog_abs, int flags,
 void get_dos_abspath_r(const char *p, const DirState *dir_state, char *out_buf, unsigned out_size);
 unsigned char run_dos_prog(struct EmuState *emu, const char *prog_filename, const char *dpmi_host, const char *args_str, const char* const *args, DirState *dir_state, TtyState *tty_state, const EmuParams *emu_params, const char* const *envp0, const char* const *extra_env, unsigned extra_env_count);
 int tty_getc(TtyState *tty_state, int ms);
-int apply_mod(int k, int mod);
-int decode_esc(const unsigned char *b, int n);
-int read_keycode(TtyState *tty_state, int c);
+/* tty_decode() event returns: >=0 is a BIOS keycode word; KEV_NONE means a
+ * consumed event with no guest keycode (mouse report, key release, unknown
+ * sequence); KEV_SHIFT means a modifier/lock transition — tty_mods then
+ * holds the new BDA 0x417 byte for the caller to apply. */
+#define KEV_NONE  (-1)
+#define KEV_SHIFT (-2)
+extern unsigned tty_mods;  /* BDA 0x417-format modifier+lock bits of the last decoded event. */
+int tty_decode(TtyState *tty_state, int c);
 void process_key(TtyState *tty_state, unsigned char ah, unsigned short *ax, unsigned short *flags);
 void tty_ensure_raw(TtyState *tty_state);
 int tty_drain(TtyState *tty_state, void *mem, int bios_push);
@@ -377,10 +382,20 @@ int kbd_pop(void *mem);
 int kbd_peek(void *mem);
 int tty_raw_pending(void);
 int tty_raw_pop(void);
+void tty_raw_push(unsigned scan);  /* Feed one byte to the port-0x60 make/break ring (called by ttydec.c). */
 int tty_bk_pop(unsigned *key_out, unsigned *mods_out);
 int tty_bk_pending(void);
 int kbd_can_push(const void *mem);
 void kbd_maybe_inject_irq(void);
+/* int 33h mouse driver (mouse.c): host pointer events from ttydec.c, the
+ * software text cursor for video.c, and per-load reset from vm.c. */
+void mouse_reset(void);
+void mouse_host_event(int px, int py, int evbtn, int evkind);
+void mouse_maybe_call_handler(void);
+void mouse_cbk_return(void);
+int mouse_cursor_cell(void);
+unsigned short mouse_cursor_and(void);
+unsigned short mouse_cursor_xor(void);
 /* Push a real interrupt frame (FLAGS,CS,IP) on the guest stack and jump to
  * the guest's IVT[n] handler — manual IRQ injection, no irqchip needed.
  * Only inject when IF=1; the ISR's iret returns to the interrupted flow. */

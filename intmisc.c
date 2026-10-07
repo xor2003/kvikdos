@@ -377,6 +377,7 @@ int int_dispatch(void) {
   case 0x00: return int00_dispatch();
   case 0x08: return IA_NEXT;  /* IRQ0 timer landing on our stub (no guest handler): the BDA tick is updated by the run loop, so a plain iret is the right no-op — like a BIOS default handler. */
   case 0x03: return int03_dispatch();
+  case 0x33: return int33_dispatch();
   }
   return IA_FATAL_INT;
 }
