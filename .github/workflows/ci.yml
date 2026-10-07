@@ -188,6 +188,9 @@ jobs:
             Write-Host 'unexpected failure without WHPX diagnostic'
             exit 1
           }
+          # The graceful-failure path leaves $LASTEXITCODE=1 from the native
+          # call, which pwsh propagates as a step failure -- succeed explicitly.
+          exit 0
 
   release:
     needs: [linux, linux-distro, windows]
