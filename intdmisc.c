@@ -477,8 +477,9 @@ int i21_misc(void) {
   /* Set verify flag. */
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
   }   else if (ah == 0x4d) {
-  /* Get return code from child process. */
-            *(unsigned short*)&regs.rax = ((unsigned short)last_exec_return_code) << 8;
+  /* Get return code from child process: AL = exit code, AH = termination
+   * type (0 normal, 1 Ctrl-C, 2 critical error, 3 TSR). */
+            *(unsigned short*)&regs.rax = ((unsigned short)last_exec_exit_type << 8) | (unsigned char)last_exec_return_code;
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
   }   else if (ah == 0x66) {
   /* Get/set global code page. */

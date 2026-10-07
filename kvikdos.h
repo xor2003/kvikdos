@@ -190,6 +190,7 @@ typedef struct EmuState {
   void *mem;
   void *xmem;  /* Extended memory: guest physical [0x100000, 0x100000 + xmem_size). */
   unsigned long xmem_size;  /* Bytes. 0 if --mem-mb=1. */
+  void *bios_rom;  /* Read-only BIOS ROM page mapped at 0xf0000-0xfffff. */
   char *ems_pool;  /* Host backing store for the EMS page frame, lazily allocated. */
   unsigned ems_pool_pages;
 } EmuState;
@@ -216,6 +217,10 @@ extern const char default_program_mcb[16];
 extern const char freed_mcb[16];
 extern int mapped_handles[20 - 5];
 extern char exec_fnbuf[LINUX_PATH_SIZE];  /* Used temporarily by run_dos_prog. */
+extern char exec_tail_buf[0x80];  /* Command tail for an in-VM exec child. */
+extern char linux_prog_buf[LINUX_PATH_SIZE];
+extern unsigned short load_env_para;          /* PSP env_seg override; 0 = default ENV_PARA. */
+extern unsigned short load_block_limit_para;  /* Cap on the child's block; 0 = rest of conventional memory. */
 /* Text-mode renderer state shared between video.c (rendering) and tty.c (raw
  * tty takeover when text mode is active). */
 extern char vid_active;

@@ -5,6 +5,7 @@ void init_emu(struct EmuState *emu) {
   emu->mem = NULL;
   emu->xmem = NULL;
   emu->xmem_size = 0;
+  emu->bios_rom = NULL;
   emu->ems_pool = NULL;
   emu->ems_pool_pages = 0;
 }
@@ -60,6 +61,25 @@ void reset_emu(struct EmuState *emu, const EmuParams *emu_params) {
         perror("fatal: hv_set_memory xmem");
         exit(252);
       }
+    }
+    /* BIOS ROM page (0xf0000-0xfffff), read-only like a real ROM. Without a
+     * mapping, every F-segment read costs an MMIO exit — programs that scan
+     * the ROM area (e.g. Borland RTM does a word-by-word sweep at startup)
+     * would generate hundreds of thousands of exits. Mostly 0xff bytes, plus
+     * the few locations programs probe (kept in sync with mmio_dispatch). */
+    if ((emu->bios_rom = mmap(NULL, 0x10000, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) == MAP_FAILED) {
+      perror("fatal: mmap bios_rom");
+      exit(252);
+    }
+    memset(emu->bios_rom, 0xff, 0x10000);
+    memcpy((char*)emu->bios_rom + 0xfff5, "01/01/92", 8);  /* System BIOS date (same as DOSBox default). */
+    ((char*)emu->bios_rom)[0xfffe] = (char)0xfc;  /* Machine ID: PC AT (same as DOSBox default). */
+    *(unsigned short*)((char*)emu->bios_rom + 0xff7e) = PROGRAM_MCB_PARA;  /* INVARS first-MCB mirror used by masm.exe. */
+    ((char*)emu->bios_rom)[0xfff0] = (char)0xcb;  /* retf at the reset vector: a stray far call returns harmlessly. */
+    if (hv_set_memory(emu->hv, 3, 0xf0000, 0x10000, emu->bios_rom, 1) < 0) {
+      perror("fatal: hv_set_memory bios_rom");
+      exit(252);
     }
     if (hv_create_vcpu(emu->hv) < 0) exit(252);
     if (hv_get_sregs(emu->hv, &emu->initial_sregs) < 0) {  /* Will be reused by DOS exec(). */

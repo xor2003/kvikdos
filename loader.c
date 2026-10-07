@@ -213,8 +213,11 @@ static const unsigned char fixed_exepack_stub[283] = {
 
 char *load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, struct kvm_regs *regs, struct kvm_sregs *sregs, unsigned short *block_size_para_out, unsigned psp_para) {
 #define MEMSIZE_AVAILABLE_PARA ((DOS_MEM_LIMIT >> 4) - psp_para - 0x10 /* PSP */)
-  const unsigned memsize_available_para = MEMSIZE_AVAILABLE_PARA;
+  unsigned memsize_available_para = MEMSIZE_AVAILABLE_PARA;
   char *psp;
+  /* An in-VM exec child may only claim its allocated MCB block. */
+  if (load_block_limit_para && memsize_available_para + 0x10 > load_block_limit_para)
+    memsize_available_para = load_block_limit_para > 0x10 ? load_block_limit_para - 0x10 : 0;
   if (header_size >= 24 && (('M' | 'Z' << 8) == ((unsigned short*)header)[EXE_SIGNATURE] || ('M' << 8 | 'Z') == ((unsigned short*)header)[EXE_SIGNATURE])) {
     const unsigned short * const exehdr = (const unsigned short*)header;
     const unsigned short nblocks = exehdr[EXE_NBLOCKS] & 0x7ff;  /* Turbo C++ 3 BOSS NE stub. Mask to 1 MiB. */

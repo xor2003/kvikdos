@@ -29,9 +29,22 @@ int int29_dispatch(void) {
   return IA_NEXT;
 }
 
+/* Program termination: at the top level it ends the VM run; under an
+ * exec'd child it records the child's exit code and pops back to the
+ * suspended parent (DOS process semantics). */
+int exit_or_pop2(unsigned char rc, unsigned char type) {
+  last_exec_return_code = rc;
+  last_exec_exit_type = type;
+  return exec_depth != 0 ? IA_EXEC_POP : IA_EXIT;
+}
+
+int exit_or_pop(unsigned char rc) {
+  return exit_or_pop2(rc, 0);
+}
+
 int int20_dispatch(void) {
 *(unsigned char*)&regs.rax = 0;  /* EXIT_SUCCESS. */
-return IA_EXIT;
+return exit_or_pop(0);
   return IA_NEXT;
 }
 
@@ -217,18 +230,15 @@ int int2f_dispatch(void) {
           *(unsigned short*)&regs.rax = 0;  /* Not running under Windows/386 enhanced services. */
         } else if (*(unsigned short*)&regs.rax == 0xed10) {  /* LINK.EXE probe in some MASM/MSC toolchains. */
           *(unsigned short*)&regs.rax = 0;  /* Not installed / no service. */
-        } else if (*(unsigned short*)&regs.rax == 0x1687) {  /* DPMI. */
-          if (!dpmi_warned && dos_prog_abs &&
-              (strstr(dos_prog_abs, "BCC.EXE") || strstr(dos_prog_abs, "bcc.exe") ||
-               strstr(dos_prog_abs, "32RTM.EXE") || strstr(dos_prog_abs, "32rtm.exe"))) {
-            fprintf(stderr, "info: DPMI/protected-mode runtime requested, but kvikdos supports real-mode DOS only.\n");
-            dpmi_warned = 1;
-          }
-          /* Keep it as is, DPMI not installed. */
-        } else if (*(unsigned short*)&regs.rax == 0xfb42) {
-          *(unsigned short*)&regs.rax = 0;  /* Not installed / no service. */
-        } else if (*(unsigned short*)&regs.rax == 0xfb43) {
-          *(unsigned short*)&regs.rax = 0;  /* Not installed / no service. */
+        } else if (*(unsigned short*)&regs.rax == 0x1687) {  /* DPMI host probe. */
+          /* Keep AX unchanged: no resident DPMI host yet (an external host
+           * such as CWSDPMI/HDPMI32/DPMIRES may install itself later). */
+        } else if (*(unsigned short*)&regs.rax == 0xfb42 ||
+                   *(unsigned short*)&regs.rax == 0xfb43) {
+          /* Borland RTM/DPMI multiplex: leave AX unchanged so the stub sees
+           * "no resident host" and loads DPMI16BI.OVL itself (upstream pts
+           * behavior; returning AX=0 makes BC.EXE/TLINK.EXE fail with
+           * "Failed to locate DPMI server"). */
         } else { 
           if (!emu_params->strict_mode) {
             *(unsigned short*)&regs.rax = 0;
@@ -330,11 +340,13 @@ int int0d_dispatch(void) {
 
 int int00_dispatch(void) {
 /* Division by zero. */
-        /* This is called only if the program doesn't override the interrupt vector.
-         * Example instructions: `xor ax, ax', `div ax'.
-         */
-        fprintf(stderr, "fatal: unhandled division by zero cs:%04x ip:%04x\n", int_cs, int_ip);
-  return IA_NEXT;
+        /* Reached only when the program hasn't overridden IVT[0] — either a
+         * real CPU #DE or a software `int 0'.  Real DOS prints "Divide
+         * error" and aborts the program; returning to the faulting div
+         * would just retrap forever, so terminate the program instead. */
+        fprintf(stderr, "Divide error at cs:%04x ip:%04x, aborting program.\n", int_cs, int_ip);
+  *(unsigned short*)&regs.rax = 0xf0;  /* Unsuccessful termination, like DOS aborting the program. */
+  return exit_or_pop2(0xf0, 2);  /* Termination type 2 = critical error/abort. */
 }
 
 int int03_dispatch(void) {
@@ -363,6 +375,7 @@ int int_dispatch(void) {
   case 0x09: return int09_dispatch();
   case 0x0d: return int0d_dispatch();
   case 0x00: return int00_dispatch();
+  case 0x08: return IA_NEXT;  /* IRQ0 timer landing on our stub (no guest handler): the BDA tick is updated by the run loop, so a plain iret is the right no-op — like a BIOS default handler. */
   case 0x03: return int03_dispatch();
   }
   return IA_FATAL_INT;

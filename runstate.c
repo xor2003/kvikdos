@@ -27,6 +27,10 @@ const char *g_prog_args_str;
 const char* const *g_prog_args;
 char dpmi_linux_buf[LINUX_PATH_SIZE];
 char target_prog_buf[LINUX_PATH_SIZE];
+ExecSave exec_stack[EXEC_SAVE_MAX];
+unsigned exec_depth;
+unsigned short load_env_para;
+unsigned short load_block_limit_para;
 unsigned int_num;
 unsigned short int_cs, int_ip;
 unsigned short *csip_ptr;
@@ -52,7 +56,6 @@ char video_byte_written;
 const char *stdout_write_p;
 const char *stdout_write_end;
 char is_stdout_write_cursor;
-char dpmi_warned;
 unsigned long xms_block_kb[XMS_HANDLE_COUNT];
 unsigned short xms_block_sizes_kb[XMS_HANDLE_COUNT];
 unsigned short xms_lock_counts[XMS_HANDLE_COUNT];
@@ -71,6 +74,7 @@ char find_linux_dir[LINUX_PATH_SIZE];
 char find_dos_pattern[13];
 unsigned short find_attrs;
 unsigned char last_exec_return_code;
+unsigned char last_exec_exit_type;
 unsigned hlt_spin_count;
 unsigned fcb_lin_table[FCB_FILE_COUNT];
 int fcb_fd_table[FCB_FILE_COUNT];
@@ -78,6 +82,8 @@ unsigned current_psp_para;
 unsigned vid_tick;
 
 char exec_fnbuf[LINUX_PATH_SIZE];  /* Used temporarily by run_dos_prog. */
+char exec_tail_buf[0x80];  /* Command tail for an in-VM exec child. */
+char linux_prog_buf[LINUX_PATH_SIZE];  /* Stable storage for dir_state->linux_prog: prog_filename points into the shared fnbuf scratch buffer, which every dos_open resolution overwrites. */
 
 
 /* do_exit: flush the final video frame, close findfirst state and emit the

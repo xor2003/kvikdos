@@ -7,6 +7,15 @@ static void sigalrm_bda_tick(int sig) {
   if (mem) bda_update_ticks(mem);
 }
 
+/* PIT IRQ0 pacing: true once per ~55 ms BIOS tick. Shared by the hlt-idle
+ * and TICK injection sites so a fast hlt loop can't overdrive IRQ0. */
+static int irq0_due(unsigned long ticks_now) {
+  static unsigned long irq0_last = ~0UL;
+  if (irq0_last != ~0UL && ticks_now - irq0_last < 1) return 0;
+  irq0_last = ticks_now;
+  return 1;
+}
+
 unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, const char *dpmi_host, const char *args_str, const char* const *args, DirState *dir_state0, TtyState *tty_state0, const EmuParams *emu_params0, const char* const *envp0, const char* const *extra_env, unsigned extra_env_count) {
   emu = emu0;
   dir_state = dir_state0;
@@ -58,7 +67,6 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
   video_byte_written = 0;  /* Pacify uninitialized warnings. */
   stdout_write_p = NULL;  /* Pacify uninitialized warnings. */
   stdout_write_end = NULL;  /* Pacify uninitialized warnings. */
-  dpmi_warned = 0;
   memset(xms_block_kb, 0, sizeof(xms_block_kb));
   memset(xms_block_sizes_kb, 0, sizeof(xms_block_sizes_kb));
   memset(xms_lock_counts, 0, sizeof(xms_lock_counts));
@@ -85,7 +93,11 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
   find_dos_pattern[0] = '\0';
   find_attrs = 0;
   last_exec_return_code = 0;
+  last_exec_exit_type = 0;
   hlt_spin_count = 0;
+  exec_depth = 0;
+  load_env_para = 0;
+  load_block_limit_para = 0;
 
  do_exec:
   header_size = detect_dos_executable_program(img_fd, load_prog, header);
@@ -160,17 +172,37 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
       memcpy(psp_args, load_args_str ? load_args_str : "", size);
       psp_args[size] = '\r';
     }
+    if (load_env_para) {  /* In-VM exec child: env_seg from the exec block. */
+      *(unsigned short*)((char*)mem + (load_psp_para << 4) + 0x2c) = load_env_para;
+      load_env_para = 0;
+    }
+  }
+  if (load_block_limit_para) {  /* Free the unused tail of an exec child's block. */
+    char * const cmcb = (char*)mem + ((load_psp_para << 4) - 16);
+    const unsigned used = MCB_SIZE_PARA(cmcb);
+    if (used + 1 < load_block_limit_para) {
+      char * const tail = cmcb + ((used + 1) << 4);
+      const char tail_type = MCB_TYPE(cmcb);
+      memcpy(tail, default_program_mcb, 16);
+      MCB_TYPE(tail) = tail_type;
+      MCB_PID(tail) = 0;
+      MCB_PSIZE_PARA(tail) = (unsigned short)used;
+      MCB_SIZE_PARA(tail) = (unsigned short)(load_block_limit_para - used - 1);
+      MCB_TYPE(cmcb) = 'M';
+    }
+    load_block_limit_para = 0;
   }
   if (img_fd >= 0) close(img_fd);
 
   /* http://www.techhelpmanual.com/346-dos_environment.html */
-  { char *env = (char*)mem + (ENV_PARA << 4), *env0 = env;
+  if (exec_depth == 0) {  /* In-VM exec children reuse the parent's env block as-is: their PSP env_seg comes from load_env_para, and rewriting the shared argv0 trailer would corrupt the parent's view (Borland RTM reads it). */
+    char *env = (char*)mem + (ENV_PARA << 4), *env0 = env;
     char * const env_end = (char*)mem + ENV_LIMIT;
     char do_set_dos_path = 1;  /* This is smart, but an accasional chdir may ruin it: !(dos_prog_abs[0] == dir_state->drive && dos_prog_abs[1] == ':' && dos_prog_abs[2] == '\\' && strchr(dos_prog_abs + 3, '\\') == 0); */
     char do_clear_after_env = envp0 == NULL;
     if (do_clear_after_env) {
-      while (*env++ != '\0') {
-        if (DEBUG || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: reusing env var (%s)\n", env - 1);
+      while (*env != '\0') {
+        if (DEBUG || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: reusing env var (%s)\n", env);
         if (!(env = memchr(env, '\0', env_end - env))) {
           fprintf(stderr, "fatal: exec environment too large\n");
           exit(252);
@@ -327,7 +359,11 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
   tick_count = 0;
   sphinx_cmm_flags = 0;
   ctrl_break_checking = 0;
-  dir_state->linux_prog = load_prog;
+  if (exec_depth == 0) {  /* Keep the top program's dos_prog_abs->linux_prog alias across in-VM exec children, so the parent can still open its own .exe (Borland RTM reads the bound app image from it). load_prog aliases the fnbuf scratch buffer that file opens reuse — copy to stable storage. */
+    strncpy(linux_prog_buf, load_prog, sizeof(linux_prog_buf) - 1);
+    linux_prog_buf[sizeof(linux_prog_buf) - 1] = '\0';
+    dir_state->linux_prog = linux_prog_buf;
+  }
   dta_seg_ofs = 0x80 | load_psp_para << 16;
   ongoing_set_int = 0;  /* No set_int operation ongoing. */
   last_dos_error_code = 0;
@@ -384,6 +420,16 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
     }
     if (DEBUG || DIAG_ON(DIAG_BIT_VERBOSE)) dump_regs("debug", &regs, &sregs);
 
+    if (getenv("KD_REASON_TRACE")) {
+      static unsigned rc[16];
+      static unsigned long rtot;
+      if ((unsigned)hx.reason < 16) ++rc[hx.reason];
+      if (++rtot == 20000) {
+        int i;
+        for (i = 0; i < 16; ++i) if (rc[i]) fprintf(stderr, "reason %d: %u\n", i, rc[i]);
+        rtot = 0; memset(rc, 0, sizeof(rc));
+      }
+    }
     if (hx.reason != HV_EXIT_HLT) hlt_spin_count = 0;
     if (++vid_tick >= 512) { vid_tick = 0; vid_render(mem); }  /* Periodic repaint of the guest text screen. */
     switch (hx.reason) {
@@ -396,9 +442,11 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
       fprintf(stderr, "fatal: shutdown\n");
       exit(252);
      case HV_EXIT_HLT:
-      if (sregs.cs.selector == INT_HLT_PARA && (unsigned)((unsigned)regs.rip - 1) < 0x100) {  /* hlt caused by int through our magic interrupt table. */
-        int_num = ((unsigned)regs.rip - 1) & 0xff;
-        csip_ptr = (unsigned short*)((char*)mem + ((unsigned)sregs.ss.selector << 4) + (*(unsigned short*)&regs.rsp));  /* !! What if rsp wraps around 64 KiB boundary? Test it. Also calculate int_cs again. */
+      /* Match by linear address: extenders (e.g. Borland RTM) may re-encode
+       * vector far-pointers as a different seg:off alias of our stub page. */
+      if ((unsigned)(sregs.cs.base + (unsigned)regs.rip - 1 - (INT_HLT_PARA << 4)) < 0x100) {  /* hlt caused by int through our magic interrupt table. */
+        int_num = (unsigned)(sregs.cs.base + (unsigned)regs.rip - 1 - (INT_HLT_PARA << 4)) & 0xff;
+        csip_ptr = (unsigned short*)((char*)mem + ((unsigned)sregs.ss.base & 0xfffff) + (*(unsigned short*)&regs.rsp));  /* !! What if rsp wraps around 64 KiB boundary? Test it. Also calculate int_cs again. */
         int_ip = csip_ptr[0]; int_cs = csip_ptr[1];  /* Return address. */  /* !! Security: check bounds, also check that rsp <= 0xfffe. */
         ah = ((unsigned)regs.rax >> 8) & 0xff;
         if (DEBUG || DEBUG_INT || DIAG_ON(DIAG_BIT_INT)) fprintf(g_diag_file, "debug: int 0x%02x ah:%02x al:%02x cs:%04x ip:%04x\n", int_num, ah, (unsigned char)regs.rax, int_cs, int_ip);
@@ -410,6 +458,27 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
           goto done_int_call;
         case IA_EXEC:
           goto do_exec;
+        case IA_EXEC_POP:
+          if (exec_depth == 0) return dos_exit();
+          { const ExecSave * const sv = &exec_stack[--exec_depth];
+            char * const cpsp = (char*)mem + ((unsigned)sv->child_psp_para << 4);
+            /* DOS restores the int 22h/23h/24h vectors from the exiting
+             * child's PSP (which holds the parent's values). */
+            memcpy((char*)mem + (0x22 << 2), cpsp + 0x0a, 4);
+            memcpy((char*)mem + (0x23 << 2), cpsp + 0x0e, 4);
+            memcpy((char*)mem + (0x24 << 2), cpsp + 0x12, 4);
+            regs = sv->regs;
+            sregs = sv->sregs;
+            SET_SREG(cs, sv->int_cs);
+            regs.rip = sv->int_ip;
+            if (sv->int_flags & (1 << 9)) *(unsigned short*)&regs.rflags |= (1 << 9);  /* Set IF back to 1 if it was 1. */
+            *(unsigned short*)&regs.rsp += 6;  /* pop ip, pop cs, pop flags. */
+            *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0: exec succeeded. */
+            *(unsigned short*)&regs.rax = 0;
+            current_psp_para = sv->psp_para;
+            if (DEBUG || DIAG_ON(DIAG_BIT_EXEC)) fprintf(g_diag_file, "debug: exec: child exited rc=%u, resuming parent at %04x:%04x\n", (unsigned)last_exec_return_code, sv->int_cs, sv->int_ip);
+          }
+          goto set_sregs_regs_and_continue;
         case IA_EXIT:
           return dos_exit();
         case IA_FATAL:
@@ -444,6 +513,13 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
         kbd_maybe_inject_irq();
         goto set_sregs_regs_and_continue;
       } else {  /* hlt instruction in user code. */
+        if (getenv("KD_HLT_TRACE")) {
+          static unsigned hn;
+          if (++hn < 20) fprintf(stderr, "hlt %s rip=%lx cs=%x:%lx fl=%lx cr0=%lx\n",
+              (sregs.cr0 & 1) ? "PM" : "RM", (unsigned long)regs.rip,
+              (unsigned)sregs.cs.selector, (unsigned long)sregs.cs.base,
+              (unsigned long)regs.rflags, (unsigned long)sregs.cr0);
+        }
         if (emu_params->hlt_dump_filename) {
           const int fd = open(emu_params->hlt_dump_filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
           if (fd >= 0) {
@@ -470,7 +546,8 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
                   sregs.es.selector, sregs.ss.selector);
           return (unsigned char)regs.rax;
         }
-        if (sregs.cs.selector >= PSP_PARA && (emu_params->is_hlt_ok || !emu_params->strict_mode)) {
+        if (((sregs.cr0 & 1) || sregs.cs.selector >= PSP_PARA) &&
+            (emu_params->is_hlt_ok || !emu_params->strict_mode)) {  /* In protected mode cs is a small selector, so the PSP_PARA real-mode check alone would misfire (e.g. Borland RTM idles with hlt). */
           /* The 8253 timer chip increments the counter in each 1 / 1193182s
            * causing IRQ0 at each 65536th increment. kvikdos doesn't implement
            * any of this, but now we wait that approximate amount for `hlt' to
@@ -500,6 +577,13 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
                * this is what wakes QuickBASIC's sti;hlt idle loop. */
               kbd_maybe_inject_irq();
             }
+            /* PIT IRQ0 for guests halted in sti;hlt (see the TICK case):
+             * protected-mode extenders such as Borland RTM sleep here waiting
+             * for the timer tick delivered through their guest IDT. */
+            if (!(pic_isr & 1) && !(pic_imr & 1) && irq0_due(bda_ticks_now())) {
+              pic_isr |= 1;
+              (void)hv_interrupt(hv, 0);
+            }
             bda_update_ticks(mem);
             vid_render(mem);  /* ~18 Hz repaint while the guest idles. */
           } else {
@@ -525,6 +609,16 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
       { const int isr = guest_int9_hooked(mem);
         (void)tty_drain(tty_state, mem, !isr);
         kbd_maybe_inject_irq();
+      }
+      /* PIT IRQ0 (~18.2 Hz): protected-mode guests need the real interrupt
+       * path (hv_interrupt walks the guest IDT in PM) to run their timer
+       * handlers — e.g. Borland RTM idles in sti;hlt waiting for IRQ0.
+       * Delivered via the PIC model like IRQ1: skip while in service or
+       * masked.  In real mode it lands on our int-8 stub harmlessly. */
+      if (!(pic_isr & 1) && !(pic_imr & 1) && (regs.rflags & (1u << 9)) &&
+          irq0_due(bda_ticks_now())) {
+        pic_isr |= 1;
+        (void)hv_interrupt(hv, 0);
       }
       vid_render(mem);
       goto set_sregs_regs_and_continue;  /* Push regs: injection may have changed them. */

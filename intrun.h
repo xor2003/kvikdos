@@ -5,8 +5,9 @@
 
 /* Internal shared state for the DOS run loop and its per-interrupt service
  * handlers. These were locals of run_dos_prog(); run_dos_prog() is not
- * re-entrant (program exec goes through a separate subprocess and overlays use
- * the in-place do_exec reload), so a single shared instance is safe.
+ * re-entrant (a program exec either stays in-VM via the exec_stack below or,
+ * as a fallback, goes through a separate subprocess), so a single shared
+ * instance is safe.
  */
 
 enum { XMS_HANDLE_COUNT = 64 };
@@ -30,8 +31,26 @@ enum {
   IA_EXIT,       /* Terminate the guest; regs.rax holds the DOS exit code (do_exit). */
   IA_FATAL,      /* Fatal error (goto fatal). */
   IA_FATAL_INT,  /* Unexpected/unsupported interrupt (fatal_int label logic). */
-  IA_FATAL_UIC   /* Unimplemented call (fatal_uic label logic). */
+  IA_FATAL_UIC,  /* Unimplemented call (fatal_uic label logic). */
+  IA_EXEC_POP    /* A child program exec'd in-VM exited; resume the parent. */
 };
+
+/* Saved parent context for an in-VM int 21h AH=4Bh (load-and-execute) child.
+ * DOS suspends the parent, runs the child in the same address space, and
+ * resumes the parent when the child exits — the child inherits the parent's
+ * interrupt vectors, which resident DOS extenders (e.g. Borland DPMI16BI via
+ * DPMILOAD) rely on to reach the host services the parent installed. */
+typedef struct ExecSave {
+  struct kvm_regs regs;
+  struct kvm_sregs sregs;
+  unsigned short int_cs, int_ip;  /* Parent's int 21h return frame. */
+  unsigned int_flags;
+  unsigned short psp_para;        /* Parent PSP to restore on pop. */
+  unsigned short child_psp_para;  /* The child's PSP (IVT restore on pop). */
+} ExecSave;
+enum { EXEC_SAVE_MAX = 8 };
+extern ExecSave exec_stack[EXEC_SAVE_MAX];
+extern unsigned exec_depth;
 
 extern struct EmuState *emu;
 extern struct hv *hv;
@@ -88,7 +107,6 @@ extern char video_byte_written;
 extern const char *stdout_write_p;
 extern const char *stdout_write_end;
 extern char is_stdout_write_cursor;
-extern char dpmi_warned;
 extern unsigned long xms_block_kb[XMS_HANDLE_COUNT];
 extern unsigned short xms_block_sizes_kb[XMS_HANDLE_COUNT];
 extern unsigned short xms_lock_counts[XMS_HANDLE_COUNT];
@@ -117,6 +135,9 @@ extern unsigned vid_tick;
 void emit_stdout(void);            /* Write stdout_write_p..stdout_write_end (and paint). */
 unsigned char dos_exit(void);      /* do_exit: cleanup, returns regs.rax exit code. */
 int int_dispatch(void);            /* Route int_num to its handler; returns IA_*. */
+int exit_or_pop(unsigned char rc);                 /* IA_EXIT at top level, IA_EXEC_POP under an exec'd child. */
+int exit_or_pop2(unsigned char rc, unsigned char type);  /* Also records the DOS termination type for AH=4Dh. */
+extern unsigned char last_exec_exit_type;          /* AH=4Dh termination type: 0 normal, 3 TSR, ... */
 int io_dispatch(void);             /* KVM_EXIT_IO port I/O; returns IA_*. */
 int mmio_dispatch(void);           /* KVM_EXIT_MMIO memory access; returns IA_*. */
 

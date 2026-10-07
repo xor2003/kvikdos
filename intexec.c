@@ -6,9 +6,29 @@ int i21_exec(void) {
   if (ah == 0x4c) {
   /* Exit to DOS. */
             if (cleanup_fn[0] != '\0') unlink(get_linux_filename(cleanup_fn));
-            return IA_EXIT;
+            return exit_or_pop((unsigned char)regs.rax);
   }   else if (ah == 0x31) {
   /* Terminate-and-stay-resident (TSR): DX = paragraphs to keep. */
+            if (exec_depth != 0) {
+              /* An exec'd child going TSR: shrink its block to DX paragraphs
+               * (the resident footprint), free the tail, and pop back to the
+               * parent. The claimed MCB keeps the resident code allocated. */
+              const unsigned res_para = (unsigned short)regs.rdx;
+              char * const cmcb = (char*)mem + ((current_psp_para - 1) << 4);
+              const unsigned old_size = MCB_SIZE_PARA(cmcb);
+              if (res_para < old_size) {
+                char * const tail = cmcb + ((res_para + 1) << 4);
+                const char tail_type = MCB_TYPE(cmcb);
+                memcpy(tail, default_program_mcb, 16);
+                MCB_TYPE(tail) = tail_type;
+                MCB_PID(tail) = 0;
+                MCB_PSIZE_PARA(tail) = (unsigned short)res_para;
+                MCB_SIZE_PARA(tail) = (unsigned short)(old_size - res_para - 1);
+                MCB_TYPE(cmcb) = 'M';
+                MCB_SIZE_PARA(cmcb) = (unsigned short)res_para;
+              }
+              return exit_or_pop2((unsigned char)regs.rax, 3);  /* Termination type 3 = TSR. */
+            }
             if (dpmi_host_active) {  /* The resident DPMI host stays; load the real target above it. */
               const unsigned host_psp = load_psp_para;
               char * const host_mcb = (char*)mem + (host_psp << 4) - 16;
@@ -244,6 +264,49 @@ int i21_exec(void) {
                       dos_exec_name = dos_exec_buf;
                     }
                   }
+                }
+                /* In-VM exec (the DOS model): suspend the parent, load the
+                 * child into the first free MCB block in this same address
+                 * space, and resume the parent when the child exits. The
+                 * child inherits the parent's interrupt vectors — resident
+                 * DOS extenders (e.g. Borland RTM + DPMI16BI) depend on this:
+                 * their DPMILOAD child reaches the host services through the
+                 * vectors the parent hooked. */
+                if (exec_depth < EXEC_SAVE_MAX) {
+                  unsigned bp, free_size = 0;
+                  char *fmcb = NULL;
+                  for (bp = PSP_PARA; !is_mcb_bad(mem, bp);) {
+                    char * const m = (char*)mem + (bp << 4) - 16;
+                    if (MCB_PID(m) == 0) { fmcb = m; free_size = MCB_SIZE_PARA(m); break; }
+                    if (MCB_TYPE(m) == 'Z') break;
+                    bp += 1 + MCB_SIZE_PARA(m);
+                  }
+                  if (fmcb != NULL && free_size >= 0x100) {  /* 4 KiB minimum for PSP+image. */
+                    g_prog_filename = get_linux_filename_r(dos_exec_name, dir_state, exec_fnbuf, NULL);
+                    if (g_prog_filename[0] != '\0' &&
+                        (img_fd = open_with_case_fallback(g_prog_filename, O_RDONLY, 0666)) >= 0) {
+                      ExecSave * const sv = &exec_stack[exec_depth++];
+                      sv->regs = regs;
+                      sv->sregs = sregs;
+                      sv->int_cs = int_cs;
+                      sv->int_ip = int_ip;
+                      sv->int_flags = csip_ptr[2];
+                      sv->psp_para = (unsigned short)current_psp_para;
+                      sv->child_psp_para = (unsigned short)bp;
+                      MCB_PID(fmcb) = (unsigned short)bp;  /* Claim the block for the child. */
+                      load_psp_para = bp;
+                      load_prog = g_prog_filename;
+                      load_args = NULL;
+                      memcpy(exec_tail_buf, safe_args, args_size + 1);
+                      load_args_str = exec_tail_buf;
+                      load_env_para = env_para;
+                      load_block_limit_para = (unsigned short)free_size;  /* Cap the child's MCB at the free block's size. */
+                      preserve_low = 1;
+                      if (DEBUG || DIAG_ON(DIAG_BIT_EXEC)) fprintf(g_diag_file, "debug: exec: in-VM child PSP at 0x%04x parent 0x%04x (%s)\n", bp, current_psp_para, dos_exec_name);
+                      return IA_EXEC;
+                    }
+                  }
+                  if (DEBUG || DIAG_ON(DIAG_BIT_EXEC)) fprintf(g_diag_file, "debug: exec: no free MCB block, falling back to subprocess (%s)\n", dos_exec_name);
                 }
                 if (run_dos_child_subprocess(dos_exec_name, safe_args, env, env_end, dir_state, &last_exec_return_code) != 0) {
                   *(unsigned short*)&regs.rax = get_dos_error_code(errno, 0x1f);  /* General failure. */

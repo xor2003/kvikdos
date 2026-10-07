@@ -161,7 +161,7 @@ int i21_mem(void) {
                             fit_prev_block_para, fit_block_para, fit_block_para + MCB_SIZE_PARA(mcb) + 1, fit_block_para + alloc_size_para + 1,
                             fit_block_para + MCB_SIZE_PARA(mcb) + 1 == fit_block_para + alloc_size_para + 1, malloc_strategy);
                   }
-                  if (free_mcb == next_mcb) {  /* Exact fit. */
+                  if (free_mcb == next_mcb || fit_block_para + alloc_size_para + 1 >= DOS_ALLOC_PARA_LIMIT) {  /* Exact fit, or a remainder too small to hold a free-tail MCB at the arena top: DOS merges it into the allocated block. */
                     if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: malloc exact fit\n");
                   } else if (malloc_strategy == MS_LAST_FIT) {  /* Not an exact fit, prepend a free block. */
                     char * const after_mcb = mcb + ((MCB_SIZE_PARA(mcb) - alloc_size_para) << 4);

@@ -151,7 +151,10 @@ static int kvm_set_sregs(struct hv *hv, const struct kvm_sregs *sregs) {
 static int kvm_interrupt(struct hv *hv, unsigned irq_line) {
   struct kvm_impl *ki = (struct kvm_impl*)hv->impl;
   struct kvm_interrupt irq;
-  irq.irq = irq_line;
+  /* KVM_INTERRUPT injects a vector, not a line: translate through the PIC
+   * base like real hardware (master ICW2=8, slave ICW2=0x70 — same mapping
+   * hv_whpx.c applies for WHvRequestInterrupt). */
+  irq.irq = irq_line < 8 ? 8 + irq_line : 0x68 + irq_line;
   return kvm_ioctl(ki->vcpu_fd, KVM_INTERRUPT, &irq) < 0 ? -1 : 0;
 }
 
