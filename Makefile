@@ -1,4 +1,4 @@
-.PHONY: all clean run test test-batch test-mem test-cli test-cli-matrix test-static test-sanitizers test-valgrind test-tooling test-x86dec ape lint
+.PHONY: all clean run test test-batch test-mem test-cli test-cli-matrix test-static test-sanitizers test-valgrind test-tooling test-x86dec ape dist lint
 .SUFFIXES:
 MAKEFLAGS += -r
 
@@ -16,7 +16,7 @@ SRCDEPS = $(KVIKDOS_SRCS) kvikdos.h mini_kvm.h mini_whpx.h hv.h x86dec.h
 all: $(ALL)
 
 clean:
-	rm -f $(ALL) kvikdos32 kvikdos64 kvikdos.static kvikdos.ape
+	rm -rf $(ALL) kvikdos32 kvikdos64 kvikdos.static kvikdos.ape kvikdos.ape.elf dist
 
 run: kvikdos guest.com
 	./kvikdos guest.com hello world
@@ -70,15 +70,28 @@ kvikdos.diet: $(SRCDEPS)
 # backend) and Windows (WHPX backend, picked via IsWindows()). The
 # single-arch unknown-cosmo target is used deliberately: KVM/WHPX are
 # x86-only hypervisors, so the aarch64 half of a fat cosmopolitan binary
-# would be dead weight. Stripped for release. Copy/rename kvikdos.ape to
-# kvikdos.com (or .exe) to run it on Windows.
+# would be dead weight. COSMOCC's own linker output is a host ELF that
+# merely *contains* the APE image; `objcopy -S -O binary' flattens the
+# load segments into the real MZqFpD-headered portable executable (the
+# same step the toolchain wrapper applies to .com/.exe outputs). The APE
+# is the shipped executable: `make dist' stages it as dist/kvikdos
+# (Linux) and dist/kvikdos.com (Windows).
 COSMOCC ?= x86_64-unknown-cosmo-cc
-COSTRIP ?= x86_64-unknown-cosmo-strip
+COOBJCOPY ?= x86_64-linux-cosmo-objcopy
 kvikdos.ape: $(SRCDEPS)
-	$(COSMOCC) -O2 -o $@ $(KVIKDOS_SRCS)
-	$(COSTRIP) $@
+	$(COSMOCC) -O2 -o $@.elf $(KVIKDOS_SRCS)
+	$(COOBJCOPY) -S -O binary $@.elf $@
+	rm -f $@.elf
 
 ape: kvikdos.ape
+
+# Release staging: the APE is the main executable — dist/kvikdos for
+# Linux, dist/kvikdos.com for Windows (same file, both names).
+dist: kvikdos.ape
+	mkdir -p dist
+	cp kvikdos.ape dist/kvikdos
+	cp kvikdos.ape dist/kvikdos.com
+	chmod 755 dist/kvikdos dist/kvikdos.com
 
 # Host-native unit test for the mini instruction decoder the WHPX backend
 # uses to complete memory-access exits (no guest or hypervisor needed).

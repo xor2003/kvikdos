@@ -29,7 +29,12 @@ pattern (cppcheck) — do not weaken the gate to hide diagnostics.
 - `make test-sanitizers` — gcc+clang ASan/UBSan (UBSan reports misaligned
   guest-memory accesses; those are inherent to a DOS emulator).
 - `make kvikdos.ape` — Cosmopolitan APE (Linux KVM + Windows WHPX in one
-  binary); set `COSMOCC`/`COSTRIP` to the x86_64-unknown-cosmo tools.
+  binary); set `COSMOCC`/`COOBJCOPY` to the cosmo tools
+  (`x86_64-unknown-cosmo-cc` + `x86_64-linux-cosmo-objcopy`). The linker
+  output is a host ELF wrapping the APE image; objcopy `-O binary`
+  flattens it into the real MZqFpD portable executable.
+- `make dist` — release staging: the APE is the shipped executable, staged
+  as `dist/kvikdos` (Linux) + `dist/kvikdos.com` (Windows).
 
 ## Conventions
 

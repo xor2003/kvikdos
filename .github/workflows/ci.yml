@@ -76,16 +76,16 @@ jobs:
           curl -fsSL -o /tmp/cosmocc.zip "https://cosmo.zip/pub/cosmocc/cosmocc-${{ env.COSMOCC_VERSION }}.zip"
           unzip -q /tmp/cosmocc.zip -d "$HOME/cosmocc"
 
-      - name: Build stripped APE (one binary for Linux + Windows)
+      - name: Build stripped APE + stage dist (one binary for Linux + Windows)
         if: matrix.os == 'ubuntu-24.04'
         run: |
-          make kvikdos.ape \
+          make dist \
             COSMOCC="$HOME/cosmocc/bin/x86_64-unknown-cosmo-cc" \
-            COSTRIP="$HOME/cosmocc/bin/x86_64-unknown-cosmo-strip"
+            COOBJCOPY="$HOME/cosmocc/bin/x86_64-linux-cosmo-objcopy"
 
       - name: Smoke-test APE on Linux via KVM
         if: matrix.os == 'ubuntu-24.04' && steps.kvm.outputs.available == 'yes'
-        run: ./kvikdos.ape guest.com ci | grep -F "Hello, World!"
+        run: ./dist/kvikdos guest.com ci | grep -F "Hello, World!"
 
       - name: Upload binaries
         if: matrix.os == 'ubuntu-24.04'
@@ -93,8 +93,8 @@ jobs:
         with:
           name: binaries
           path: |
-            kvikdos
-            kvikdos.ape
+            dist/kvikdos
+            dist/kvikdos.com
           if-no-files-found: error
 
   linux-distro:
@@ -168,7 +168,6 @@ jobs:
       - name: Smoke-test APE on Windows (usage banner)
         shell: pwsh
         run: |
-          Copy-Item kvikdos.ape kvikdos.com
           $out = .\kvikdos.com | Out-String
           $out
           if ($out -notmatch 'run DOS programs') { exit 1 }
@@ -204,9 +203,8 @@ jobs:
       - name: Package release assets
         run: |
           cd dist
-          chmod 755 kvikdos
-          cp kvikdos.ape kvikdos.com   # .com extension so Windows runs the APE
-          sha256sum kvikdos kvikdos.com kvikdos.ape > SHA256SUMS.txt
+          chmod 755 kvikdos kvikdos.com
+          sha256sum kvikdos kvikdos.com > SHA256SUMS.txt
 
       - name: Create GitHub release
         env:
@@ -216,4 +214,4 @@ jobs:
           gh release create "${{ github.ref_name }}" \
             --title "kvikdos ${{ github.ref_name }}" \
             --generate-notes \
-            kvikdos kvikdos.com kvikdos.ape SHA256SUMS.txt
+            kvikdos kvikdos.com SHA256SUMS.txt
