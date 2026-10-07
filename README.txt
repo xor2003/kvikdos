@@ -1,16 +1,22 @@
-kvikdos: a very fast headless DOS emulator for Linux
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-kvikdos is a very fast emulator for running DOS programs on Linux, both
-real-mode and 32-bit protected-mode. Typical targets are old compilers,
-assemblers and other build tools, plus text-mode IDEs and editors.
-kvikdos implements a very small subset of DOS, BIOS and IBM PC harware, so
-it can keep the overhead low, so it can be very fast. It uses Linux KVM
-under the hood for emulating the CPU, which is also very fast.
+kvikdos-ng: a very fast headless DOS emulator for Linux and Windows
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+kvikdos-ng is a very fast emulator for running DOS programs on Linux (and,
+via the cosmopolitan build, Windows), both real-mode and 32-bit
+protected-mode. Typical targets are old compilers, assemblers and other
+build tools, plus text-mode IDEs and editors. kvikdos-ng implements a very
+small subset of DOS, BIOS and IBM PC harware, so it can keep the overhead
+low, so it can be very fast. It uses Linux KVM under the hood for
+emulating the CPU (or Windows WHPX), which is also very fast.
 
-kvikdos is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.
+kvikdos-ng is a fork of kvikdos by Peter Szabo
+(https://github.com/pts/kvikdos), extended with external-DPMI
+protected-mode support, an 80x25 text mode for IDEs, and the
+Windows/WHPX backend. The binary is still named `kvikdos`.
 
-kvikdos should be pronunced as ``quick DOS''. the initials ``kv'' refers to
-KVM, the underlying virtualization technology.
+kvikdos-ng is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.
+
+kvikdos-ng should be pronunced as ``quick DOS''. the initials ``kv'' refers to
+KVM, the original virtualization technology.
 
 Features at a glance:
 
@@ -89,24 +95,24 @@ Requirements:
 
 Limitations:
 
-* On Linux, kvikdos runs the virtual CPU through /dev/kvm; it has been
+* On Linux, kvikdos-ng runs the virtual CPU through /dev/kvm; it has been
   tested and found working with both: Linux compiled for i386 and Linux
   compiled for amd64. The cosmopolitan (APE) build adds a Windows host
   path: the same single binary loads WinHvPlatform.dll and runs the guest
   through WHPX when it detects Windows at runtime (the backend layer is
   in hv.h/hv_kvm.c/hv_whpx.c; WHPX exit completion needs the small
   instruction decoder in x86dec.c). macOS users should use udosrun
-  instead of kvikdos, others should use DOSBox or DOSBox-X.
+  instead of kvikdos-ng, others should use DOSBox or DOSBox-X.
 
-* kvikdos can run 16-bit real-mode DOS programs (written for the 8086, 186
+* kvikdos-ng can run 16-bit real-mode DOS programs (written for the 8086, 186
   or 286 processors, but not 16-bit 286 protected mode), and it can also
   run 32-bit protected-mode DOS programs (written for 386, 486, Pentium
   processors or above) whose extender uses DPMI or runs in protected mode
   directly on the KVM CPU. See the protected mode section below for the
-  supported extenders. kvikdos can't run 64-bit programs.
+  supported extenders. kvikdos-ng can't run 64-bit programs.
 
-* kvikdos can run a single DOS program at a time. (But you can run multiple
-  independent instances of kvikdos in parallel.) Use udosrun (with the
+* kvikdos-ng can run a single DOS program at a time. (But you can run multiple
+  independent instances of kvikdos-ng in parallel.) Use udosrun (with the
   `-text' or `-gui' flag) or DOSBox if you want to run multiple DOS programs
   after each other or nested.
 
@@ -117,30 +123,30 @@ Limitations:
   (last 768 bytes), BIOS Data Area, helper code, the user code written for
   Linux.
 
-  On top of conventional memory, kvikdos provides extended memory (XMS 3.0,
+  On top of conventional memory, kvikdos-ng provides extended memory (XMS 3.0,
   including the >64 MiB functions 0x88/0x89, and the int 15h AH=88h
   interface): 127 MiB by default, configurable with `--mem-mb=<n>' (1 ..
   1024 MiB of total guest memory). A partial EMS (int 67h) implementation
   exists for toolchain probes. There is no VCPI.
 
-  For DPMI, kvikdos loads an external resident DPMI host (e.g. CWSDPMI or
+  For DPMI, kvikdos-ng loads an external resident DPMI host (e.g. CWSDPMI or
   HDPMI32) into the guest with `--dpmi=<dos-pathname>', then runs the real
   program on top of it; there is no built-in DPMI server.
 
-* kvikdos doesn't support graphics. Use udosrun or DOSBox instead.
+* kvikdos-ng doesn't support graphics. Use udosrun or DOSBox instead.
 
-* kvikdos has a minimal 80x25 text mode: it renders the text screen
+* kvikdos-ng has a minimal 80x25 text mode: it renders the text screen
   (colors, cursor position and shape, blinking) on the Linux terminal, and
   supports the BIOS/DOS video and keyboard calls needed by text-mode IDEs
   and editors (e.g. Watcom VI and Turbo Pascal IDEs work). Full-screen
   programs which need fancy video tricks may still misbehave; use udosrun
-  or DOSBox for those. kvikdos can also supply line-based input (terminated
+  or DOSBox for those. kvikdos-ng can also supply line-based input (terminated
   by <Enter>) to programs which don't need the interactive screen.
 
-* kvikdos doesn't emulate any special hardware (e.g. sound card, MIDI,
+* kvikdos-ng doesn't emulate any special hardware (e.g. sound card, MIDI,
   joystick, mouse, CD-ROM). Use DOSBox instead.
 
-* kvikdos implements a tiny subset of the DOS ABI (int 21h etc.), PC BIOS
+* kvikdos-ng implements a tiny subset of the DOS ABI (int 21h etc.), PC BIOS
   ABI (int 10h etc.) and IBM PC hardware interfaces (in and out
   instructions). Thus random DOS programs won't work out of the box. Simple
   API calls can be added on the fly to the int*.c sources. However, many famous build
@@ -148,57 +154,57 @@ Limitations:
   already work, see the compatibility list below. To get good chances for
   running any random DOS program, use udosrun or DOSBox instead.
 
-* If the target file is Linux-native (ELF or shebang script), kvikdos
+* If the target file is Linux-native (ELF or shebang script), kvikdos-ng
   executes it natively with Linux `fork+execvp` instead of DOS emulation.
 
-* If the target file is a Windows executable format (PE/NE/LE/LX), kvikdos
+* If the target file is a Windows executable format (PE/NE/LE/LX), kvikdos-ng
   delegates execution to `wine` automatically.
 
 Features and advantages:
 
-* kvikdos is very fast, it runs CPU-intensive code at almost native speeds
-  with Linux KVM. For I/O-intensive code, kvikdos tries to satisfy DOS I/O
+* kvikdos-ng is very fast, it runs CPU-intensive code at almost native speeds
+  with Linux KVM. For I/O-intensive code, kvikdos-ng tries to satisfy DOS I/O
   calls using the corresponding Linux system calls (mapping as directly as
   possible), thus it has less overhead than other emulators. See
-  benchmark/benchmark.md for a comparison between kvikdos, DOSBox and QEMU.
-  For CPU-intensive worklad, kvikdos and QEMU + KVM are on par, each of them
+  benchmark/benchmark.md for a comparison between kvikdos-ng, DOSBox and QEMU.
+  For CPU-intensive worklad, kvikdos-ng and QEMU + KVM are on par, each of them
   is about 11.49 times faster than the next emulator. For mixed CPU and I/O
-  workload, kvikdos is 4.507 times faster than anything else.
+  workload, kvikdos-ng is 4.507 times faster than anything else.
 
 * All features of a modern Intel CPU (such as floating point instructions,
   32-bit registers and 16/32-bit protected mode) are available for DOS
   programs, because the host CPU features are used directly. Guest memory
   is up to 1 GiB (`--mem-mb=<n>', 128 MiB by default).
 
-* Since very little hardware is emulated, kvikdos starts up very quickly,
-  it's possible to run dozens of short-lived kvikdos instances per second.
+* Since very little hardware is emulated, kvikdos-ng starts up very quickly,
+  it's possible to run dozens of short-lived kvikdos-ng instances per second.
 
-* After installation (and enabling KVM for the Linux user), kvikdos doesn't
+* After installation (and enabling KVM for the Linux user), kvikdos-ng doesn't
   need special privileges (i.e. root or sudo not needed).
 
-* kvikdos integrates DOS command-line tools to the Linux (Unix) command-line:
+* kvikdos-ng integrates DOS command-line tools to the Linux (Unix) command-line:
   its standard input, output etc. can be redirected, it propagatates the DOS
   exit code to Unix, it can pass environment variables to DOS etc. It also
   works very well headless (i.e. without GUI or interactive text UI), e.g.
   as part of continous build pipelines.
 
-* kvikdos runs 32-bit protected-mode DOS programs: Phar Lap
+* kvikdos-ng runs 32-bit protected-mode DOS programs: Phar Lap
   386|DOS-Extender/TNT bound binaries run directly (Watcom compilers,
   WLINK, VI), and DPMI clients run through an external resident host
   loaded with `--dpmi=' (CWSDPMI, HDPMI32). Extended memory is provided
   via XMS 3.0 and int 15h AH=88h on top of the conventional arena.
 
-* kvikdos has a minimal 80x25 text mode for IDEs and editors (colors,
+* kvikdos-ng has a minimal 80x25 text mode for IDEs and editors (colors,
   cursor position/shape/blink, Alt-aware keyboard), rendered on the Linux
   terminal.
 
-* kvikdos runs DOS batch files (.bat) with `set`, `%VAR%`, `%1..%9`,
+* kvikdos-ng runs DOS batch files (.bat) with `set`, `%VAR%`, `%1..%9`,
   `shift`, `call`, `if`, `goto`, `mkdir`, `copy`, `del` etc., enough for
   compiler driver scripts.
 
-How to install kvikdos:
+How to install kvikdos-ng:
 
-* (You don't have to install QEMU, kvikdos doesn't need it.)
+* (You don't have to install QEMU, kvikdos-ng doesn't need it.)
 
 * To check for hardware virtualization (Intel VT-x or AMD-V),
   run this command on your Linux system (without the leading `$'):
@@ -228,7 +234,7 @@ How to install kvikdos:
 
     $ sudo adduser "$(id -nu)" kvm
 
-* Download the precompiled kvikdos binary (kvikdos.linux.i386). Rename the
+* Download the precompiled kvikdos-ng binary (kvikdos.linux.i386). Rename the
   file to kvikdos, and make it executable:
 
     $ mv kvikdos.linux.i386 kvikdos
@@ -390,7 +396,7 @@ Readability and stability improvement roadmap (recommended):
 
 About making Linux files available for DOS programs:
 
-* kvikdos emulates DOS drives A: .. F: by exposing directories on the Linux
+* kvikdos-ng emulates DOS drives A: .. F: by exposing directories on the Linux
   filesystem as mount points for these DOS drives.
 
 * Use the `--mount=<drive><case><dirname>/' command-line flag to make
@@ -405,9 +411,9 @@ About making Linux files available for DOS programs:
 
 * The following drives are visible to DOS by default (i.e. default mounts):
 
-  * C: points to the current directory (.) of the kvikdos Linux process.
+  * C: points to the current directory (.) of the kvikdos-ng Linux process.
 
-  * D: points to the directory containing the kvikdos executable program
+  * D: points to the directory containing the kvikdos-ng executable program
     (taken from argv[0]).
 
   * E: points to the directory containing the <dos-executable-file>
@@ -430,14 +436,14 @@ About making Linux files available for DOS programs:
 About uppercase and lowercase filenames:
 
 * Filenames in Linux are case sensitive, but in DOS they are case
-  insensitive. Thus if a DOS program wants to open or access a file, kvikdos
+  insensitive. Thus if a DOS program wants to open or access a file, kvikdos-ng
   has to decide how to case fold the letters in the pathname.
 
 * Only unaccented Latin letters a .. z (and A .. Z) are targets of case
   folding. International characters (typically with code >= 128) are kept
   intact.
 
-* When the DOS program tries to open or access a file, kvikdos generates an
+* When the DOS program tries to open or access a file, kvikdos-ng generates an
   uppercase or lowercase Linux filename based on the mount flags of the
   emulated drive the DOS file is on. (DOSBox does it differently: on a per
   file basis, it uses uppercase iff the lowercase variant doesn't already
@@ -449,7 +455,7 @@ About uppercase and lowercase filenames:
   specify `--mount=C-' .
 
 * For drives C:, D: and E:, if not explicitly specified as
-  `--mount=<drive>...', kvikdos autodetects lowercase based on the
+  `--mount=<drive>...', kvikdos-ng autodetects lowercase based on the
   on the <dos-executable-file>: if there is at least
   one lowercase character, the drive becomes lowercase. For drives D: and E:
   only the last pathname component is considered, for C:, if
@@ -457,7 +463,7 @@ About uppercase and lowercase filenames:
   To override autodetection, specify e.g. `--mount=E:' for uppercase and
   `-mount=E-' for lowercase.
 
-Software compatibility, i.e. DOS programs known to work in kvikdos:
+Software compatibility, i.e. DOS programs known to work in kvikdos-ng:
 
 Quick start for DOS compilers and assemblers:
 
@@ -471,7 +477,7 @@ Quick start for DOS compilers and assemblers:
   * Set DOS environment explicitly with --env=LIB=... and
     --env=INCLUDE=...
 
-* Recently validated under kvikdos (compile, link, run of a tiny HELLO):
+* Recently validated under kvikdos-ng (compile, link, run of a tiny HELLO):
   * Microsoft C 4.0
   * Microsoft C 5.1
   * Microsoft C 6ax (from toolchain root, C:\BIN\CL.EXE, LIB=C:\LIB)
@@ -492,7 +498,7 @@ Quick start for DOS compilers and assemblers:
 
 * Turbo Link (TLINK) linker 3.01 and 4.0 tlink.exe. There is no newer 16-bit
   real mode TLINK, newer versions of tlink.exe use 16-bit 286 protected
-  mode, which kvikdos doesn't support. It reads OMF .obj and .lib files,
+  mode, which kvikdos-ng doesn't support. It reads OMF .obj and .lib files,
   and it produces .exe and .com program files.
 
 * TLIB library builder 3.01 and 3.02 tlib.exe. There is no newer 16-bit
@@ -508,7 +514,7 @@ Quick start for DOS compilers and assemblers:
 
   Please note that the generated .exe files are correct (they are identical
   to those generated in DOSBox by the same tools), but they don't work yet
-  in kvikdos, even the hello-world doesn't work yet.
+  in kvikdos-ng, even the hello-world doesn't work yet.
 
 * Microsoft BASIC Professional Development System compiler 7.10 bc.exe and
   the corresponding linker link.exe. The compiler produces OMF .obj files,
@@ -517,7 +523,7 @@ Quick start for DOS compilers and assemblers:
 
   Please note that the generated .exe files are correct (they are identical
   to those generated in DOSBox by the same tools), but they don't work yet
-  in kvikdos, even the hello-world doesn't work yet.
+  in kvikdos-ng, even the hello-world doesn't work yet.
 
 * BAssPasC Compiler v3.0pre2 bapc3.exe. It produces .asm (TASM) assembly
   source files from .bp3 source files.
@@ -562,18 +568,18 @@ Quick start for DOS compilers and assemblers:
 
 * (Please note that installers typically don't work. So you should run the
   installer in `udosrun -gui' or DOSBox, and then run the installed programs
-  in kvikdos.)
+  in kvikdos-ng.)
 
-Protected mode support for running 32-bit DOS programs in kvikdos:
+Protected mode support for running 32-bit DOS programs in kvikdos-ng:
 
 * The CPU emulation in KVM runs both 16-bit and 32-bit protected mode
   natively (and even 64-bit long mode would be possible, but no DOS
   program uses it).
 
-* DPMI: kvikdos doesn't have a built-in DPMI server. Instead, it loads an
+* DPMI: kvikdos-ng doesn't have a built-in DPMI server. Instead, it loads an
   external resident DPMI host into the guest (`--dpmi=<dos-pathname>'):
   the host (e.g. CWSDPMI.EXE, HDPMI32.EXE, or a Borland DPMIRES-style
-  stub) installs itself as a TSR via int 21h AH=31h, then kvikdos
+  stub) installs itself as a TSR via int 21h AH=31h, then kvikdos-ng
   preserves low memory and the interrupt vectors and loads the real
   program above it. The program then uses the host's int 2fh AX=1687h
   mode switch and int 31h services as usual.
@@ -602,7 +608,7 @@ Protected mode support for running 32-bit DOS programs in kvikdos:
 * There is no VCPI and no built-in DPMI/EMS hardware emulation beyond the
   API surface described above.
 
-Alternatives of kvikdos:
+Alternatives of kvikdos-ng:
 
 * udosrun (unreleased): A wrapper around pts-fast-dosbox and DOSBox to run
   DOS command-line tools conveniently and directly within the Linux
@@ -619,7 +625,7 @@ Alternatives of kvikdos:
 
 * pts-fast-dosbox (unreleased): a fork of DOSBox 0.74 for Linux, optimized
   for fast startup and fast operation (both faster than regular DOSBox, but
-  not as fast as kvikdos). By default it doesn't open a separate window, it
+  not as fast as kvikdos-ng). By default it doesn't open a separate window, it
   doesn't emulate most of the hardware, and it has an embedded dosbox.conf
   file optimized for (CPU) speed. It also features a command prompt (`C:\>')
   within the Linux terminal. You can use it most conveniently by driving it
@@ -627,9 +633,9 @@ Alternatives of kvikdos:
 
 * EMU2: https://github.com/dmsc/emu2 . It works on the Unix terminal,
   including interactive text-mode DOS programs. It emulates more hardware
-  and more DOS functionality than kvikdos. It contains a slow and
+  and more DOS functionality than kvikdos-ng. It contains a slow and
   architecture-independent 80286 emulator, without protected mode. It is
-  able to run MASM 1.00. It is quite close to kvikdos in the sense that it
+  able to run MASM 1.00. It is quite close to kvikdos-ng in the sense that it
   maps DOS standard handles to Unix standard file descriptors (stdin, stdout
   and stderr).
 
@@ -696,7 +702,7 @@ Future work / TODO:
     needed).
   * Speed measurements for the new protected-mode paths.
 
-* Embed an alternative (but slow) CPU emulator, to make kvikdos
+* Embed an alternative (but slow) CPU emulator, to make kvikdos-ng
   system-independent (i.e. no KVM) on the host. Example such emulators:
 
   * https://github.com/ecm-pushbx/8086tiny
