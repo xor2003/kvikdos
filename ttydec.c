@@ -72,6 +72,24 @@ static void raw_pair(unsigned key) {  /* Synthesized make+break for legacy encod
   tty_raw_push((key >> 8) | 0x80);
 }
 
+/* E0-prefixed make/break: on a real AT keyboard the dedicated editing and
+ * navigation keys (the six-pack plus arrows, keypad / and keypad Enter)
+ * carry an E0 prefix that distinguishes them from their numpad twins —
+ * guest int 9 handlers rely on it (plain 0x53 is numpad-Del, E0 0x53 is
+ * the editing-cluster Delete). */
+static void raw_make_e(unsigned scan, int e0) {
+  if (e0) tty_raw_push(0xe0);
+  tty_raw_push(scan);
+}
+static void raw_break_e(unsigned scan, int e0) {
+  if (e0) tty_raw_push(0xe0);
+  tty_raw_push(scan | 0x80);
+}
+static void raw_pair_e(unsigned key, int e0) {
+  raw_make_e(key >> 8, e0);
+  raw_break_e(key >> 8, e0);
+}
+
 /* US-layout shifted chars, used only when the terminal reports neither the
  * shifted alternate key (kitty flag 4) nor the text (flag 16). */
 static unsigned shift_map(unsigned key) {
@@ -95,15 +113,66 @@ static int kitty_scan(unsigned key) {
       0x4b, 0x4d, 0x48, 0x50, 0x49, 0x51, 0x47, 0x4f, 0x52, 0x53 };
   if (key - 57399U <= 27U) return kp_scans[key - 57399];
   if (key == 57427) return 0x4c;  /* KP_BEGIN */
+  if (key - 57364U <= 9U) return key - 57364 + 0x3b;  /* F1..F10 */
   switch (key) {
+   case 57344: return 0x01;  /* ESCAPE */
+   case 57345: return 0x1c;  /* ENTER */
+   case 57346: return 0x0f;  /* TAB */
+   case 57347: return 0x0e;  /* BACKSPACE */
+   case 57348: return 0x52;  /* INSERT */
+   case 57349: return 0x53;  /* DELETE */
+   case 57350: return 0x4b;  /* LEFT */
+   case 57351: return 0x4d;  /* RIGHT */
+   case 57352: return 0x48;  /* UP */
+   case 57353: return 0x50;  /* DOWN */
+   case 57354: return 0x49;  /* PAGE_UP */
+   case 57355: return 0x51;  /* PAGE_DOWN */
+   case 57356: return 0x47;  /* HOME */
+   case 57357: return 0x4f;  /* END */
    case 57358: return 0x3a;  /* CAPS_LOCK */
    case 57359: return 0x46;  /* SCROLL_LOCK */
    case 57360: return 0x45;  /* NUM_LOCK */
+   case 57374: return 0x57;  /* F11 */
+   case 57375: return 0x58;  /* F12 */
    case 57441: return 0x2a;  /* LEFT_SHIFT */
    case 57442: case 57448: return 0x1d;  /* CTRL */
    case 57443: case 57449: case 57453: return 0x38;  /* ALT (+ ISO Level3). */
    case 57447: return 0x36;  /* RIGHT_SHIFT */
   }
+  return -1;
+}
+
+/* Nonzero when the key's hardware scancode carries an E0 prefix: the
+ * dedicated editing/navigation keys (57348 INSERT .. 57357 END), keypad /
+ * and keypad Enter. */
+static int kitty_e0(unsigned key) {
+  return (key - 57348U <= 9U) || key == 57410U || key == 57414U;
+}
+
+/* kitty key -> keymods[] index for the BIOS keycode word (with shift/ctrl/
+ * alt variants), or -1 when not an editing/navigation/F key.  Keypad
+ * digits count as navigation keys only when the effective Num Lock state
+ * (kitty bit 128, inverted by shift like the real BIOS) is off. */
+static int kitty_km_idx(unsigned key, unsigned mods) {
+  static const signed char kp_nav[11] = {8, 5, 1, 7, 3, -1, 2, 4, 0, 6, 9};  /* KP_0..KP_9, KP_PERIOD */
+  switch (key) {
+   case 57352: case 57419: return 0;  /* UP */
+   case 57353: case 57420: return 1;  /* DOWN */
+   case 57351: case 57418: return 2;  /* RIGHT */
+   case 57350: case 57417: return 3;  /* LEFT */
+   case 57356: case 57423: return 4;  /* HOME */
+   case 57357: case 57424: return 5;  /* END */
+   case 57354: case 57421: return 6;  /* PAGE_UP */
+   case 57355: case 57422: return 7;  /* PAGE_DOWN */
+   case 57348: case 57425: return 8;  /* INSERT */
+   case 57349: case 57426: return 9;  /* DELETE */
+  }
+  if (key - 57399U <= 10U) {  /* KP_0..KP_9 + KP_DECIMAL: digit vs nav. */
+    int nav = !(mods & 128);
+    if (mods & 1) nav = !nav;  /* Shift temporarily inverts Num Lock. */
+    return nav ? kp_nav[key - 57399] : -1;
+  }
+  if (key - 57364U <= 11U) return (int)(key - 57364) + 10;  /* F1..F12 */
   return -1;
 }
 
@@ -157,27 +226,46 @@ static int kitty_event(const unsigned char *b, int n) {
   }
   scan = key < 128 ? (key == 127 ? 0x0e : scancodes[key]) : kitty_scan(key);
   if (scan < 0) return KEV_NONE;
-  if (ev == 3) {  /* Release: break scancode only — the BIOS never buffers releases. */
-    tty_raw_push((unsigned)(scan | 0x80));
-    return KEV_NONE;
-  }
   {
-    unsigned ascii;
-    if (text && text < 128) ascii = text;
-    else if (shifted && shifted < 128 && (mods & 1)) ascii = shifted;
-    else if (key < 128) {
-      ascii = key;
-      if (key == 13) ascii = (mods & 4) ? 0x0a : 0x0d;         /* Ctrl-Enter = LF per BIOS. */
-      else if (key == 127) ascii = 8;
-      else if (key == 32 && (mods & 4)) ascii = 0;             /* Ctrl-Space = NUL. */
-      else if (mods & 2) ascii = 0;                            /* Alt: BIOS gives scan<<8|0. */
-      else if (mods & 4) ascii = key & 0x1f;                   /* Ctrl: control byte. */
-      else if (mods & 1) ascii = key >= 'a' && key <= 'z' ? key - 32 : shift_map(key);
-    } else {
-      ascii = kp_ascii(key);
+    const int e0 = kitty_e0(key);
+    if (ev == 3) {  /* Release: break scancode only — the BIOS never buffers releases. */
+      raw_break_e((unsigned)scan, e0);
+      return KEV_NONE;
     }
-    tty_raw_push((unsigned)scan);
-    return (int)(((unsigned)scan << 8) | ascii);
+    {
+      unsigned word;
+      const int km = kitty_km_idx(key, (unsigned)mods);
+      if (km >= 0) {
+        word = (unsigned)apply_mod(km, mods);  /* Editing/nav/F keys, incl. shifted/ctrl variants. */
+      } else if (key == 57344) {
+        word = 0x011b;
+      } else if (key == 57345) {
+        word = (mods & 4) ? 0x1c0a : 0x1c0d;   /* Enter (Ctrl = LF). */
+      } else if (key == 57346) {
+        word = (mods & 1) ? 0x0f00 : 0x0f09;   /* Tab / Shift-Tab. */
+      } else if (key == 57347) {
+        word = 0x0e08;                          /* Backspace. */
+      } else {
+        unsigned ascii;
+        if (text && text < 128) ascii = text;
+        else if (shifted && shifted < 128 && (mods & 1)) ascii = shifted;
+        else if (key < 128) {
+          ascii = key;
+          if (key == 13) ascii = (mods & 4) ? 0x0a : 0x0d;         /* Ctrl-Enter = LF per BIOS. */
+          else if (key == 127) ascii = 8;
+          else if (key == 32 && (mods & 4)) ascii = 0;             /* Ctrl-Space = NUL. */
+          else if (mods & 2) ascii = 0;                            /* Alt: BIOS gives scan<<8|0. */
+          else if (mods & 4) ascii = key & 0x1f;                   /* Ctrl: control byte. */
+          else if (mods & 1) ascii = key >= 'a' && key <= 'z' ? key - 32 : shift_map(key);
+        } else {
+          ascii = kp_ascii(key);
+        }
+        word = ((unsigned)scan << 8) | ascii;
+      }
+      if (key == 57348 && ev != 2) tty_ins ^= 0x80;  /* Ins press toggles BDA bit7. */
+      raw_make_e((unsigned)scan, e0);
+      return (int)word;
+    }
   }
 }
 
@@ -226,7 +314,7 @@ static int x10_mouse(TtyState *tty_state) {
 
 /* Legacy CSI / SS3 body (no kitty 'u' final): CSI num[;mod[:ev]]<final>. */
 static int decode_csi(const unsigned char *b, int n) {
-  int i = 1, num, mod = 0, ev = 0, word = 0x011b;
+  int i = 1, num, mod = 0, ev = 0, word = 0x011b, e0 = 0;
   num = (int)rdnum(b, n, &i);
   if (i < n && b[i] == ';') {  /* Modifier param, optional :event-type subfield. */
     ++i; mod = (int)rdnum(b, n, &i);
@@ -240,12 +328,12 @@ static int decode_csi(const unsigned char *b, int n) {
   }
   if (i < n && b[i] >= 'A' && b[i] <= 'Z' && b[i] != '~') {  /* CSI [p1;mod]<letter>. */
     switch (b[i]) {
-     case 'A': word = apply_mod(K_UP, mod); break;
-     case 'B': word = apply_mod(K_DOWN, mod); break;
-     case 'C': word = apply_mod(K_RIGHT, mod); break;
-     case 'D': word = apply_mod(K_LEFT, mod); break;
-     case 'H': word = apply_mod(K_HOME, mod); break;
-     case 'F': word = apply_mod(K_END, mod); break;
+     case 'A': word = apply_mod(K_UP, mod); e0 = 1; break;
+     case 'B': word = apply_mod(K_DOWN, mod); e0 = 1; break;
+     case 'C': word = apply_mod(K_RIGHT, mod); e0 = 1; break;
+     case 'D': word = apply_mod(K_LEFT, mod); e0 = 1; break;
+     case 'H': word = apply_mod(K_HOME, mod); e0 = 1; break;
+     case 'F': word = apply_mod(K_END, mod); e0 = 1; break;
      case 'Z': word = 0x0f09; break;  /* <Shift><Tab>. */
      case 'P': word = apply_mod(K_F1, mod); break;
      case 'Q': word = apply_mod(K_F2, mod); break;
@@ -254,12 +342,12 @@ static int decode_csi(const unsigned char *b, int n) {
     }
   } else if (i < n && b[i] == '~') {  /* CSI <num>[;mod[:ev]]~ */
     switch (num) {
-     case 1: case 7: word = apply_mod(K_HOME, mod); break;
-     case 4: case 8: word = apply_mod(K_END, mod); break;
-     case 2: word = apply_mod(K_INS, mod); break;
-     case 3: word = apply_mod(K_DEL, mod); break;
-     case 5: word = apply_mod(K_PGUP, mod); break;
-     case 6: word = apply_mod(K_PGDN, mod); break;
+     case 1: case 7: word = apply_mod(K_HOME, mod); e0 = 1; break;
+     case 4: case 8: word = apply_mod(K_END, mod); e0 = 1; break;
+     case 2: word = apply_mod(K_INS, mod); e0 = 1; break;
+     case 3: word = apply_mod(K_DEL, mod); e0 = 1; break;
+     case 5: word = apply_mod(K_PGUP, mod); e0 = 1; break;
+     case 6: word = apply_mod(K_PGDN, mod); e0 = 1; break;
      case 11: case 12: case 13: case 14: word = apply_mod(K_F1 + num - 11, mod); break;  /* <F1>..<F4> */
      case 15: word = apply_mod(K_F5, mod); break;
      case 17: case 18: case 19: case 20: case 21: word = apply_mod(K_F6 + num - 17, mod); break;  /* <F6>..<F10> */
@@ -268,12 +356,12 @@ static int decode_csi(const unsigned char *b, int n) {
     }
   }
   if (ev == 3) {  /* Release (kitty event type): break scancode only. */
-    tty_raw_push((unsigned)((word >> 8) | 0x80));
+    raw_break_e((unsigned)(word >> 8), e0);
     return KEV_NONE;
   }
-  if (num == 2 && i < n && b[i] == '~') tty_ins ^= 0x80;  /* Ins press toggles BDA bit7. */
-  if (ev) tty_raw_push((unsigned)(word >> 8));  /* kitty press/repeat: real make, break on release. */
-  else raw_pair((unsigned)word);  /* Legacy: synthesized make+break pair. */
+  if (num == 2 && ev != 2 && i < n && b[i] == '~') tty_ins ^= 0x80;  /* Ins press toggles BDA bit7. */
+  if (ev) raw_make_e((unsigned)(word >> 8), e0);  /* kitty press/repeat: real make, break on release. */
+  else raw_pair_e((unsigned)word, e0);  /* Legacy: synthesized make+break pair. */
   return word;
 }
 
@@ -302,9 +390,12 @@ int tty_decode(TtyState *tty_state, int c) {
     switch (n >= 2 ? b[1] : 0) {
      case 'P': word = 0x3b00; break; case 'Q': word = 0x3c00; break;
      case 'R': word = 0x3d00; break; case 'S': word = 0x3e00; break;  /* <F1>..<F4> */
-     case 'A': word = 0x4800; break; case 'B': word = 0x5000; break;
-     case 'C': word = 0x4d00; break; case 'D': word = 0x4b00; break;  /* Arrow keys. */
-     case 'H': word = 0x4700; break; case 'F': word = 0x4f00; break;  /* <Home>, <End>. */
+     case 'A': raw_pair_e(0x4800, 1); return 0x4800;  /* <Up> */
+     case 'B': raw_pair_e(0x5000, 1); return 0x5000;  /* <Down> */
+     case 'C': raw_pair_e(0x4d00, 1); return 0x4d00;  /* <Right> */
+     case 'D': raw_pair_e(0x4b00, 1); return 0x4b00;  /* <Left> */
+     case 'H': raw_pair_e(0x4700, 1); return 0x4700;  /* <Home> */
+     case 'F': raw_pair_e(0x4f00, 1); return 0x4f00;  /* <End> */
      default: word = 0x011b; break;
     }
     raw_pair((unsigned)word);
