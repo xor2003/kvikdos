@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Static-analysis gate for kvikdos: cppcheck, clang-check, clang-tidy,
-# clang --analyze.  Always run before committing C changes (see AGENTS.md).
+# Static-analysis gate for kvikdos: cppcheck, clang-tidy, clang --analyze.
+# clang-check (full parse/AST per TU) is slow, so it only runs when
+# STATIC_SLOW=1 is set (CI sets it; `make lint-full' locally).
 # Any hard diagnostic (error:) fails; clang-tidy analyzer warnings also fail.
 set -euo pipefail
 
@@ -25,13 +26,17 @@ elif [[ "$cpp_rc" -ne 0 ]]; then
   exit "$cpp_rc"
 fi
 
-echo "[static] clang-check (parse/AST)"
-: >/tmp/kvikdos-clang-check.txt
-echo "$SRCS" | tr ' ' '\n' | xargs -P "$JOBS" -I{} \
-  timeout 120s clang-check {} -- $CFLAGS_LINT >>/tmp/kvikdos-clang-check.txt 2>&1 || true
-if grep -n 'error:' /tmp/kvikdos-clang-check.txt; then
-  echo "[static] clang-check found errors" >&2
-  exit 1
+if [[ "${STATIC_SLOW:-}" = "1" ]]; then
+  echo "[static] clang-check (parse/AST)"
+  : >/tmp/kvikdos-clang-check.txt
+  echo "$SRCS" | tr ' ' '\n' | xargs -P "$JOBS" -I{} \
+    timeout 120s clang-check {} -- $CFLAGS_LINT >>/tmp/kvikdos-clang-check.txt 2>&1 || true
+  if grep -n 'error:' /tmp/kvikdos-clang-check.txt; then
+    echo "[static] clang-check found errors" >&2
+    exit 1
+  fi
+else
+  echo "[static] clang-check skipped (slow; STATIC_SLOW=1 or make lint-full)"
 fi
 
 # Advisory classes excluded: insecureAPI.strcpy (all call sites bounded by

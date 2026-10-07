@@ -7,14 +7,18 @@ committing:
 
     make lint        # == ./tests/test_static.sh
 
-It runs four tools over every translation unit in `KVIKDOS_SRCS`:
+It runs these tools over every translation unit in `KVIKDOS_SRCS`:
 
 - **cppcheck** (`--enable=warning --std=c89`)
-- **clang-check** (parse/AST per TU — catches e.g. typedef redefinitions)
 - **clang-tidy** (`clang-analyzer-*`; the advisory classes
   `security.insecureAPI.*` and `deadcode.DeadStores` are excluded — fix or
   NOLINT anything else)
 - **clang --analyze** (hard errors gate; warnings are report-only)
+
+A fourth tool, **clang-check** (parse/AST per TU — catches e.g. typedef
+redefinitions), is skipped by default because it is slow. It runs in CI
+and locally via `make lint-full` (or `STATIC_SLOW=1
+./tests/test_static.sh`).
 
 If a finding is a true positive, fix the code. If it is a false positive,
 use a `/* NOLINT(check-name): reason */` comment (clang-tidy) or fix the
