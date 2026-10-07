@@ -1,7 +1,11 @@
 #include "kvikdos.h"
 #include "intrun.h"
 
-
+static void sigalrm_bda_tick(int sig) {
+  /* Async-signal-safe enough: one aligned 32-bit store into guest RAM. */
+  (void)sig;
+  if (mem) bda_update_ticks(mem);
+}
 
 unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, const char *dpmi_host, const char *args_str, const char* const *args, DirState *dir_state0, TtyState *tty_state0, const EmuParams *emu_params0, const char* const *envp0, const char* const *extra_env, unsigned extra_env_count) {
   emu = emu0;
@@ -116,7 +120,8 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
     memset((char*)mem + 0x400, 0, 0x100);  /* Clear stale BDA on exec. */
     *(unsigned short*)((char*)mem + 0x410) = 0x21;  /* Equipment word: IPL from diskette, 80x25 color text. */
     *(unsigned short*)((char*)mem + 0x413) = DOS_MEM_LIMIT >> 10;  /* Base memory in KiB. */
-    *(unsigned short*)((char*)mem + 0x41a) = 0x1e1e;  /* Keyboard buffer head=tail (empty). */
+    ((unsigned short*)mem)[0x41a >> 1] = 0x1e;  /* Keyboard buffer head == tail: empty. */
+    ((unsigned short*)mem)[0x41c >> 1] = 0x1e;
     *(unsigned short*)((char*)mem + 0x480) = 0x1e;   /* Keyboard buffer start offset. */
     *(unsigned short*)((char*)mem + 0x482) = 0x3e;   /* Keyboard buffer end offset. */
     ((char*)mem)[0x449] = 0x03;  /* Current video mode: 80x25 text. */
@@ -334,6 +339,25 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
 
   /* !! Security: close all filehandles except for 0, 1, 2 and kvm_fds, so that read and write from DOS won't be able to touch them. */
 
+  /* A real PC advances the BIOS tick counter (BDA 0x46c) from the IRQ0
+   * handler asynchronously — including while the CPU runs guest code.  Our
+   * exit-driven updates can't reach guests that spin on plain memory reads
+   * (QuickBASIC's idle loop reads 0x46c in a tight loop), so arm a real
+   * interval timer and poke the counter from the signal handler. */
+  {
+    struct sigaction sa;
+    struct itimerval it;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigalrm_bda_tick;
+    sa.sa_flags = SA_RESTART;  /* Keep poll/KVM_RUN calls from churning EINTR. */
+    sigemptyset(&sa.sa_mask);
+    (void)sigaction(SIGALRM, &sa, NULL);
+    it.it_interval.tv_sec = 0;
+    it.it_interval.tv_usec = 54925;  /* ~18.2 Hz: 1000000/(1193182/65536). */
+    it.it_value = it.it_interval;
+    (void)setitimer(ITIMER_REAL, &it, NULL);
+  }
+
  set_sregs_regs_and_continue:
   if (hv_set_sregs(hv, &sregs) < 0) {
     perror("fatal: hv_set_sregs");
@@ -414,6 +438,10 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
         regs.rip = int_ip;
         if (csip_ptr[2] & (1 << 9)) *(unsigned short*)&regs.rflags |= (1 << 9);  /* Set IF back to 1 if it was 1. */
         *(unsigned short*)&regs.rsp += 6;  /* pop ip, pop cs, pop flags. */
+        /* New keys drained during a device-idle int (16h/17h/28h-style):
+         * inject IRQ1 now — regs hold the real post-int state, so the ISR
+         * sees a proper interrupt frame. */
+        kbd_maybe_inject_irq();
         goto set_sregs_regs_and_continue;
       } else {  /* hlt instruction in user code. */
         if (emu_params->hlt_dump_filename) {
@@ -449,11 +477,31 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
            * wake up.
            */
           if (*(unsigned short*)&regs.rflags & (1 << 9)) {  /* IF == 1. */
-            if (++hlt_spin_count >= 400) {
-              fprintf(stderr, "error: guest stalled in HLT loop, aborting in permissive mode.\n");
-              return 1;
+            int fdt;
+            struct pollfd pfd;
+            ++hlt_spin_count;  /* No abort: sti;hlt idle is legitimate (per ntvdm). */
+            /* No hardware IRQs are delivered, so fake the timer+keyboard side
+             * effects (per msdos_player / ntvdm idle semantics): wait ~1 tick
+             * (55 ms) but wake early on a keypress, feed the BDA buffer, and
+             * advance the tick counter.  This unblocks sti;hlt idle loops
+             * such as QuickBASIC's. */
+            fdt = (tty_state->tty_in_fd == -2) ? 0 : tty_state->tty_in_fd;
+            if (fdt >= 0) {
+              pfd.fd = fdt; pfd.events = POLLIN; pfd.revents = 0;
+              if (poll(&pfd, 1, 55) > 0 && !(pfd.revents & POLLIN))
+                usleep(54925);  /* EOF/hup on a pipe — don't busy-spin. */
+            } else {
+              usleep(54925);
             }
-            usleep(54925);  /* 54925 =~= 1000000.0 / (1193182.0 / 65536). */
+            { const int isr = guest_int9_hooked(mem);
+              (void)tty_drain(tty_state, mem, !isr);
+              /* Deliver IRQ1 when the guest installed an int 9 handler:
+               * its ISR reads port 0x60 and fills the BDA buffer itself —
+               * this is what wakes QuickBASIC's sti;hlt idle loop. */
+              kbd_maybe_inject_irq();
+            }
+            bda_update_ticks(mem);
+            vid_render(mem);  /* ~18 Hz repaint while the guest idles. */
           } else {
             if (++hlt_spin_count >= 2000) {
               fprintf(stderr, "error: guest stalled in HLT loop (IF=0), aborting in permissive mode.\n");
@@ -467,6 +515,19 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
           goto fatal;
         }
       }
+     case HV_EXIT_TICK:
+      /* Host heartbeat (~18.2 Hz SIGALRM) while the guest ran CPU-bound code
+       * — e.g. QuickBASIC's post-IRQ idle, which spins on memory reads with
+       * no exits.  Do the IRQ-substitute housekeeping here: pull host keys
+       * into the scancode/keycode queues, deliver IRQ1 to a guest int 9 ISR
+       * if one is installed, and repaint.  This is what keeps keyboard input
+       * flowing when the guest never exits on its own. */
+      { const int isr = guest_int9_hooked(mem);
+        (void)tty_drain(tty_state, mem, !isr);
+        kbd_maybe_inject_irq();
+      }
+      vid_render(mem);
+      goto set_sregs_regs_and_continue;  /* Push regs: injection may have changed them. */
      case HV_EXIT_MMIO:
       if (mmio_dispatch() == IA_FATAL) goto fatal;
       break;
@@ -479,7 +540,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
        */
       goto fatal;
      default:
-      fprintf(stderr, "fatal: unexpected exit: reason=%u\n", hx.reason);
+      fprintf(stderr, "fatal: unexpected exit: reason=%u\n", (unsigned)hx.reason);
       goto fatal;
     }
   }

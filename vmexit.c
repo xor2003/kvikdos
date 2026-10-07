@@ -7,7 +7,106 @@
 int io_dispatch(void) {
   char *p = (char*)hx.io.data;
   if (hx.io.port == 0x40 && hx.io.size == 1 && hx.io.direction == 0) {
-    *p = port_0x40_tick++;  /* Simulate some timer ticks. */
+    *p = (char)bda_ticks_now();  /* Low byte of the live PIT channel-0 count. */
+    trace_guest_io(hx.io.port, hx.io.direction, hx.io.size, hx.io.count, p);
+    return IA_NEXT;
+  } else if ((hx.io.port == 0x60 || hx.io.port == 0x64) && hx.io.size == 1 && hx.io.direction == 0) {
+    /* 8042 keyboard-controller reads for direct pollers (QuickBASIC's IDE
+     * idle loop does `in al,0x64` / `in al,0x60` instead of int 16h).
+     * 0x64 status: bit0 = output-buffer full (a scancode waits in 0x60).
+     * 0x60 data: the make-scancode byte, 0 when the raw queue is empty. */
+    const int isr = guest_int9_hooked(mem);
+    (void)tty_drain(tty_state, mem, !isr);
+    /* New key edge + guest ISR: deliver IRQ1 (int 9) so the ISR reads 0x60
+     * and fills the BDA buffer itself — real 8042 semantics. */
+    kbd_maybe_inject_irq();
+    if (hx.io.port == 0x64) *p = tty_raw_pending() ? (char)1 : (char)0;
+    else { const int s = tty_raw_pop(); *p = s < 0 ? (char)0 : (char)s; }
+    trace_guest_io(hx.io.port, hx.io.direction, hx.io.size, hx.io.count, p);
+    bda_update_ticks(mem);
+    return IA_NEXT;
+  } else if (hx.io.port == 0x61 && hx.io.size == 1) {
+    /* PPI port B (XT keyboard acknowledge + speaker gate): the int 9 ISR
+     * pulses bit7 high then low after reading 0x60. Latch it; reads return
+     * the latch like a real 8255 (with speaker/timer bits as written). */
+    if (hx.io.direction) port_0x61 = *p;
+    else *p = port_0x61;
+    trace_guest_io(hx.io.port, hx.io.direction, hx.io.size, hx.io.count, p);
+    return IA_NEXT;
+  } else if ((hx.io.port == 0x20 || hx.io.port == 0x21) && hx.io.size == 1) {
+    /* Master PIC (8259A): 0x20 = command port — OCW2 EOI forms clear the
+     * in-service bits our injected IRQ1 sets (0x20 non-specific EOI clears
+     * the highest in-service bit; 0x60|n specific EOI clears bit n).
+     * 0x21 = interrupt mask register (guest keyboard drivers unmask IRQ1
+     * here when installing their int 9 ISR). */
+    if (hx.io.port == 0x21) {
+      if (hx.io.direction) pic_imr = (unsigned char)*p;
+      else *p = (char)pic_imr;
+    } else if (hx.io.direction) {
+      const unsigned char v = (unsigned char)*p;
+      if ((v & 0xf8) == 0x60) pic_isr &= (unsigned char)~(1u << (v & 7));
+      else if (v & 0x20) {  /* Non-specific EOI: clear lowest set bit. */
+        unsigned n;
+        for (n = 0; n < 8; ++n)
+          if (pic_isr & (1u << n)) { pic_isr &= (unsigned char)~(1u << n); break; }
+      }
+    }
+    trace_guest_io(hx.io.port, hx.io.direction, hx.io.size, hx.io.count, p);
+    return IA_NEXT;
+  } else if ((hx.io.port == 0x3b4 || hx.io.port == 0x3d4) && hx.io.size == 1) {  /* MDA/CGA CRTC index (borrowed CRTC surface, per msdos_player). */
+    if (hx.io.direction) port_crtc_index = *p & 0x1f;
+    else *p = (char)port_crtc_index;
+    trace_guest_io(hx.io.port, hx.io.direction, hx.io.size, hx.io.count, p);
+    return IA_NEXT;
+  } else if ((hx.io.port == 0x3b5 || hx.io.port == 0x3d5) && hx.io.size == 1) {  /* MDA/CGA CRTC data. */
+    unsigned char *const m = (unsigned char*)mem;
+    if (hx.io.direction) {
+      crtc_regs[(unsigned char)port_crtc_index] = *p;
+      if (port_crtc_index == 14 || port_crtc_index == 15) {
+        /* Cursor regs written directly — mirror into the BDA so the console
+         * renderer and int 10h/ah==3 readers follow (QuickBASIC moves the
+         * cursor this way). */
+        const unsigned off = ((unsigned)crtc_regs[14] << 8) | crtc_regs[15];
+        unsigned char *const cur = m + 0x450 + (m[0x462] << 1);
+        cur[0] = (unsigned char)(off % VID_COLS);
+        cur[1] = (unsigned char)(off / VID_COLS);
+      } else if (port_crtc_index == 10 || port_crtc_index == 11) {
+        m[0x460] = crtc_regs[11];  /* Cursor end scanline. */
+        m[0x461] = crtc_regs[10];  /* Cursor start (bit5 hides). */
+      }
+    } else {
+      if (port_crtc_index == 14 || port_crtc_index == 15) {  /* Sync from BDA. */
+        const unsigned char *const cur = m + 0x450 + (m[0x462] << 1);
+        const unsigned off = (unsigned)cur[1] * VID_COLS + cur[0];
+        crtc_regs[14] = (unsigned char)(off >> 8);
+        crtc_regs[15] = (unsigned char)off;
+      }
+      *p = (char)crtc_regs[(unsigned char)port_crtc_index];
+    }
+    trace_guest_io(hx.io.port, hx.io.direction, hx.io.size, hx.io.count, p);
+    return IA_NEXT;
+  } else if ((hx.io.port == 0x3b8 || hx.io.port == 0x3d8 || hx.io.port == 0x3d9) && hx.io.size == 1) {
+    /* MDA mode control / CGA mode control / CGA color select — store & read
+     * back (real 0x3d8/0x3d9 are write-only; returning the latch is harmless). */
+    if (hx.io.direction) {
+      if (hx.io.port == 0x3b8) port_0x3b8 = *p;
+      else if (hx.io.port == 0x3d8) port_0x3d8 = *p;
+      else port_0x3d9 = *p;
+    } else {
+      *p = (char)(hx.io.port == 0x3b8 ? port_0x3b8 : hx.io.port == 0x3d8 ? port_0x3d8 : port_0x3d9);
+    }
+    trace_guest_io(hx.io.port, hx.io.direction, hx.io.size, hx.io.count, p);
+    return IA_NEXT;
+  } else if ((hx.io.port == 0x3ba || hx.io.port == 0x3da) && hx.io.size == 1 && hx.io.direction == 0) {
+    /* MDA/CGA status register — the call QuickBASIC spins on before drawing.
+     * bit0: horizontal retrace in progress; bit3: vertical retrace in
+     * progress.  Derive both from host time: ~60 Hz frame, ~1.3 ms vblank,
+     * ~31.5 kHz line rate for hsync. */
+    struct timeval tv;
+    unsigned long f;
+    gettimeofday(&tv, NULL);
+    f = (unsigned long)tv.tv_usec % 16667;
+    *p = (char)((f >= 15333 ? 8 : 0) | ((tv.tv_usec & 31) >= 29 ? 1 : 0));
     trace_guest_io(hx.io.port, hx.io.direction, hx.io.size, hx.io.count, p);
     return IA_NEXT;
   } else if (hx.io.port == 0x92 && hx.io.size == 1) {  /* PS/2 system control port: A20 gate + fast reset. */

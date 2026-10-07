@@ -41,13 +41,85 @@ int int22_dispatch(void) {
   return IA_NEXT;
 }
 
+/* Real 18.2 Hz BIOS tick count (per msdos_player): ticks since local
+ * midnight, same value the BDA keeps at 0x46c. */
+unsigned long bda_ticks_now(void) {
+  struct timeval tv;
+  const struct tm *lt;
+  const time_t t = time(NULL);
+  gettimeofday(&tv, NULL);
+  lt = localtime(&t);
+  return (unsigned long)((lt->tm_hour * 3600.0 + lt->tm_min * 60.0 + lt->tm_sec)
+                         * 1193180.0 / 65536.0 + tv.tv_usec * 1193180.0 / (65536.0 * 1e6));
+}
+
+void bda_update_ticks(void *mem) {
+  *(unsigned*)((char*)mem + 0x46c) = (unsigned)bda_ticks_now();
+}
+
+void guest_inject_irq(struct hv *hv, void *mem, unsigned int_no) {
+  /* Manual IRQ injection: push FLAGS,CS,IP like the CPU does for a hardware
+   * interrupt, clear IF+TF, and jump to the guest's IVT handler.  Used for
+   * IRQ1 (int 9) so guest-installed keyboard ISRs run — required by IDEs
+   * (QuickBASIC) that wait for the ISR flag rather than polling int 16h.
+   * Operates on the shared regs/sregs globals: the run loop pushes them to
+   * the vCPU before the next hv_run. */
+  unsigned char *const m = (unsigned char*)mem;
+  const unsigned vec = ((const unsigned*)mem)[int_no];
+  unsigned short sp;
+  (void)hv;
+  if (!(regs.rflags & (1u << 9))) return;  /* IF=0: guest isn't taking IRQs now. */
+  sp = (unsigned short)(regs.rsp - 6);
+  *(unsigned short*)(m + sregs.ss.base + sp + 4) = (unsigned short)regs.rflags;
+  *(unsigned short*)(m + sregs.ss.base + sp + 2) = sregs.cs.selector;
+  *(unsigned short*)(m + sregs.ss.base + sp + 0) = (unsigned short)regs.rip;
+  *(unsigned short*)&regs.rsp = sp;
+  *(unsigned short*)&regs.rflags &= ~((1u << 9) | (1u << 8));  /* IF+TF clear, per real int entry. */
+  *(unsigned short*)&regs.rip = (unsigned short)vec;
+  sregs.cs.selector = (unsigned short)(vec >> 16);
+  sregs.cs.base = (unsigned long)sregs.cs.selector << 4;
+  pic_isr |= (unsigned char)(1u << (int_no - 8));  /* IRQ now in service until EOI. */
+}
+
+void kbd_maybe_inject_irq(void) {
+  /* IRQ1 delivery per real 8042+PIC semantics: the line stays asserted while
+   * a scancode byte pends, but the PIC won't re-deliver the same IRQ while
+   * it is in service (pic_isr, cleared by the ISR's EOI to port 0x20) or
+   * masked (pic_imr, port 0x21).  The ISR drains 0x60 one byte per IRQ, so
+   * the make+break pair arrives over two injections — exactly like hardware. */
+  if (guest_int9_hooked(mem) && (tty_raw_pending() || (tty_bk_pending() && kbd_can_push(mem))) && !(pic_isr & 2) && !(pic_imr & 2)) {
+    guest_inject_irq(emu->hv, mem, 9);
+  }
+}
+
+int int09_dispatch(void) {
+  /* BIOS keyboard hardware ISR (the ROM BIOS int 9): reached when the guest
+   * int 9 owner chains to the original vector — standard for IDE keyboard
+   * drivers like QuickBASIC's, which read port 0x60 themselves then let the
+   * BIOS fill the keyboard buffer.  Pops one decoded keycode (queued at
+   * drain time — host escape decoding already produced scan<<8|ascii plus
+   * modifier bits), pushes it into the BDA buffer, then issues the PIC EOI.
+   * A raw-queue pop here would race the break byte: the ISR's own 0x60 read
+   * already consumed the make code, so the next byte is the release. */
+  unsigned key, mods;
+  /* Wait for BDA room: the staged queue holds the key until the app drains
+   * the 16-entry buffer (burst-safe). */
+  if (kbd_can_push(mem) && tty_bk_pop(&key, &mods) == 0) {
+    kbd_push(mem, key, (int)mods);
+  }
+  pic_isr &= (unsigned char)~2u;  /* IRQ1 EOI — what `out 0x20,0x20` does. */
+  return IA_NEXT;
+}
+
 int int1a_dispatch(void) {
 /* Timer. */
-        if (ah == 0x00) {  /* Read system clock counter. */
-          ++tick_count;  /* We don't emulate a real clock, we just increment the tick counter whenever queried. */
-          *(unsigned char*)&regs.rax = 0;  /* No midnight yet. */
-          *(unsigned short*)&regs.rcx = tick_count >> 16;
-          *(unsigned short*)&regs.rdx = tick_count;
+        if (ah == 0x00) {  /* Read system clock counter (real time, per msdos_player). */
+          const unsigned long t = bda_ticks_now();
+          tick_count = (unsigned)t;  /* Keep the legacy counter in sync for any other readers. */
+          *(unsigned char*)&regs.rax = ((unsigned char*)mem)[0x470];  /* Midnight-rollover byte from the BDA. */
+          *(unsigned short*)&regs.rcx = (unsigned short)(t >> 16);
+          *(unsigned short*)&regs.rdx = (unsigned short)t;
+          bda_update_ticks(mem);
         } else {
           return IA_FATAL_INT;
         }
@@ -55,15 +127,43 @@ int int1a_dispatch(void) {
 }
 
 int int16_dispatch(void) {
-/* Keyboard. */
+/* Keyboard: the BDA buffer at 0x41e is canonical (per msdos_player), so
+ * direct-buffer readers and BIOS callers share state. */
         if (ah == 0x12) {  /* Get extended keyboard status. */
           *(unsigned short*)&regs.rax = *(const unsigned short*)((const char*)mem + 0x417);  /* In BDA, 0 by default, no modifier keys pressed. */
         } else if (ah == 0x02) {  /* Get keyboard status. */
           *(unsigned char*)&regs.rax = *(const unsigned char*)((const char*)mem + 0x417);  /* In BDA, 0 by default, no modifier keys pressed. */
+        } else if (ah == 0x05) {  /* Store keystroke CX in the buffer. */
+          kbd_push(mem, *(unsigned short*)&regs.rcx, -1);
+          *(unsigned char*)&regs.rax = 0;  /* AL=0: stored. */
         } else if (ah == 0x01 || ah == 0x11 ||  /* Check buffer, do not clear. */
                    ah == 0x00 || ah == 0x10) {  /* Wait for keystroke and read. */
           vid_render(mem);  /* The program is idle waiting for input: repaint now. */
-          process_key(tty_state, ah, (unsigned short*)&regs.rax, (unsigned short*)&regs.rflags);
+          if (tty_state->tty_in_fd == -3) {  /* Fake keys (test mode). */
+            process_key(tty_state, ah, (unsigned short*)&regs.rax, (unsigned short*)&regs.rflags);
+          } else {
+            /* Fold pending host keys in; a guest int 9 ISR fills the BDA
+             * buffer itself (via injected IRQ1 + port 0x60). */
+            (void)tty_drain(tty_state, mem, !guest_int9_hooked(mem));
+            if (ah & 1) {
+              const int k = kbd_peek(mem);
+              if (k < 0) {
+                *(unsigned short*)&regs.rflags |= (1 << 6);  /* ZF=1, no key. */
+              } else {
+                *(unsigned short*)&regs.rax = (unsigned short)k;
+                *(unsigned short*)&regs.rflags &= ~(1 << 6);  /* ZF=0, key available. */
+              }
+            } else {
+              int k = kbd_pop(mem);
+              if (k < 0) {
+                int mods = 0;
+                k = tty_wait_key(tty_state, &mods);  /* Block for one host keypress. */
+                kbd_push(mem, (unsigned)k, mods);
+                k = kbd_pop(mem);
+              }
+              *(unsigned short*)&regs.rax = (unsigned short)(k < 0 ? 0 : k);
+            }
+          }
         } else {
           return IA_FATAL_INT;
         }
@@ -83,6 +183,17 @@ int int2a_dispatch(void) {
 int int11_dispatch(void) {
 /* Get BIOS equipment flags. */
         *(unsigned short*)&regs.rax = *(const unsigned short*)((const char*)mem + 0x410);
+  return IA_NEXT;
+}
+
+int int17_dispatch(void) {
+/* Printer service (per ntvdm/msdos_player). IDEs poll AH=02 for printer
+ * status while idling; report a ready, selected, not-busy printer so the
+ * poll terminates (0x90 = bit7 not-busy + bit4 selected, no error/timeout).
+ * It's also a device-idle poll point — feed the keyboard buffer here like
+ * real IRQ1-driven BIOSes do asynchronously. */
+        (void)tty_drain(tty_state, mem, !guest_int9_hooked(mem));
+        *(unsigned char*)((char*)&regs.rax + 1) = (char)0x90;  /* AH = status. */
   return IA_NEXT;
 }
 
@@ -244,10 +355,12 @@ int int_dispatch(void) {
   case 0x16: return int16_dispatch();
   case 0x2a: return int2a_dispatch();
   case 0x11: return int11_dispatch();
+  case 0x17: return int17_dispatch();
   case 0x2f: return int2f_dispatch();
   case 0x15: return int15_dispatch();
   case 0x67: return int67_dispatch();
   case 0x43: return int43_dispatch();
+  case 0x09: return int09_dispatch();
   case 0x0d: return int0d_dispatch();
   case 0x00: return int00_dispatch();
   case 0x03: return int03_dispatch();

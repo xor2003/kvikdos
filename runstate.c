@@ -42,6 +42,11 @@ unsigned short last_dos_error_code;
 char port_0x40_tick;
 char port_0x92_a20;
 char port_0x70_index;
+char port_0x3b8, port_0x3d8, port_0x3d9;
+unsigned char pic_isr, pic_imr;  /* Master PIC in-service + interrupt-mask regs. */
+char port_0x61;                  /* PPI port B latch (kbd ack, speaker). */
+char port_crtc_index;
+char crtc_regs[0x20];
 unsigned char video_write_step;
 char video_byte_written;
 const char *stdout_write_p;
@@ -90,13 +95,14 @@ unsigned char dos_exit(void) {
   }
   maybe_dump_guest_mem(mem, GUEST_MEM_LIMIT);
   /* Optional: dump all guest RAM (low + xmem) to a file for offline analysis. */
-  if (getenv("KVIKDOS_DUMPALL")) {
-    int fd = open(getenv("KVIKDOS_DUMPALL"), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  {
+    const char *dumpall = getenv("KVIKDOS_DUMPALL");
+    int fd = dumpall ? open(dumpall, O_WRONLY | O_CREAT | O_TRUNC, 0666) : -1;
     if (fd >= 0) {
       if (write(fd, mem, GUEST_MEM_LIMIT) < 0) perror("dump mem");
       if (emu->xmem && write(fd, emu->xmem, emu->xmem_size) < 0) perror("dump xmem");
       close(fd);
-      fprintf(stderr, "dumped %u low + %lu xmem bytes\n", GUEST_MEM_LIMIT, (unsigned long)emu->xmem_size);
+      fprintf(stderr, "dumped %u low + %lu xmem bytes\n", (unsigned)GUEST_MEM_LIMIT, (unsigned long)emu->xmem_size);
     }
   }
   return (unsigned char)regs.rax;

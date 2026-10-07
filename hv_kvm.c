@@ -72,12 +72,20 @@ static int kvm_create_vcpu(struct hv *hv) {
 
 static int kvm_run_vcpu(struct hv *hv, struct hv_exit *hx) {
   struct kvm_impl *ki = (struct kvm_impl*)hv->impl;
-  const int ret = ioctl(ki->vcpu_fd, KVM_RUN, 0);
-  if (ret < 0) {
+  memset(hx, 0, sizeof(*hx));
+  if (ioctl(ki->vcpu_fd, KVM_RUN, 0) < 0) {
+    if (errno == EINTR) {
+      /* A host signal (the ~18.2 Hz SIGALRM BIOS tick) interrupted KVM_RUN
+       * while the guest ran plain CPU code — no exit would otherwise reach
+       * the run loop. Surface it as a tick so the loop can do its periodic
+       * housekeeping (tty drain, IRQ1 injection, repaint). Real hardware
+       * delivers IRQ0/IRQ1 asynchronously; this is our delivery point. */
+      hx->reason = HV_EXIT_TICK;
+      return 0;
+    }
     perror("fatal: KVM_RUN failed");
     return -1;
   }
-  memset(hx, 0, sizeof(*hx));
   switch (ki->run->exit_reason) {
    case KVM_EXIT_IO:
     hx->reason = HV_EXIT_IO;
@@ -131,6 +139,13 @@ static int kvm_set_sregs(struct hv *hv, const struct kvm_sregs *sregs) {
   return ioctl(ki->vcpu_fd, KVM_SET_SREGS, (struct kvm_sregs*)sregs) < 0 ? -1 : 0;
 }
 
+static int kvm_interrupt(struct hv *hv, unsigned irq_line) {
+  struct kvm_impl *ki = (struct kvm_impl*)hv->impl;
+  struct kvm_interrupt irq;
+  irq.irq = irq_line;
+  return ioctl(ki->vcpu_fd, KVM_INTERRUPT, &irq) < 0 ? -1 : 0;
+}
+
 static const struct hv_ops kvm_ops = {
   "KVM",
   kvm_destroy,
@@ -141,7 +156,8 @@ static const struct hv_ops kvm_ops = {
   kvm_get_regs,
   kvm_set_regs,
   kvm_get_sregs,
-  kvm_set_sregs
+  kvm_set_sregs,
+  kvm_interrupt
 };
 
 struct hv *hv_kvm_create(void) {
@@ -170,6 +186,10 @@ struct hv *hv_kvm_create(void) {
     perror("fatal: failed to create KVM vm");
     goto fail;
   }
+  /* No KVM_CREATE_IRQCHIP on purpose: with an in-kernel PIC, guest HLT with
+   * IF=1 blocks inside KVM_RUN instead of exiting to userspace — and our
+   * whole int-stub model needs the exit.  Interrupts are injected by hand
+   * (guest_inject_irq pushes the frame + jumps the IVT vector). */
   return hv;
  fail:
   kvm_destroy(hv);

@@ -99,6 +99,7 @@ void trace_guest_io(unsigned short port, unsigned char direction, unsigned char 
   unsigned n;
   unsigned char rec[4];
   if (g_io_trace_file == NULL) return;
+  setvbuf(g_io_trace_file, NULL, _IONBF, 0);  /* Keep records visible across kill/crash. */
   if (!g_io_trace_all && !(port == 0x388 || port == 0x389)) return;
   if (size == 0 || count == 0) return;
   n = (unsigned)size * (unsigned)count;

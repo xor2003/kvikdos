@@ -19,6 +19,7 @@ enum hv_exit_reason {
   HV_EXIT_MMIO,      /* Memory-mapped access needs service. */
   HV_EXIT_DEBUG,     /* Debug exit; ignored by the run loop. */
   HV_EXIT_SHUTDOWN,  /* Triple fault / shutdown. */
+  HV_EXIT_TICK,      /* Host timer tick interrupted a CPU-bound guest: housekeeping. */
   HV_EXIT_INTERNAL   /* Unrecoverable or unimplemented exit. */
 };
 
@@ -63,6 +64,9 @@ struct hv_ops {
   int (*set_regs)(struct hv *hv, const struct kvm_regs *regs);
   int (*get_sregs)(struct hv *hv, struct kvm_sregs *sregs);
   int (*set_sregs)(struct hv *hv, const struct kvm_sregs *sregs);
+  /* Raise a PIC interrupt line (0=timer, 1=keyboard, ...); the backend routes
+   * it to the guest vector. 0 = accepted, -1 = unsupported. */
+  int (*interrupt)(struct hv *hv, unsigned irq_line);
 };
 
 /* Create/destroy a VM. hv_create picks the backend for the host OS:
@@ -80,6 +84,7 @@ int hv_get_regs(struct hv *hv, struct kvm_regs *regs);
 int hv_set_regs(struct hv *hv, const struct kvm_regs *regs);
 int hv_get_sregs(struct hv *hv, struct kvm_sregs *sregs);
 int hv_set_sregs(struct hv *hv, const struct kvm_sregs *sregs);
+int hv_interrupt(struct hv *hv, unsigned irq_line);
 
 /* Backend-specific constructors (hv_create dispatches on the host OS). */
 struct hv *hv_kvm_create(void);

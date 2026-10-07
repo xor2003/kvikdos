@@ -364,6 +364,18 @@ static void whpx_destroy(struct hv *hv) {
   }
 }
 
+static int whpx_interrupt(struct hv *hv, unsigned irq_line) {
+  struct whpx_impl *w = (struct whpx_impl*)hv->impl;
+  WHV_INTERRUPT_CONTROL ctl;
+  /* WHPX injects a vector directly (no PIC emulation): real-mode PIC default
+   * base 8 maps irq line N to int 8+N (irq1 -> int 9 = keyboard). */
+  memset(&ctl, 0, sizeof(ctl));  /* Flags=0: Fixed type, physical mode, edge. */
+  ctl.Destination = 0;
+  ctl.Vector = 8 + irq_line;
+  return w->api.RequestInterrupt &&
+         WHV_SUCCEEDED(w->api.RequestInterrupt(w->partition, &ctl, sizeof(ctl))) ? 0 : -1;
+}
+
 static const struct hv_ops whpx_ops = {
   "WHPX",
   whpx_destroy,
@@ -374,7 +386,8 @@ static const struct hv_ops whpx_ops = {
   whpx_get_regs,
   whpx_set_regs,
   whpx_get_sregs,
-  whpx_set_sregs
+  whpx_set_sregs,
+  whpx_interrupt
 };
 
 static void *whpx_sym(void *lib, const char *name) {
@@ -418,6 +431,10 @@ struct hv *hv_whpx_create(void) {
   WHPX_LOAD(RunVirtualProcessor, "RunVirtualProcessor");
   WHPX_LOAD(GetVirtualProcessorRegisters, "GetVirtualProcessorRegisters");
   WHPX_LOAD(SetVirtualProcessorRegisters, "SetVirtualProcessorRegisters");
+  /* RequestInterrupt is optional (older DLLs lack it): resolve manually. */
+  { void *p_ = whpx_sym(lib, "WHvRequestInterrupt");
+    if (p_) memcpy(&w->api.RequestInterrupt, &p_, sizeof p_);
+    else w->api.RequestInterrupt = NULL; }
 #undef WHPX_LOAD
 
   if (w->api.GetCapability(WHvCapabilityCodeHypervisorPresent, &cap,

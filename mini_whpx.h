@@ -149,6 +149,16 @@ typedef struct WHV_RUN_VP_EXIT_CONTEXT {
   } u;
 } WHV_RUN_VP_EXIT_CONTEXT;  /* 368 bytes (SDK's own is ~300). */
 
+/* WHV_INTERRUPT_CONTROL per WinHvPlatformDefs.h.  The SDK packs the first
+ * three fields as UINT64 bitfields; we keep them as a plain flags word:
+ * Type(bits0-7)=WHvX64InterruptTypeFixed(0), DestinationMode(8-11)=physical(0),
+ * TriggerMode(12-15)=edge(0) — so Flags stays 0 for a hardware vector. */
+typedef struct WHV_INTERRUPT_CONTROL {
+  uint64_t Flags;
+  uint32_t Destination;
+  uint32_t Vector;
+} WHV_INTERRUPT_CONTROL;
+
 /* Function pointer table for WinHvPlatform.dll exports. */
 typedef struct whpx_api {
   WHV_HRESULT (*GetCapability)(int code, void *capbuf, uint32_t bufsize, uint32_t *written);
@@ -168,6 +178,8 @@ typedef struct whpx_api {
                                               const int *names, uint32_t count, WHV_REGISTER_VALUE *values);
   WHV_HRESULT (*SetVirtualProcessorRegisters)(WHV_PARTITION_HANDLE partition, uint32_t vpindex,
                                               const int *names, uint32_t count, const WHV_REGISTER_VALUE *values);
+  WHV_HRESULT (*RequestInterrupt)(WHV_PARTITION_HANDLE partition,
+                                  const WHV_INTERRUPT_CONTROL *control, uint32_t size);
 } whpx_api;
 
 #endif

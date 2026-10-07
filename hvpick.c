@@ -59,3 +59,6 @@ int hv_get_sregs(struct hv *hv, struct kvm_sregs *sregs) {
 int hv_set_sregs(struct hv *hv, const struct kvm_sregs *sregs) {
   return hv->ops->set_sregs(hv, sregs);
 }
+int hv_interrupt(struct hv *hv, unsigned irq_line) {
+  return hv->ops->interrupt ? hv->ops->interrupt(hv, irq_line) : -1;
+}

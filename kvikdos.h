@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -119,6 +120,8 @@
 #define VID_COLS   80
 #define VID_ROWS   25
 #define VID_BUFSZ  (VID_COLS * VID_ROWS * 2)
+#define VID_PAGE_STRIDE 0x1000  /* BIOS page size for 80x25 (regen word 0x44c). */
+#define VID_PAGES  8            /* 8 pages fit in 0xb8000..0xc0000. */
 
 typedef struct DirState {
   char drive;  /* 'A', 'B', 'C', 'D', ... ('A' + DRIVE_COUNT - 1). */
@@ -216,6 +219,7 @@ extern char exec_fnbuf[LINUX_PATH_SIZE];  /* Used temporarily by run_dos_prog. *
 /* Text-mode renderer state shared between video.c (rendering) and tty.c (raw
  * tty takeover when text mode is active). */
 extern char vid_active;
+extern char vid_blink;
 extern char vid_wrap_pend;
 extern int vid_cur_shape;
 extern int vid_tty_fd;
@@ -356,15 +360,39 @@ int apply_mod(int k, int mod);
 int decode_esc(const unsigned char *b, int n);
 int read_keycode(TtyState *tty_state, int c);
 void process_key(TtyState *tty_state, unsigned char ah, unsigned short *ax, unsigned short *flags);
+void tty_ensure_raw(TtyState *tty_state);
+int tty_drain(TtyState *tty_state, void *mem, int bios_push);
+/* Nonzero when the guest has hooked int 9 (keyboard IRQ): the IVT entry no
+ * longer points to our magic hlt stub.  In that case keys go to the raw
+ * scancode ring + an IRQ1 injection instead of the BDA buffer. */
+#define guest_int9_hooked(mem) (((const unsigned*)(mem))[9] != MAGIC_INT_VALUE(9))
+int tty_wait_key(TtyState *tty_state, int *mods_out);
+void kbd_push(void *mem, unsigned key, int mods);
+int kbd_pop(void *mem);
+int kbd_peek(void *mem);
+int tty_raw_pending(void);
+int tty_raw_pop(void);
+int tty_bk_pop(unsigned *key_out, unsigned *mods_out);
+int tty_bk_pending(void);
+int kbd_can_push(const void *mem);
+void kbd_maybe_inject_irq(void);
+/* Push a real interrupt frame (FLAGS,CS,IP) on the guest stack and jump to
+ * the guest's IVT[n] handler — manual IRQ injection, no irqchip needed.
+ * Only inject when IF=1; the ISR's iret returns to the interrupted flow. */
+void guest_inject_irq(struct hv *hv, void *mem, unsigned int_no);
+void bda_update_ticks(void *mem);
+unsigned long bda_ticks_now(void);
 void init_tty_state(TtyState *tty_state, int tty_in_fd);
 unsigned char cga_to_ansi(unsigned char c);
 char *vid_utf8(char *o, unsigned cp);
 void vid_term_release(void);
 void vid_enter(void);
 void vid_render(void *mem);
-void vid_fill(void *mem, int top, int left, int bottom, int right, unsigned char ch, unsigned char attr);
-void vid_scroll(void *mem, unsigned char al, unsigned char bh, unsigned short cx, unsigned short dx, int down);
-void vid_putc(void *mem, unsigned char ch);
+unsigned char *vid_page(void *mem, unsigned page);
+void vid_bda_init(void *mem, unsigned char mode);
+void vid_fill(void *mem, unsigned page, int top, int left, int bottom, int right, unsigned char ch, unsigned char attr);
+void vid_scroll(void *mem, unsigned page, unsigned char al, unsigned char bh, unsigned short cx, unsigned short dx, int down);
+void vid_putc(void *mem, unsigned page, unsigned char ch);
 void vid_write_str(void *mem, const char *p, const char *end);
 int run_dos_child_subprocess(const char *dos_filename, const char *dos_args, const char *env, const char *env_end, const DirState *dir_state, unsigned char *exit_code_out);
 int run_with_wine(const char *prog_filename, const char *const *args, const char *linux_cwd);
