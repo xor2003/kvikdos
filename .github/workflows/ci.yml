@@ -168,7 +168,9 @@ jobs:
       - name: Smoke-test APE on Windows (usage banner)
         shell: pwsh
         run: |
-          $out = .\kvikdos.com | Out-String
+          # Usage goes to stderr (exit-1 path on no args), so merge it in. --help
+          # exits 0 and prints the same banner.
+          $out = .\kvikdos.com --help 2>&1 | Out-String
           $out
           if ($out -notmatch 'run DOS programs') { exit 1 }
 
