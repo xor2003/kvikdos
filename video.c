@@ -42,6 +42,15 @@ static const unsigned short cp437_high[128] = {
   0x2261, 0x00b1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00f7, 0x2248,
   0x00b0, 0x2219, 0x00b7, 0x221a, 0x207f, 0x00b2, 0x25a0, 0x0020 };
 
+/* CP437 glyphs for character codes 0x00..0x1f (control-code range): real
+ * DOS text screens store these as glyphs (scrollbar arrows, dialog
+ * symbols), not as control characters.  Index 0 (NUL) renders as blank. */
+static const unsigned short cp437_low[32] = {
+  0x0020, 0x263a, 0x263b, 0x2665, 0x2666, 0x2663, 0x2660, 0x2022,
+  0x25d8, 0x25cb, 0x25d9, 0x2642, 0x2640, 0x266a, 0x266b, 0x263c,
+  0x25ba, 0x25c4, 0x2195, 0x203c, 0x00b6, 0x00a7, 0x25ac, 0x21a8,
+  0x2191, 0x2193, 0x2192, 0x2190, 0x221f, 0x2194, 0x25b2, 0x25bc };
+
 unsigned char cga_to_ansi(unsigned char c) {
   return (unsigned char)((c & 2) | ((c & 1) << 2) | ((c & 4) >> 2));
 }
@@ -131,7 +140,11 @@ void vid_render(void *mem) {
     if (ch == vid_shadow[i << 1] && at8 == vid_shadow[(i << 1) + 1]) continue;
     vid_shadow[i << 1] = ch; vid_shadow[(i << 1) + 1] = at8;
     if (o > out + sizeof(out) - 64) { (void)!write(1, out, o - out); o = out; la = -1; expect = -1; }
-    if (i != expect) {  /* Not contiguous with the previous cell: move the cursor. */
+    /* A row boundary always needs a fresh cursor-position escape, even
+     * when the cell index is contiguous: without it the terminal wraps
+     * on its own width, and hosts wider than 80 columns would bleed the
+     * next row's cells onto the previous physical line. */
+    if (i != expect || i % VID_COLS == 0) {
       row = i / VID_COLS + 1; col = i % VID_COLS + 1;
       o += sprintf(o, "\x1b[%d;%dH", row, col);
     }
@@ -149,8 +162,9 @@ void vid_render(void *mem) {
         o += sprintf(o, "\x1b[0;%d;%dm", ((at & 8) ? 90 : 30) + fg, ((at & 0x80) ? 100 : 40) + bg);
     }
     if (ch >= 0x80) o = vid_utf8(o, cp437_high[ch - 0x80]);
-    else if (ch >= 0x20 && ch < 0x7f) *o++ = (char)ch;
-    else *o++ = ' ';
+    else if (ch == 0x7f) o = vid_utf8(o, 0x2302);  /* CP437 DEL = ⌂. */
+    else if (ch >= 0x20) *o++ = (char)ch;
+    else o = vid_utf8(o, cp437_low[ch]);
   }
   vid_last_attr = la;
   /* Cursor shape/visibility from the BDA register (set by int 10h AH=01). */
