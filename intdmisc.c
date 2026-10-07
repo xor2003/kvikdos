@@ -18,6 +18,14 @@ static const struct {
 
 typedef char CountryInfoAssert[(sizeof(country_info) == 0x18) ? 1 : -1];
 
+/* Set the current PSP (int 21h AH=50h/AH=55h and exec save/restore). Updates
+ * both the C-side variable and the mirrored word inside the DOS sysvars area
+ * that Microsoft tools (e.g. QBX.EXE) probe to verify a real DOS kernel. */
+void set_current_psp(unsigned psp_para) {
+  current_psp_para = psp_para;
+  *(unsigned short*)((char*)mem + SYSVARS_CUR_PSP_LIN) = (unsigned short)psp_para;
+}
+
 /* DOS int 21h services: misc group. Returns an IA_* action. */
 int i21_misc(void) {
   if (ah == 0x30) {
@@ -312,7 +320,7 @@ int i21_misc(void) {
             *(unsigned*)(psp + 0x12) = *(unsigned*)((char*)mem + (0x24 << 2));  /* int 0x24 vector copy. */
             *(unsigned short*)(psp + 0x16) = (unsigned short)current_psp_para;  /* Parent PSP. */
             *(unsigned short*)(psp + 6) = 0xffff;  /* .COM bytes available in segment. */
-            current_psp_para = new_psp_para;
+            set_current_psp(new_psp_para);
   }   else if (ah == 0x65) {
   /* Get extended country information (DOS 3.3+). */
             const unsigned char al = (unsigned char)regs.rax;
@@ -343,6 +351,11 @@ int i21_misc(void) {
               *(unsigned short*)&regs.rax = 2;  /* File not found (bad info id). */
               return dos_error_21();
             }
+  }   else if (ah == 0x50) {
+  /* Set process ID (PSP) (0x50). Undocumented DOS 2.x+: BX is the new current
+   * PSP. Borrowed from msdos_player; also mirrors the sysvars current-PSP
+   * word that Microsoft tools verify. */
+            set_current_psp(*(unsigned short*)&regs.rbx);
   }   else if (ah == 0x51 || ah == 0x62) {
   /* Get process ID (PSP) (0x51). Get PSP (0x62). */
             *(unsigned short*)&regs.rbx = (unsigned short)current_psp_para;

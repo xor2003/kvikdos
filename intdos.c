@@ -161,6 +161,9 @@ int int21_dispatch(void) {
   case 0x65:
  return i21_misc();
 
+  case 0x50:
+ return i21_misc();
+
   case 0x51:
   case 0x62:
  return i21_misc();

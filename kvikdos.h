@@ -70,10 +70,11 @@
 #define MEM_SIZE (2 << 20)  /* In bytes. 2 MiB. */
 #endif
 #define INT_HLT_PARA 0x54
-#define INVARS_LIN 0x670  /* Linear address of dos_info_t.first_dpb. int 21h AH=52h returns ES:BX = 0x66:0x10, so dos_info_t spans 0x64a..0x6df, between the int stubs (0x540-0x63f) and the environment (0x700). */
+#define INVARS_LIN 0x670  /* Linear address of dos_info_t.first_dpb. int 21h AH=52h returns ES:BX = 0x66:0x10, so dos_info_t spans 0x64a..0x6df, between the int stubs (0x540-0x63f) and the environment (0x940). */
+#define SYSVARS_CUR_PSP_LIN 0x93e  /* Mirrored current-PSP word at 0x66:0x2de inside the sysvars segment (the DOS 5.x SDA offset). Microsoft tools (e.g. QBX.EXE) verify that it tracks the PSP set via int 21h AH=50h before they run. */
 #define PSP_PARA 0x100
 #define PROGRAM_MCB_PARA (PSP_PARA - 1)
-#define ENV_PARA 0x70
+#define ENV_PARA 0x94  /* Environment block at 0x940..0xfef; 0x700..0x93f is DOS-owned data space holding the sysvars current-PSP mirror (SYSVARS_CUR_PSP_LIN). */
 #define ENV_LIMIT (PROGRAM_MCB_PARA << 4)
 #define GUEST_MEM_MODULE_START 0x1000
 #define MAGIC_INT_VALUE(int_num) ((unsigned)INT_HLT_PARA << 16 | (unsigned)int_num)
@@ -346,6 +347,7 @@ void free_extra_env_args(ParsedCmdArgs *cmd_args);
 char is_mcb_bad(void *mem, unsigned short block_para);
 void check_all_mcbs(void *mem);
 void init_dos_info(void *mem, unsigned long xmem_size);
+void set_current_psp(unsigned psp_para);
 int detect_dos_executable_program(int img_fd, const char *prog_filename, char *p);
 char *load_dos_executable_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, struct kvm_regs *regs, struct kvm_sregs *sregs, unsigned short *block_size_para_out, unsigned psp_para);
 int load_dos_overlay_program(int img_fd, const char *filename, void *mem, const char *header, int header_size, unsigned short load_para, unsigned short reloc_para);

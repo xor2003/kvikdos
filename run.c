@@ -109,6 +109,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
       xms_free_kb = emu->xmem_size >= (64 << 10) ? xmem_kb - 64 - reserve : 0; }
     hv = emu->hv;
     mem = emu->mem;
+    set_current_psp(PSP_PARA);  /* Mirrors into the sysvars current-PSP word (mem must be set first). */
     /* Any read/write outside the regions above will trigger an MMIO exit. */
     /* Fill magic interrupt table. */
     { unsigned u;
@@ -157,7 +158,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
   /*memcpy(initial_sregs, &sregs, sizeof(sregs));*/  /* Not completely 0, but sregs.Xs.selector is 0. */
   sregs.fs.selector = sregs.gs.selector = ENV_PARA;  /* Random value after magic interrupt table. */
 
-  current_psp_para = load_psp_para;
+  set_current_psp(load_psp_para);
   { char *psp_args = load_dos_executable_program(img_fd, load_prog, mem, header, header_size, &regs, &sregs, &MCB_SIZE_PARA((char*)mem + ((load_psp_para - 1) << 4)), load_psp_para) + 0x80;
     if (load_args) {
       copy_args_to_dos_args(psp_args, load_args);
@@ -479,7 +480,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
             *(unsigned short*)&regs.rsp += 6;  /* pop ip, pop cs, pop flags. */
             *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0: exec succeeded. */
             *(unsigned short*)&regs.rax = 0;
-            current_psp_para = sv->psp_para;
+            set_current_psp(sv->psp_para);
             if (DEBUG || DIAG_ON(DIAG_BIT_EXEC)) fprintf(g_diag_file, "debug: exec: child exited rc=%u, resuming parent at %04x:%04x\n", (unsigned)last_exec_return_code, sv->int_cs, sv->int_ip);
           }
           goto set_sregs_regs_and_continue;
