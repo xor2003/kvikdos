@@ -56,7 +56,7 @@ void process_key(TtyState *tty_state, unsigned char ah, unsigned short *ax, unsi
         rt.c_iflag &= ~(IXON | ICRNL);
         rt.c_cc[VMIN] = 1;
         rt.c_cc[VTIME] = 0;
-        if (tcsetattr(fd, 0, &rt) == 0) { vid_tty_fd = fd; vid_raw_taken = 1; tty_state->raw_on = 1; }
+        if (tcsetattr(fd, 0, &rt) == 0) { vid_tty_fd = fd; vid_raw_taken = 1; tty_state->raw_on = 1; vid_install_release(); }
         else tty_state->is_tty_in_error = 1;
       } else tty_state->is_tty_in_error = 1;
     }
@@ -68,7 +68,16 @@ void process_key(TtyState *tty_state, unsigned char ah, unsigned short *ax, unsi
         old_lflag = tio.c_lflag;
         tio.c_lflag &= ~(ICANON | ECHO);  /* As a side effect, ECHOCTL is also disabled, so Ctrl-<C> won't show up as ^C, but it will still send SIGINT. */
         if (tcsetattr(tty_state->tty_in_fd, 0, &tio) != 0) tty_state->is_tty_in_error = 1;
-        else applied = 1;
+        else {
+          /* Publish the transient raw state so the signal/exit release
+           * restores it if we die while blocked on a key. */
+          applied = 1;
+          tio.c_lflag = old_lflag;
+          vid_saved_tio = tio;
+          vid_tty_fd = tty_state->tty_in_fd;
+          vid_raw_taken = 1;
+          vid_install_release();
+        }
       }
     }
     if (tty_state->pending_key >= 0) {
@@ -107,6 +116,7 @@ void process_key(TtyState *tty_state, unsigned char ah, unsigned short *ax, unsi
         tio.c_lflag = old_lflag;
         if (tcsetattr(tty_state->tty_in_fd, 0, &tio) != 0) tty_state->is_tty_in_error = 1;
       }
+      vid_raw_taken = 0;
     }
   }
 }
@@ -190,7 +200,7 @@ void tty_ensure_raw(TtyState *tty_state) {
     rt.c_iflag &= ~(IXON | ICRNL);
     rt.c_cc[VMIN] = 1;
     rt.c_cc[VTIME] = 0;
-    if (tcsetattr(fd, 0, &rt) == 0) { vid_tty_fd = fd; vid_raw_taken = 1; tty_state->raw_on = 1; }
+    if (tcsetattr(fd, 0, &rt) == 0) { vid_tty_fd = fd; vid_raw_taken = 1; tty_state->raw_on = 1; vid_install_release(); }
     else tty_state->is_tty_in_error = 1;
   } else tty_state->is_tty_in_error = 1;
 }
@@ -214,6 +224,13 @@ static int tty_soft_raw(TtyState *tty_state, tcflag_t *old_lflag) {
   *old_lflag = tio.c_lflag;
   tio.c_lflag &= ~(ICANON | ECHO);  /* As a side effect, ECHOCTL is also disabled, so Ctrl-<C> won't show up as ^C, but it will still send SIGINT. */
   if (tcsetattr(tty_state->tty_in_fd, 0, &tio) != 0) { tty_state->is_tty_in_error = 1; return 0; }
+  /* Publish the transient raw state so the signal/exit release restores it
+   * if we die while blocked on a key. */
+  tio.c_lflag = *old_lflag;
+  vid_saved_tio = tio;
+  vid_tty_fd = tty_state->tty_in_fd;
+  vid_raw_taken = 1;
+  vid_install_release();
   return 1;
 }
 
@@ -224,6 +241,7 @@ static void tty_soft_raw_undo(TtyState *tty_state, int applied, tcflag_t old_lfl
     tio.c_lflag = old_lflag;
     if (tcsetattr(tty_state->tty_in_fd, 0, &tio) != 0) tty_state->is_tty_in_error = 1;
   }
+  vid_raw_taken = 0;
 }
 
 /* Raw make-scancode ring for programs that poll the keyboard controller

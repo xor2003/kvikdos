@@ -80,7 +80,7 @@ char *vid_cp437_utf8(char *o, unsigned char ch) {
   return vid_utf8(o, cp437_low[ch]);
 }
 
-void vid_term_release(void) {  /* Registered via atexit(). */
+void vid_term_release(void) {  /* Registered via vid_install_release(). */
   if (vid_raw_taken && vid_tty_fd >= 0) tcsetattr(vid_tty_fd, 0, &vid_saved_tio);
   vid_raw_taken = 0;
   if (vid_altscreen) {
@@ -90,6 +90,33 @@ void vid_term_release(void) {  /* Registered via atexit(). */
     (void)!write(1, leave_seq, sizeof(leave_seq) - 1);
     vid_altscreen = 0;
   }
+}
+
+/* atexit() doesn't run when the process dies by signal (e.g. Ctrl-C during
+ * a guest hang), leaving the host tty in raw mode with alt screen, kitty
+ * keyboard and mouse reporting still enabled.  This handler restores
+ * everything (only async-signal-safe calls) then re-raises so the process
+ * dies with the original signal semantics. */
+static void vid_sig_release(int sig) {
+  struct sigaction dfl;
+  vid_term_release();
+  memset(&dfl, 0, sizeof(dfl));
+  dfl.sa_handler = SIG_DFL;
+  (void)sigaction(sig, &dfl, NULL);
+  (void)kill(getpid(), sig);
+}
+
+void vid_install_release(void) {  /* Idempotent. */
+  struct sigaction sa;
+  if (vid_release_registered) return;
+  vid_release_registered = 1;
+  atexit(vid_term_release);
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = vid_sig_release;
+  (void)sigaction(SIGINT, &sa, NULL);
+  (void)sigaction(SIGTERM, &sa, NULL);
+  (void)sigaction(SIGHUP, &sa, NULL);
+  (void)sigaction(SIGQUIT, &sa, NULL);
 }
 
 void vid_enter(void) {  /* Activate text mode (alt screen + fresh repaint). */
@@ -102,7 +129,7 @@ void vid_enter(void) {  /* Activate text mode (alt screen + fresh repaint). */
    * reports for the int 33h driver.  Unsupported terminals ignore all of
    * these, falling back to legacy ESC-prefix decoding. */
   static const char enter_seq[] = "\x1b[?1049h\x1b[2J\x1b[H\x1b[?12h\x1b[>31u\x1b[?1003h\x1b[?1006h";
-  if (!vid_release_registered) { vid_release_registered = 1; atexit(vid_term_release); }
+  vid_install_release();
   if (!vid_altscreen) { (void)!write(1, enter_seq, sizeof(enter_seq) - 1); vid_altscreen = 1; }
   memset(vid_shadow, 0xff, sizeof(vid_shadow));  /* Force a full repaint. */
   vid_last_attr = -1;

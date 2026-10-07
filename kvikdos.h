@@ -409,6 +409,7 @@ unsigned char cga_to_ansi(unsigned char c);
 char *vid_utf8(char *o, unsigned cp);
 char *vid_cp437_utf8(char *o, unsigned char ch);
 void vid_term_release(void);
+void vid_install_release(void);
 void vid_enter(void);
 void vid_render(void *mem);
 unsigned char *vid_page(void *mem, unsigned page);
