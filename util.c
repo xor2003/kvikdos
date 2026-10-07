@@ -51,14 +51,20 @@ char is_same_ascii_nocase(const char *a, const char *b, unsigned size) {
 
 void *my_memmem(const void *haystack, size_t haystacklen,
                        const void *needle, size_t needlelen) {
-  const void *c, *haystack_end = (const char*)haystack + haystacklen - needlelen + 1;
-  if (haystacklen < needlelen) return NULL;
+  /* `last' is the last position where a full needle can still start. The
+   * first-byte memchr is bounded to it — passing the raw remainder would go
+   * negative once a candidate sits past `last' (size_t wraparound = out of
+   * bounds scan; musl SIGBUSes, glibc reads garbage). */
+  const char *c = (const char*)haystack, *last;
+  char first;
   if (needlelen == 0) return (void*)haystack;
-  if (needlelen == 1) return memchr(haystack, *(const char*)needle, haystacklen);
-  for (c = memchr(haystack, *(const char*)needle, haystacklen); c;
-       c = memchr(c, *(const char*)needle, (const char*)haystack_end - (const char*)c)) {
+  first = *(const char*)needle;
+  if (haystacklen < needlelen) return NULL;
+  if (needlelen == 1) return memchr(haystack, first, haystacklen);
+  last = c + (haystacklen - needlelen);
+  while ((c = (const char*)memchr(c, first, (size_t)(last - c + 1))) != NULL) {
     if (memcmp(c, needle, needlelen) == 0) return (void*)c;
-    c = (const void*)((const char*)c + 1);
+    ++c;
   }
   return NULL;
 }

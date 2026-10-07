@@ -3,6 +3,15 @@
 
 /* Linux /dev/kvm backend for the hv_* interface. */
 
+/* musl declares ioctl(int, int, ...) while glibc takes (int, unsigned long,
+ * ...) — the large _IOW/_IOR request constants overflow an implicit int
+ * conversion and trip -Werror=overflow on musl.  Cast the request once
+ * here: the kernel matches on the low 32 bits, so the int round-trip is
+ * identical on both ABIs. */
+static int kvm_ioctl(int fd, unsigned long req, void *arg) {
+  return ioctl(fd, (int)req, arg);
+}
+
 struct kvm_impl {
   int kvm_fd, vm_fd, vcpu_fd;
   struct kvm_run *run;  /* mmap'd from vcpu_fd. */
@@ -29,14 +38,14 @@ static int kvm_set_memory(struct hv *hv, unsigned slot, unsigned long gpa,
   region.memory_size = size;
   region.userspace_addr = (uintptr_t)host;
   region.flags = readonly ? KVM_MEM_READONLY : 0;
-  return ioctl(ki->vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0 ? -1 : 0;
+  return kvm_ioctl(ki->vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0 ? -1 : 0;
 }
 
 static int kvm_create_vcpu(struct hv *hv) {
   struct kvm_impl *ki = (struct kvm_impl*)hv->impl;
   int kvm_run_mmap_size;
   struct kvm_regs dummy_regs;
-  if ((ki->vcpu_fd = ioctl(ki->vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
+  if ((ki->vcpu_fd = kvm_ioctl(ki->vm_fd, KVM_CREATE_VCPU, 0)) < 0) {
     perror("fatal: can not create KVM vcpu");
     return -1;
   }
@@ -47,13 +56,13 @@ static int kvm_create_vcpu(struct hv *hv) {
         1, sizeof(*cpuid_data) + 256 * sizeof(struct kvm_cpuid_entry2));
     if (cpuid_data) {
       cpuid_data->nent = 256;
-      if (ioctl(ki->kvm_fd, KVM_GET_SUPPORTED_CPUID, cpuid_data) >= 0) {
-        (void)ioctl(ki->vcpu_fd, KVM_SET_CPUID2, cpuid_data);  /* Best effort. */
+      if (kvm_ioctl(ki->kvm_fd, KVM_GET_SUPPORTED_CPUID, cpuid_data) >= 0) {
+        (void)kvm_ioctl(ki->vcpu_fd, KVM_SET_CPUID2, cpuid_data);  /* Best effort. */
       }
       free(cpuid_data);
     }
   }
-  kvm_run_mmap_size = ioctl(ki->kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
+  kvm_run_mmap_size = kvm_ioctl(ki->kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
   if (kvm_run_mmap_size < 0) {
     perror("fatal: ioctl KVM_GET_VCPU_MMAP_SIZE");
     return -1;
@@ -63,7 +72,7 @@ static int kvm_create_vcpu(struct hv *hv) {
     perror("fatal: mmap kvm_run");
     return -1;
   }
-  if (ioctl(ki->vcpu_fd, KVM_GET_REGS, &dummy_regs) < 0) {  /* We don't use the result; but we just check here that ioctl KVM_GET_REGS works. */
+  if (kvm_ioctl(ki->vcpu_fd, KVM_GET_REGS, &dummy_regs) < 0) {  /* We don't use the result; but we just check here that ioctl KVM_GET_REGS works. */
     perror("fatal: KVM_GET_REGS");
     return -1;
   }
@@ -73,7 +82,7 @@ static int kvm_create_vcpu(struct hv *hv) {
 static int kvm_run_vcpu(struct hv *hv, struct hv_exit *hx) {
   struct kvm_impl *ki = (struct kvm_impl*)hv->impl;
   memset(hx, 0, sizeof(*hx));
-  if (ioctl(ki->vcpu_fd, KVM_RUN, 0) < 0) {
+  if (kvm_ioctl(ki->vcpu_fd, KVM_RUN, 0) < 0) {
     if (errno == EINTR) {
       /* A host signal (the ~18.2 Hz SIGALRM BIOS tick) interrupted KVM_RUN
        * while the guest ran plain CPU code — no exit would otherwise reach
@@ -121,29 +130,29 @@ static int kvm_get_fds(const struct hv *hv, int *out, int n) {
 
 static int kvm_get_regs(struct hv *hv, struct kvm_regs *regs) {
   struct kvm_impl *ki = (struct kvm_impl*)hv->impl;
-  return ioctl(ki->vcpu_fd, KVM_GET_REGS, regs) < 0 ? -1 : 0;
+  return kvm_ioctl(ki->vcpu_fd, KVM_GET_REGS, regs) < 0 ? -1 : 0;
 }
 
 static int kvm_set_regs(struct hv *hv, const struct kvm_regs *regs) {
   struct kvm_impl *ki = (struct kvm_impl*)hv->impl;
-  return ioctl(ki->vcpu_fd, KVM_SET_REGS, (struct kvm_regs*)regs) < 0 ? -1 : 0;
+  return kvm_ioctl(ki->vcpu_fd, KVM_SET_REGS, (struct kvm_regs*)regs) < 0 ? -1 : 0;
 }
 
 static int kvm_get_sregs(struct hv *hv, struct kvm_sregs *sregs) {
   struct kvm_impl *ki = (struct kvm_impl*)hv->impl;
-  return ioctl(ki->vcpu_fd, KVM_GET_SREGS, sregs) < 0 ? -1 : 0;
+  return kvm_ioctl(ki->vcpu_fd, KVM_GET_SREGS, sregs) < 0 ? -1 : 0;
 }
 
 static int kvm_set_sregs(struct hv *hv, const struct kvm_sregs *sregs) {
   struct kvm_impl *ki = (struct kvm_impl*)hv->impl;
-  return ioctl(ki->vcpu_fd, KVM_SET_SREGS, (struct kvm_sregs*)sregs) < 0 ? -1 : 0;
+  return kvm_ioctl(ki->vcpu_fd, KVM_SET_SREGS, (struct kvm_sregs*)sregs) < 0 ? -1 : 0;
 }
 
 static int kvm_interrupt(struct hv *hv, unsigned irq_line) {
   struct kvm_impl *ki = (struct kvm_impl*)hv->impl;
   struct kvm_interrupt irq;
   irq.irq = irq_line;
-  return ioctl(ki->vcpu_fd, KVM_INTERRUPT, &irq) < 0 ? -1 : 0;
+  return kvm_ioctl(ki->vcpu_fd, KVM_INTERRUPT, &irq) < 0 ? -1 : 0;
 }
 
 static const struct hv_ops kvm_ops = {
@@ -174,7 +183,7 @@ struct hv *hv_kvm_create(void) {
     perror("fatal: failed to open /dev/kvm");
     goto fail;
   }
-  if ((api_version = ioctl(ki->kvm_fd, KVM_GET_API_VERSION, 0)) < 0) {
+  if ((api_version = kvm_ioctl(ki->kvm_fd, KVM_GET_API_VERSION, 0)) < 0) {
     perror("fatal: failed to get KVM api version");
     goto fail;
   }
@@ -182,7 +191,7 @@ struct hv *hv_kvm_create(void) {
     fprintf(stderr, "fatal: KVM API version mismatch: kernel=%d user=%d\n",
             api_version, KVM_API_VERSION);
   }
-  if ((ki->vm_fd = ioctl(ki->kvm_fd, KVM_CREATE_VM, 0)) < 0) {
+  if ((ki->vm_fd = kvm_ioctl(ki->kvm_fd, KVM_CREATE_VM, 0)) < 0) {
     perror("fatal: failed to create KVM vm");
     goto fail;
   }

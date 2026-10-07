@@ -12,7 +12,12 @@ env:
 
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04 = gcc 11 / clang 14, ubuntu-24.04 = gcc 13 / clang 18.
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -55,28 +60,35 @@ jobs:
       - name: Decoder unit test
         run: make test-x86dec
 
+      # Lint gate + sanitizers on the newest leg only: they gate on tool
+      # diagnostics whose wording/extra findings vary across tool versions.
       - name: Linters (cppcheck + clang-check + clang-tidy + clang --analyze)
+        if: matrix.os == 'ubuntu-24.04'
         run: bash tests/test_static.sh
 
       - name: Sanitizers (gcc + clang ASan/UBSan)
+        if: matrix.os == 'ubuntu-24.04'
         run: bash tests/test_sanitizers.sh
 
       - name: Install cosmopolitan toolchain
+        if: matrix.os == 'ubuntu-24.04'
         run: |
           curl -fsSL -o /tmp/cosmocc.zip "https://cosmo.zip/pub/cosmocc/cosmocc-${{ env.COSMOCC_VERSION }}.zip"
           unzip -q /tmp/cosmocc.zip -d "$HOME/cosmocc"
 
       - name: Build stripped APE (one binary for Linux + Windows)
+        if: matrix.os == 'ubuntu-24.04'
         run: |
           make kvikdos.ape \
             COSMOCC="$HOME/cosmocc/bin/x86_64-unknown-cosmo-cc" \
             COSTRIP="$HOME/cosmocc/bin/x86_64-unknown-cosmo-strip"
 
       - name: Smoke-test APE on Linux via KVM
-        if: steps.kvm.outputs.available == 'yes'
+        if: matrix.os == 'ubuntu-24.04' && steps.kvm.outputs.available == 'yes'
         run: ./kvikdos.ape guest.com ci | grep -F "Hello, World!"
 
       - name: Upload binaries
+        if: matrix.os == 'ubuntu-24.04'
         uses: actions/upload-artifact@v4
         with:
           name: binaries
@@ -85,9 +97,68 @@ jobs:
             kvikdos.ape
           if-no-files-found: error
 
+  linux-distro:
+    # Other distros in containers on the ubuntu host: exercises different
+    # glibc versions (debian, fedora) and a non-glibc libc (alpine/musl)
+    # against the same strict C89 build + KVM test suite.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            deps: apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev make nasm
+          - image: fedora:42
+            deps: dnf install -y gcc make nasm
+          - image: alpine:3.21
+            deps: apk add --no-cache bash gcc musl-dev linux-headers make nasm
+    container:
+      image: ${{ matrix.image }}
+      options: --device /dev/kvm  # Pass host KVM in; the check below degrades gracefully if absent.
+    defaults:
+      run:
+        shell: sh  # alpine has no bash by default.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: ${{ matrix.deps }}
+
+      - name: Check KVM availability
+        id: kvm
+        run: |
+          if [ -e /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "available=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build kvikdos (strict warnings)
+        run: make kvikdos
+
+      - name: Build guest test binaries
+        run: make guest.com cat.com printenv.com waitkey.com malloct.com mallocs.com slowp.com
+
+      - name: Run test suite (KVM)
+        if: steps.kvm.outputs.available == 'yes'
+        run: make test
+
+      - name: Run arg-parsing tests only (no KVM)
+        if: steps.kvm.outputs.available != 'yes'
+        run: |
+          ./tests/test_cli_parse.sh ./kvikdos
+          ./tests/test_cli_matrix.sh ./kvikdos
+
+      - name: Decoder unit test
+        run: make test-x86dec
+
   windows:
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
     steps:
       - name: Download binaries
         uses: actions/download-artifact@v4
@@ -118,7 +189,7 @@ jobs:
           }
 
   release:
-    needs: [linux, windows]
+    needs: [linux, linux-distro, windows]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
