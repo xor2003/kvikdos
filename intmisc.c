@@ -1,26 +1,8 @@
 #include "kvikdos.h"
 #include "intrun.h"
 
-/* Minimal stdout emitter shared by int 29h and DOS console writes.
- * stdout_write_p/stdout_write_end bound the bytes to emit. */
-void emit_stdout(void) {
-  if (vid_active) {
-    vid_write_str(mem, stdout_write_p, stdout_write_end);
-    vid_render(mem);
-  } else {
-    if (is_stdout_write_cursor) {
-      const char *p = stdout_write_p;
-      unsigned short *cursor = (unsigned short*)((char*)mem + 0x450);
-      if (*cursor <= 0xff) {
-        while (p != stdout_write_end) {
-          const char c = *p++;
-          if (c - 32U <= 126U - 32U && *cursor < 0xff) ++*cursor; else *cursor = 0;
-        }
-      }
-    }
-    (void)!write(1, stdout_write_p, stdout_write_end - stdout_write_p);
-  }
-}
+/* emit_stdout() (the CON writer the stdout calls funnel into) lives in
+ * conout.c. */
 
 int int29_dispatch(void) {
   stdout_write_p = (const char*)&regs.rax;

@@ -405,6 +405,7 @@ unsigned long bda_ticks_now(void);
 void init_tty_state(TtyState *tty_state, int tty_in_fd);
 unsigned char cga_to_ansi(unsigned char c);
 char *vid_utf8(char *o, unsigned cp);
+char *vid_cp437_utf8(char *o, unsigned char ch);
 void vid_term_release(void);
 void vid_enter(void);
 void vid_render(void *mem);

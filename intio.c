@@ -31,6 +31,10 @@ int i21_io(void) {
                 } else {
                   if ((got = ftruncate(fd, got1)) != 0) goto write_fault;
                 }
+              } else if (*(unsigned short*)&regs.rbx < 3) {  /* DOS STDOUT/STDERR: the CON device — wrap, glyph and newline emulation (conout.c). */
+                con_write(mem, p, p + size, fd, 1);
+                got = size;
+                goto write_success;
               } else {
                 got = write(fd, p, size);
                 if (got < 0) { write_fault:  /* errno may not be valid now, fstat(2) after lseek(3) failure may have reset it. */

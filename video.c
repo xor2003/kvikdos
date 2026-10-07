@@ -71,6 +71,15 @@ char *vid_utf8(char *o, unsigned cp) {
   return o;
 }
 
+/* Emit one CP437 byte as its UTF-8 glyph (shared by the renderer and the
+ * CON stdout path, which draws control codes as glyphs like DOS does). */
+char *vid_cp437_utf8(char *o, unsigned char ch) {
+  if (ch >= 0x80) return vid_utf8(o, cp437_high[ch - 0x80]);
+  if (ch == 0x7f) return vid_utf8(o, 0x2302);  /* CP437 DEL = ⌂. */
+  if (ch >= 0x20) { *o++ = (char)ch; return o; }
+  return vid_utf8(o, cp437_low[ch]);
+}
+
 void vid_term_release(void) {  /* Registered via atexit(). */
   if (vid_raw_taken && vid_tty_fd >= 0) tcsetattr(vid_tty_fd, 0, &vid_saved_tio);
   vid_raw_taken = 0;
@@ -194,10 +203,7 @@ void vid_render(void *mem) {
       else
         o += sprintf(o, "\x1b[0;%d;%dm", ((at & 8) ? 90 : 30) + fg, ((at & 0x80) ? 100 : 40) + bg);
     }
-    if (ch >= 0x80) o = vid_utf8(o, cp437_high[ch - 0x80]);
-    else if (ch == 0x7f) o = vid_utf8(o, 0x2302);  /* CP437 DEL = ⌂. */
-    else if (ch >= 0x20) *o++ = (char)ch;
-    else o = vid_utf8(o, cp437_low[ch]);
+    o = vid_cp437_utf8(o, ch);
   }
   vid_last_attr = la;
   /* Cursor shape/visibility from the BDA register (set by int 10h AH=01). */

@@ -133,6 +133,7 @@ extern unsigned vid_tick;
 
 /* Shared helpers used by several int handlers. */
 void emit_stdout(void);            /* Write stdout_write_p..stdout_write_end (and paint). */
+void con_write(void *mem, const char *p, const char *end, int fd, int is_con);  /* DOS CON output to a host fd (conout.c). */
 unsigned char dos_exit(void);      /* do_exit: cleanup, returns regs.rax exit code. */
 int int_dispatch(void);            /* Route int_num to its handler; returns IA_*. */
 int exit_or_pop(unsigned char rc);                 /* IA_EXIT at top level, IA_EXEC_POP under an exec'd child. */
