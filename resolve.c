@@ -149,7 +149,7 @@ char *add_env(char *env, char *env_end, const char *var, char do_check) {
       exit(252);
     }
     if (c == '=') do_check = 0;  /*in_name = 0;*/
-    *env++ = (c - 'a' + 0U <= 'z' - 'a' + 0U && do_check) ? c & ~32 : c;  /* Convert name to uppercase. */
+    *env++ = ((unsigned)c - 'a' + 0U <= 'z' - 'a' + 0U && do_check) ? c & ~32 : c;  /* Convert name to uppercase. */
     if (c == '\0') break;
   }
   if (do_check) {
@@ -178,7 +178,7 @@ char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, char had_
   /* !!! TODO(pts): Make the default permissive in general, and enable these protections only on a flag. */
   if (int_num == 0x23) *tasm30_bitset |= 4;
   if (int_num == 0x18) *tasm30_bitset |= 8;
-  if (int_num - 0x22 + 0U <= 0x24 - 022 +0U ||  /* Application Ctrl-<Break> handler == 0x23. We allow 0x22..0x24. */
+  if ((unsigned)int_num - 0x22 + 0U <= 0x24 - 022 +0U ||  /* Application Ctrl-<Break> handler == 0x23. We allow 0x22..0x24. */
       value_seg_ofs == *p ||  /* Unchanged. */
       value_seg_ofs == MAGIC_INT_VALUE(int_num) ||  /* Set back to original. */
       ((had_get_ints & 2) && int_num == 0x18) ||  /* TASM 3.2. */

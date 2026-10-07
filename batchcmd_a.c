@@ -227,7 +227,7 @@ if (bctx->cmd_size == 1 && (bctx->p_line[0] & ~32)  - 'A' + 0U <= 'Z' - 'A' + 0U
           while (*s && t + 2 < tmp + sizeof(tmp)) {
             char c3 = *s++;
             if (c3 == '/') c3 = '\\';
-            *t++ = (c3 - 'a' + 0U <= 'z' - 'a' + 0U) ? (c3 & ~32) : c3;
+            *t++ = ((unsigned)c3 - 'a' + 0U <= 'z' - 'a' + 0U) ? (c3 & ~32) : c3;
           }
           if (t != tmp && t[-1] != '\\') *t++ = '\\';
           *t = '\0';

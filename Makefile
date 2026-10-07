@@ -1,4 +1,4 @@
-.PHONY: all clean run test test-batch test-mem test-cli test-cli-matrix test-static test-sanitizers test-valgrind test-tooling test-x86dec ape
+.PHONY: all clean run test test-batch test-mem test-cli test-cli-matrix test-static test-sanitizers test-valgrind test-tooling test-x86dec ape lint
 .SUFFIXES:
 MAKEFLAGS += -r
 
@@ -35,7 +35,9 @@ test-cli: kvikdos
 test-cli-matrix: kvikdos
 	./tests/test_cli_matrix.sh ./kvikdos
 
-test-static:
+# Static-analysis gate: cppcheck + clang-check + clang-tidy + clang --analyze.
+# Required after any C change (see AGENTS.md).
+lint test-static:
 	./tests/test_static.sh
 
 test-sanitizers:

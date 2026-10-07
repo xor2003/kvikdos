@@ -199,7 +199,7 @@ void finish_args(struct ArgsWork *w) {
     while (*p && q + 2 < tmp + sizeof(tmp)) {
       char c = *p++;
       if (c == '/') c = '\\';
-      *q++ = (c - 'a' + 0U <= 'z' - 'a' + 0U) ? (c & ~32) : c;
+      *q++ = ((unsigned)c - 'a' + 0U <= 'z' - 'a' + 0U) ? (c & ~32) : c;
     }
     if (q != tmp && q[-1] != '\\') *q++ = '\\';
     *q = '\0';

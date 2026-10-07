@@ -19,7 +19,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm cppcheck clang unzip curl
+          sudo apt-get install -y nasm cppcheck clang clang-tidy clang-tools unzip curl
 
       - name: Check KVM availability
         id: kvm
@@ -55,7 +55,7 @@ jobs:
       - name: Decoder unit test
         run: make test-x86dec
 
-      - name: Linters (cppcheck + clang --analyze)
+      - name: Linters (cppcheck + clang-check + clang-tidy + clang --analyze)
         run: bash tests/test_static.sh
 
       - name: Sanitizers (gcc + clang ASan/UBSan)

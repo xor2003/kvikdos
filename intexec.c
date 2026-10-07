@@ -149,7 +149,7 @@ int i21_exec(void) {
                 g_prog_filename = get_linux_filename_r(dos_filename, dir_state, exec_fnbuf, NULL);
                 dir_state->dos_prog_abs = NULL;  /* For security. */
                 if (g_prog_filename[0] == '\0' && dos_prog_abs[0] &&
-                    !strchr(dos_filename, ':') && !strchr(dos_filename, '\\') && !strchr(dos_filename, '/')) {
+                    !strchr(dos_filename, ':') && !strchr(dos_filename, '\\') && !strchr(dos_filename, '/')) {  /* NOLINT(clang-analyzer-core.NonNullParamChecker): dos_filename is a guest pointer derived from mem, never NULL. */
                   const char *base = dos_prog_abs + strlen(dos_prog_abs);
                   for (; base != dos_prog_abs + 3 && base[-1] != '\\'; --base) {}
                   if (base > dos_prog_abs + 3) {

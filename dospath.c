@@ -308,7 +308,7 @@ char dosfnbuf[DOS_PATH_SIZE];
 
 void dos_normalize_abspath(const char *p, const DirState *dir_state, char *out, unsigned out_size) {
   char abs_path[DOS_PATH_SIZE + 4];
-  char *segs[DOS_PATH_SIZE / 2];
+  char *segs[DOS_PATH_SIZE / 2] = {0};
   unsigned nseg = 0, i;
   char *r, *e, *w;
   get_dos_abspath_r(p, dir_state, abs_path, sizeof(abs_path));

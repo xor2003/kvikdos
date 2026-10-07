@@ -1,10 +1,23 @@
+#ifndef KVIKDOS_MINI_KVM_H
+#define KVIKDOS_MINI_KVM_H
+
 #include <stdint.h>  /* E.g. uint64_t. */
 #include <sys/ioctl.h>  /* _IO(...). */
 
-typedef uint8_t __u8;
-typedef uint16_t __u16;
-typedef uint32_t __u32;
-typedef uint64_t __u64;
+/* Definitions identical to asm-generic/int-ll64.h so that either
+   inclusion order with the system headers is a legal same-type
+   redefinition.  Skipped entirely when those headers already ran. */
+#if !defined(_UAPI_ASM_GENERIC_INT_LL64_H) && \
+    !defined(_UAPI_ASM_GENERIC_INT_L64_H)
+__extension__ typedef __signed__ char __s8;
+__extension__ typedef unsigned char __u8;
+__extension__ typedef __signed__ short __s16;
+__extension__ typedef unsigned short __u16;
+__extension__ typedef __signed__ int __s32;
+__extension__ typedef unsigned int __u32;
+__extension__ typedef __signed__ long long __s64;
+__extension__ typedef unsigned long long __u64;
+#endif
 
 #define KVM_API_VERSION 12
 #define KVMIO 0xAE
@@ -63,7 +76,7 @@ struct kvm_cpuid_entry2 {
         __u32 padding[3];
 };
 
-struct kvm_cpuid2 {
+__extension__ struct kvm_cpuid2 {
         __u32 nent;
         __u32 padding;
         struct kvm_cpuid_entry2 entries[0];
@@ -249,12 +262,18 @@ __extension__ struct kvm_run {
 #define KVM_CREATE_VCPU           _IO(KVMIO,   0x41)
 #define KVM_SET_USER_MEMORY_REGION _IOW(KVMIO, 0x46, \
                                         struct kvm_userspace_memory_region)
+#define KVM_CREATE_IRQCHIP        _IO(KVMIO,   0x60)
 #define KVM_RUN                   _IO(KVMIO,   0x80)
 #define KVM_GET_REGS              _IOR(KVMIO,  0x81, struct kvm_regs)
 #define KVM_SET_REGS              _IOW(KVMIO,  0x82, struct kvm_regs)
 #define KVM_GET_SREGS             _IOR(KVMIO,  0x83, struct kvm_sregs)
 #define KVM_SET_SREGS             _IOW(KVMIO,  0x84, struct kvm_sregs)
+#define KVM_INTERRUPT             _IOW(KVMIO,  0x86, struct kvm_interrupt)
 #define KVM_SET_CPUID2            _IOW(KVMIO,  0x90, struct kvm_cpuid2)
+
+struct kvm_interrupt {
+	__u32 irq;  /* PIC line (0..15); the in-kernel PIC routes it to a vector. */
+};
 
 #define KVM_MEM_LOG_DIRTY_PAGES (1UL << 0)
 #define KVM_MEM_READONLY        (1UL << 1)
@@ -265,3 +284,5 @@ __extension__ struct kvm_run {
 #define KVM_EXIT_MMIO             6
 #define KVM_EXIT_SHUTDOWN         8   
 #define KVM_EXIT_INTERNAL_ERROR   17
+
+#endif /* KVIKDOS_MINI_KVM_H */
