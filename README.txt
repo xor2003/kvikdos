@@ -46,7 +46,8 @@ Features at a glance:
   (`set`, `%VAR%`, `%1..%9`, `shift`, `call`, `if`, `goto`, `mkdir`,
   `copy`, `del` ...).
 * Integration: propagates DOS exit codes, passes environment variables,
-  runs Linux ELF/scripts natively and delegates PE/NE/LE/LX to wine.
+  runs Linux ELF/scripts natively, runs PE executables natively on
+  Windows, and otherwise delegates PE/NE/LE/LX to wine.
 * Hosts: Linux/KVM natively; the cosmopolitan (APE) build adds
   Windows/WHPX — a single binary picks its backend at runtime.
 
@@ -77,7 +78,8 @@ Emulated DOS environment in more detail:
 * EXE loading: MZ with relocations, EXEPACK detection with the
   DOS 5-style fixed unpacking stub (avoids the `Packed file is corrupt'
   error), Phar Lap `P3'/TNT bound overlays, and format detection
-  (MZ/NE/LE/LX/PE delegated to wine, Linux ELF/scripts run natively).
+  (MZ/NE/LE/LX/PE delegated to wine — or run natively on Windows —
+  Linux ELF/scripts run natively).
 * Diagnostics and test hooks: `--diag=' categories (compat, exec, int,
   fs, all), `--diag-file=', `--hlt-ok'/`--hlt-dump=' guest RAM dumps,
   `--call-near'/`--call-far'/`--call-ss'/`--call-set' for running and
@@ -155,10 +157,17 @@ Limitations:
   running any random DOS program, use udosrun or DOSBox instead.
 
 * If the target file is Linux-native (ELF or shebang script), kvikdos-ng
-  executes it natively with Linux `fork+execvp` instead of DOS emulation.
+  executes it natively with `fork+execvp` instead of DOS emulation.
 
-* If the target file is a Windows executable format (PE/NE/LE/LX), kvikdos-ng
-  delegates execution to `wine` automatically.
+* If the target file is a PE (32-bit or 64-bit) executable and kvikdos-ng
+  itself runs on Windows, it is launched by the host system natively —
+  64-bit directly, 32-bit through WoW64 — no emulator or wine involved.
+
+* Otherwise, if the target file is a Windows executable format
+  (PE/NE/LE/LX), kvikdos-ng delegates execution to `wine` automatically.
+
+* `--force-dos' disables all of the above native/wine delegation and always
+  runs the program in the DOS emulator.
 
 Features and advantages:
 
@@ -336,10 +345,18 @@ I/O and memory:
   (e.g. CWSDPMI.EXE or HDPMI32.EXE) as a TSR first, then runs the real
   DOS program on top of it. Use this for 32-bit protected-mode tools
   which need DPMI (e.g. DOS4GW-style programs and the HX loader).
-  As a shortcut, when a program's real-mode loader is a Borland 32STUB
-  (e.g. BCC32.EXE or TLINK32.EXE), kvikdos-ng auto-loads the sibling
-  32RTM.EXE/RTM.EXE as the resident host when no `--dpmi=' is given,
-  so those tools can be run directly without a flag.
+  In most cases the flag is unnecessary: when the program looks like a
+  DPMI client (it contains DPMI/extender strings such as `DPMI',
+  `DOS/4G', `CAUSEWAY', `PMODEW', `RTM'), kvikdos-ng auto-searches a
+  known host — HDPMI32.EXE, CWSDPMI.EXE, HDPMI.EXE, DPMIRES.EXE,
+  32RTM.EXE, RTM.EXE, PMODEW.EXE, CWSDPR0.EXE — next to the program, on
+  the DOS PATH and on the emulator's own D: mount, and loads it
+  resident. Programs which are themselves DPMI hosts/loaders are
+  excluded by name. `--dpmi=auto' forces the host search even without
+  markers; `--dpmi=off' (or `=none') disables auto-detection for the
+  run. As a further shortcut, when a program's real-mode loader is a
+  Borland 32STUB (e.g. BCC32.EXE or TLINK32.EXE), kvikdos-ng auto-loads
+  the sibling 32RTM.EXE/RTM.EXE as the resident host.
 * `--hlt-ok' and `--hlt-dump=<file>' are low-level debug options.
 
 Best defaults:

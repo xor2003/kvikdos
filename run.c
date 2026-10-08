@@ -65,7 +65,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
   { struct SA { int StaticAssert_ShortSize : sizeof(short) == 2; }; }  /* Assumed by *(unsigned short*)... in many places. */
   { struct SA { int StaticAssert_IntSize : sizeof(int) == 4; }; }  /* Assumed by *(unsigned*)... in many places. */
 
-  if (!dpmi_host) dpmi_host = borland_stub_host(prog_filename);  /* Auto-load a sibling 32RTM.EXE/RTM.EXE for Borland DPMI stubs. */
+  if (!dpmi_host && !emu_params->dpmi_off) dpmi_host = borland_stub_host(prog_filename);  /* Auto-load a sibling 32RTM.EXE/RTM.EXE for Borland DPMI stubs. */
   dpmi_host_active = (dpmi_host != NULL);
   preserve_low = 0;
   load_psp_para = PSP_PARA;

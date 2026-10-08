@@ -143,6 +143,7 @@ typedef struct EmuParams {
   unsigned case_fallback_mode;  /* 0=off 1=prog 2=all */
   char strict_mode;  /* 0=permissive 1=strict */
   char batch_cd_root_mode;  /* 0=legacy, 1=interpret `cd \foo' as drive-root absolute. */
+  char dpmi_off;  /* 1=--dpmi=off: no resident host, not even the Borland sibling one. */
   char call_near_enabled;
   unsigned short call_near_ip;
   char call_far_enabled;
@@ -287,6 +288,7 @@ struct ArgsWork {
   char *placeholder, *prog_name_arg;
   char **argv, **envp0, **envp;
   char prog_filename_type, dos_prog_drive, is_kvm_check, is_drive_specified;
+  signed char dpmi_auto;  /* -1: --dpmi=off, 0: detect by markers, 1: --dpmi=auto. */
 };
 /* Working state shared across the run_dos_batch stages. run_dos_batch is
  * reentrant (nested CALL and .bat execution), so this state travels in a
@@ -360,6 +362,10 @@ int file_contains_text(const char *path, const char *needle);
 int is_probable_borland_dual_mode_ne(const char *path);
 int is_probable_windows_message_stub(const char *path);
 int is_probable_dos_extender_program(const char *path);
+/* Auto-detect a resident DPMI host for a DPMI-client-looking program: returns
+ * its DOS pathname or NULL. force!=0 skips the image marker check. */
+const char *auto_dpmi_host(const char *prog_filename, const DirState *dir_state, const char *dos_path, int force);
+int is_windows_host(void);  /* 1 when the APE/native binary runs on Windows. */
 int map_fd_open(int fd);
 void map_handle_close(unsigned short handle);
 int get_linux_fd(unsigned short handle);

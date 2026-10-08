@@ -208,4 +208,23 @@ void finish_args(struct ArgsWork *w) {
     *q = '\0';
     copy_cstr0(w->cmd.dir_state.current_dir[drive - 'A'], sizeof(w->cmd.dir_state.current_dir[drive - 'A']), tmp);
   }
+
+  /* Auto-load a resident DPMI host when the program looks like a DPMI client
+   * and a known host is reachable — saves typing --dpmi= in most cases.
+   * auto_dpmi_host() calls find_prog_on_path()/get_linux_filename_r(), which
+   * reuse fnbuf — the same buffer prog_filename often points into — so keep a
+   * stable copy of the program name for both the scan and the run. */
+  if (!w->cmd.dpmi_prog && w->dpmi_auto >= 0 &&
+      w->cmd.prog_filename && *w->cmd.prog_filename) {
+    static char prog_stay[LINUX_PATH_SIZE];
+    const char *host;
+    copy_cstr0(prog_stay, sizeof(prog_stay), w->cmd.prog_filename);
+    host = auto_dpmi_host(prog_stay, &w->cmd.dir_state,
+                          w->dos_path, w->dpmi_auto > 0);
+    w->cmd.prog_filename = prog_stay;
+    if (host) {
+      w->cmd.dpmi_prog = host;
+      if (CMD_PARSE_DEBUG) fprintf(stderr, "debug: auto-detected DPMI host: %s\n", host);
+    }
+  }
 }

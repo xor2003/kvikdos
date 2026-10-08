@@ -68,6 +68,21 @@ run_no_crash "dos-path-flags-slashes" \
 KVIKDOS_FLAGS="--root=$TMP/c" run_no_crash "kvikdos-flags-env" \
   'C:\\BIN\\LINK.EXE' || fails=$((fails+1))
 
+run_no_crash "dpmi-explicit-path" \
+  "${COMMON[@]}" --dpmi='C:/BIN/DPMI.EXE' 'C:\\BIN\\LINK.EXE' || fails=$((fails+1))
+
+run_no_crash "dpmi-auto" \
+  "${COMMON[@]}" --dpmi=auto 'C:\\BIN\\LINK.EXE' || fails=$((fails+1))
+
+run_no_crash "dpmi-off" \
+  "${COMMON[@]}" --dpmi=off 'C:\\BIN\\LINK.EXE' || fails=$((fails+1))
+
+run_no_crash "dpmi-none" \
+  "${COMMON[@]}" --dpmi=none 'C:\\BIN\\LINK.EXE' || fails=$((fails+1))
+
+run_no_crash "force-dos-on-mz" \
+  "${COMMON[@]}" --force-dos 'C:\\BIN\\LINK.EXE' || fails=$((fails+1))
+
 if [[ $fails -ne 0 ]]; then
   echo "FAIL: cli-matrix failures=$fails" >&2
   exit 1

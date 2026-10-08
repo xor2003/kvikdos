@@ -1,4 +1,17 @@
 #include "kvikdos.h"
+#ifdef __COSMOCC__
+#  include <cosmo.h>
+#endif
+
+int is_windows_host(void) {
+#if defined(__COSMOCC__)
+  return IsWindows();
+#elif defined(_WIN32)
+  return 1;
+#else
+  return 0;
+#endif
+}
 
 int run_dos_child_subprocess(const char *dos_filename, const char *dos_args, const char *env, const char *env_end, const DirState *dir_state, unsigned char *exit_code_out) {
   char self_exe[LINUX_PATH_SIZE];

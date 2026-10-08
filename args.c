@@ -25,6 +25,7 @@ void init_parsed_cmd_args(ParsedCmdArgs *cmd_args, char *placeholder_for_default
   cmd_args->emu_params.case_fallback_mode = 2;  /* all */
   cmd_args->emu_params.strict_mode = 0;  /* permissive */
   cmd_args->emu_params.batch_cd_root_mode = 0;  /* legacy */
+  cmd_args->emu_params.dpmi_off = 0;
   cmd_args->emu_params.call_near_enabled = 0;
   cmd_args->emu_params.call_near_ip = 0;
   cmd_args->emu_params.call_far_enabled = 0;
@@ -67,6 +68,7 @@ void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const char *pre
                     "  --prog=<dos-pathname>      Set DOS pathname of running program\n"
                     "  --cwd-dos=<path>           Set initial DOS current directory (e.g. C:/BIN)\n"
                     "  --dpmi=<dos-pathname>      Load resident DPMI host (HDPMI32, CWSDPMI) first\n"
+                    "  --dpmi=auto                Force DPMI host auto-search; =off disables it\n"
                     "  --batch-cd-root            Enable root-absolute `cd \\foo' in .bat built-in `cd'\n"
                     "\n"
                     "Mounts:\n"
@@ -86,7 +88,7 @@ void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const char *pre
                     "I/O and Memory:\n"
                     "  --tty-in=<fd>               -3 fake, -2 buffered stdin, -1 /dev/tty, >=0 fd\n"
                     "  --mem-mb=<n>                DOS memory in MiB, 1..1024 (128: default; >1 adds extended memory for protected mode)\n"
-                    "  --force-dos                 Always run the program in the DOS emulator, even if it looks like a Windows executable\n"
+                    "  --force-dos                 Always run the program in the DOS emulator, even if it looks like a native Linux/Windows executable\n"
                     "  --hlt-ok                    Allow hlt instruction\n"
                     "  --hlt-dump=<filename>       Dump guest memory on hlt\n"
                     "\n"
@@ -113,6 +115,7 @@ void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const char *pre
   w.envp = w.envp0 = ++w.argv;
   w.is_kvm_check = 0;
   w.is_drive_specified = 0;
+  w.dpmi_auto = 0;
   parse_option_loop(&w);
   finish_args(&w);
   w.cmd.args = (const char* const*)w.argv;

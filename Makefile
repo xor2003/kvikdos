@@ -10,7 +10,7 @@ XCFLAGS =  # To be overridden from the command-line.
 
 # Split translation units (was a single kvikdos.c). kvikdos.h is the shared
 # internal header with the common types, constants, externs and prototypes.
-KVIKDOS_SRCS = util.c diag.c resolve.c dospath.c args.c argsparse.c argspost.c batchline.c batchcmd_a.c batchcmd_b.c batchcmd_c.c loader.c mzdetect.c fds.c video.c tty.c ttydec.c mouse.c conout.c vm.c hv_kvm.c hv_whpx.c hvpick.c x86dec.c spawn.c runstate.c run.c vmexit.c intmisc.c intdos.c intcon.c intopen.c intio.c intmem.c intfcb.c intfind.c intexec.c intdmisc.c intvid.c intems.c intxms.c batch.c main.c
+KVIKDOS_SRCS = util.c diag.c resolve.c dospath.c args.c argsparse.c argspost.c batchline.c batchcmd_a.c batchcmd_b.c batchcmd_c.c loader.c mzdetect.c fds.c video.c tty.c ttydec.c mouse.c conout.c vm.c hv_kvm.c hv_whpx.c hvpick.c x86dec.c spawn.c dpmiauto.c runstate.c run.c vmexit.c intmisc.c intdos.c intcon.c intopen.c intio.c intmem.c intfcb.c intfind.c intexec.c intdmisc.c intvid.c intems.c intxms.c batch.c main.c
 SRCDEPS = $(KVIKDOS_SRCS) kvikdos.h mini_kvm.h mini_whpx.h hv.h x86dec.h
 
 all: $(ALL)

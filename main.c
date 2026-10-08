@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
     printf("is_hlt_ok: %d\n", cmd_args.emu_params.is_hlt_ok);
     return 0;
   }
-  if (is_linux_native_executable(cmd_args.prog_filename)) {
+  if (!cmd_args.force_dos && is_linux_native_executable(cmd_args.prog_filename)) {
     int rc = run_native_execvp(cmd_args.prog_filename, cmd_args.args);
     free_extra_env_args(&cmd_args);
     return rc;
@@ -67,6 +67,13 @@ int main(int argc, char **argv) {
   {
     const enum mz_subformat_t subfmt = detect_mz_subformat(cmd_args.prog_filename);
     const int is_ext = is_probable_dos_extender_program(cmd_args.prog_filename);
+    if (!cmd_args.force_dos && !is_ext && subfmt == MZ_SUBFMT_PE && is_windows_host()) {
+      /* On Windows a PE executable is native: 64-bit runs directly, 32-bit
+       * via WoW64 — no wine needed. Spawn it and propagate its exit code. */
+      int rc = run_native_execvp(cmd_args.prog_filename, cmd_args.args);
+      free_extra_env_args(&cmd_args);
+      return rc;
+    }
     if (!cmd_args.force_dos && !is_ext &&
         (subfmt == MZ_SUBFMT_PE ||
          ((subfmt == MZ_SUBFMT_NE || subfmt == MZ_SUBFMT_LE || subfmt == MZ_SUBFMT_LX) &&

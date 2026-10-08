@@ -44,7 +44,15 @@ void parse_option_loop(struct ArgsWork *w) {
       arg = *w->argv++;
      do_dpmi:
       slashes_to_dos(arg);
-      w->cmd.dpmi_prog = (const char*)arg;
+      if (is_same_ascii_nocase(arg, "auto", 4) && arg[4] == '\0') {
+        w->dpmi_auto = 1;  /* Force auto host search, no image-marker check. */
+      } else if ((is_same_ascii_nocase(arg, "off", 3) && arg[3] == '\0') ||
+                 (is_same_ascii_nocase(arg, "none", 4) && arg[4] == '\0')) {
+        w->dpmi_auto = -1;  /* Disable auto-detection for this run. */
+        w->cmd.emu_params.dpmi_off = 1;  /* Including the Borland sibling host. */
+      } else {
+        w->cmd.dpmi_prog = (const char*)arg;
+      }
     } else if (0 == strncmp(arg, "--dpmi=", 7)) {
       arg += 7;
       goto do_dpmi;
