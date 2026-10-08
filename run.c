@@ -423,7 +423,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
   sphinx_cmm_flags = 0;
   ctrl_break_checking = 0;
   if (exec_depth == 0) {  /* Keep the top program's dos_prog_abs->linux_prog alias across in-VM exec children, so the parent can still open its own .exe (Borland RTM reads the bound app image from it). load_prog aliases the fnbuf scratch buffer that file opens reuse — copy to stable storage. */
-    strncpy(linux_prog_buf, load_prog, sizeof(linux_prog_buf) - 1);
+    strncpy(linux_prog_buf, load_prog ? load_prog : "", sizeof(linux_prog_buf) - 1);
     linux_prog_buf[sizeof(linux_prog_buf) - 1] = '\0';
     dir_state->linux_prog = linux_prog_buf;
   }
