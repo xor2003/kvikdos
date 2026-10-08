@@ -35,6 +35,9 @@ void finish_args(struct ArgsWork *w) {
   *w->envp = NULL;
   /* Remaining arguments in w->argv will be passed to the DOS program in PSP:0x80. */
   w->dos_path = getenv_prefix("PATH=", (char const**)w->envp0, (char const**)w->envp);
+  /* --path-dos feeds bare-name resolution too; find_prog_on_path mutates the
+   * string (temporary NULs), so it needs a writable copy. */
+  if (!w->dos_path && w->path_dos_flag) w->dos_path = xstrdup(w->path_dos_flag);
 
   if (w->cmd.dir_state.linux_mount_dir['C' - 'A'] == w->placeholder) {  /* Set to current directory in Linux. */
     w->cmd.dir_state.linux_mount_dir['C' - 'A'] = "";  /* Either --mount=C:. (uppercase) or --mount=C-. (lowercase). */

@@ -57,17 +57,20 @@ void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const char *pre
                     "General:\n"
                     "  --kvm-check                Check KVM only (runs fake true.com)\n"
                     "  --strict | --permissive    Interrupt/API handling policy (default: --permissive)\n"
+                    "  KVIKDOS_FLAGS env var      Extra default flags, prepended to the command line\n"
                     "\n"
                     "DOS Runtime:\n"
                     "  --toolchain=<name>         Preset env for msc4|msc5|msc6|masm5|bc2|bcpp1|bc5|ic86\n"
                     "  --env=<NAME>=<value>       Add DOS environment variable\n"
                     "  --env-file=<file>          Load DOS env vars (NAME=VALUE lines)\n"
-                    "  --path-dos=<pathlist>      Set DOS PATH directly (e.g. C:\\BIN;C:\\)\n"
+                    "  --path-dos=<pathlist>      Set DOS PATH directly (e.g. C:/BIN;C:/)\n"
                     "  --prog=<dos-pathname>      Set DOS pathname of running program\n"
-                    "  --cwd-dos=<path>           Set initial DOS current directory (e.g. C:\\BIN)\n"
+                    "  --cwd-dos=<path>           Set initial DOS current directory (e.g. C:/BIN)\n"
+                    "  --dpmi=<dos-pathname>      Load resident DPMI host (HDPMI32, CWSDPMI) first\n"
                     "  --batch-cd-root            Enable root-absolute `cd \\foo' in .bat built-in `cd'\n"
                     "\n"
                     "Mounts:\n"
+                    "  --root=<dirname>           Mount dir as C:, drive C:, cwd C:\\, PATH C:\\;C:\\BIN\n"
                     "  --mount=<drive><case><dirname>/   Mount Linux dir to DOS drive\n"
                     "  --mount=<drive>0                  Hide DOS drive\n"
                     "    <case> ':' uppercase, '-' lowercase\n"
@@ -115,6 +118,39 @@ void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const char *pre
   w.cmd.args = (const char* const*)w.argv;
   w.cmd.envp0 = (const char* const*)w.envp0;
   *cmd_args_out = w.cmd;
+}
+
+/* Build a merged argv with whitespace-separated tokens of the KVIKDOS_FLAGS
+ * environment variable inserted after argv[0]. Returns argv unchanged when the
+ * variable is unset or empty. The result is never freed (process-lifetime). */
+char **argv_with_env_flags(char **argv) {
+  static const char delim[] = " \t\n\r";
+  const char *kf = getenv("KVIKDOS_FLAGS");
+  char **m, *buf, *p;
+  unsigned argc = 0, words = 0, i = 1;
+  if (!kf) return argv;
+  for (p = (char*)kf; *p;) {  /* Count flag words. */
+    while (*p && strchr(delim, *p)) ++p;
+    if (!*p) break;
+    ++words;
+    while (*p && !strchr(delim, *p)) ++p;
+  }
+  if (!words) return argv;
+  for (; argv[argc]; ++argc) {}
+  buf = xstrdup(kf);
+  m = (char**)malloc((argc + words + 1) * sizeof(char*));
+  if (!m) { perror("fatal: malloc"); exit(252); }
+  m[0] = argv[0];
+  for (p = buf;;) {
+    while (*p && strchr(delim, *p)) ++p;
+    if (!*p) break;
+    m[i++] = p;
+    while (*p && !strchr(delim, *p)) ++p;
+    if (*p) *p++ = '\0';
+  }
+  for (argc = 1; argv[argc]; ++argc) m[i++] = argv[argc];
+  m[i] = NULL;
+  return m;
 }
 
 void free_extra_env_args(ParsedCmdArgs *cmd_args) {

@@ -1,5 +1,10 @@
 #include "kvikdos.h"
 
+/* Convert forward slashes to DOS backslashes in a DOS-path flag value. */
+static void slashes_to_dos(char *s) {
+  for (; *s != '\0'; ++s) if (*s == '/') *s = '\\';
+}
+
 void parse_option_loop(struct ArgsWork *w) {
   while (w->argv[0]) {
     char *arg = *w->argv++;
@@ -29,6 +34,7 @@ void parse_option_loop(struct ArgsWork *w) {
       if (!w->argv[0]) goto missing_argument;
       arg = *w->argv++;
      do_prog:
+      slashes_to_dos(arg);
       w->cmd.dir_state.dos_prog_abs = arg;
     } else if (0 == strncmp(arg, "--prog=", 7)) {
       arg += 7;
@@ -37,6 +43,7 @@ void parse_option_loop(struct ArgsWork *w) {
       if (!w->argv[0]) goto missing_argument;
       arg = *w->argv++;
      do_dpmi:
+      slashes_to_dos(arg);
       w->cmd.dpmi_prog = (const char*)arg;
     } else if (0 == strncmp(arg, "--dpmi=", 7)) {
       arg += 7;
@@ -255,14 +262,18 @@ void parse_option_loop(struct ArgsWork *w) {
             } else if (arg[0] != '\0') {
               char *p = arg + strlen(arg);
               if (arg[1] != '\0' && p[-1] == '.' && p[-2] == '/') *--p = '\0';  /* Remove trailing . if it ends with /. */
-              if (p[-1] != '/') {
-                fprintf(stderr, "fatal: mount directory target must end with /: %s\n", arg);
-                exit(1);
+              if (p[-1] != '/') {  /* Missing trailing /: append it. */
+                char *m = (char*)malloc((size_t)(p - arg) + 2);
+                if (!m) { perror("fatal: malloc"); exit(252); }
+                memcpy(m, arg, (size_t)(p - arg));
+                m[p - arg] = '/';
+                m[p - arg + 1] = '\0';
+                arg = m;
               }
             }
           }
         }
-        w->cmd.dir_state.linux_mount_dir[(int)drive_idx] = arg;  /* w->argv retains ownership of arg. */
+        w->cmd.dir_state.linux_mount_dir[(int)drive_idx] = arg;  /* NOLINT(clang-analyzer-unix.Malloc): mount strings live in dir_state for the whole run */
         w->cmd.dir_state.case_mode[(int)drive_idx] = case_mode;
       }
     } else if (0 == strncmp(arg, "--mount=", 8)) {
@@ -281,6 +292,43 @@ void parse_option_loop(struct ArgsWork *w) {
     } else if (0 == strncmp(arg, "--drive=", 8)) {
       arg += 8;
       goto do_drive;
+    } else if (0 == strcmp(arg, "--root")) {  /* Typical example: --root=/tmp/dos */
+      if (!w->argv[0]) goto missing_argument;
+      arg = *w->argv++;
+     do_root:
+      {
+        const char *home = NULL;
+        char *m;
+        size_t nd, nh = 0;
+        /* Equivalent to --mount=C:<dir> --drive=C: --cwd-dos=C:\ plus
+         * PATH=C:\;C:\BIN — later flags can still override. */
+        w->cmd.dir_state.drive = 'C';
+        w->is_drive_specified = 1;
+        w->cwd_dos_flag = "C:\\";
+        w->path_dos_flag = "C:\\;C:\\BIN";
+        nd = strlen(arg);
+        if (arg[0] == '~' && arg[1] == '/') {  /* Support --root=~/dir. */
+          home = getenv("HOME");
+          if (home) nh = strlen(home);
+        }
+        m = (char*)malloc(nh + nd + 4);
+        if (!m) { perror("fatal: malloc"); exit(252); }
+        memcpy(m, "C:", 2);
+        if (nh) {
+          memcpy(m + 2, home, nh);
+          memcpy(m + 2 + nh, arg + 1, nd - 1);  /* arg+1 keeps the '/' of "~/". */
+          nd = nh + nd - 1;  /* Length of the dir part in m. */
+        } else {
+          memcpy(m + 2, arg, nd);
+        }
+        if (nd && m[nd + 1] != '/') m[2 + nd++] = '/';  /* Append missing trailing /. */
+        m[2 + nd] = '\0';
+        arg = m;
+        goto do_mount;
+      }
+    } else if (0 == strncmp(arg, "--root=", 7)) {
+      arg += 7;
+      goto do_root;
     } else if (0 == strcmp(arg, "--tty-in")) {
       int char_count;
       if (!w->argv[0]) goto missing_argument;
@@ -322,9 +370,13 @@ void parse_option_loop(struct ArgsWork *w) {
       w->cmd.emu_params.batch_cd_root_mode = 1;
     } else if (0 == strcmp(arg, "--path-dos")) {
       if (!w->argv[0]) goto missing_argument;
-      w->path_dos_flag = *w->argv++;
+      arg = *w->argv++;
+     do_path_dos:
+      slashes_to_dos(arg);
+      w->path_dos_flag = arg;
     } else if (0 == strncmp(arg, "--path-dos=", 11)) {
-      w->path_dos_flag = arg + 11;
+      arg += 11;
+      goto do_path_dos;
     } else if (0 == strcmp(arg, "--cwd-dos")) {
       if (!w->argv[0]) goto missing_argument;
       w->cwd_dos_flag = *w->argv++;

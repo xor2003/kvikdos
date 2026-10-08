@@ -6,7 +6,7 @@ int main(int argc, char **argv) {
   (void)argc;
   g_diag_file = stderr; /* default diag stream: valid before parse_args (compile-time DEBUG paths may print early) */
   parse_args(
-      argv, &cmd_args,
+      argv_with_env_flags(argv), &cmd_args,
       "kvikdos: run DOS programs headless (a very fast DOS emulator)\nUsage: ", "",
       "This is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.\n");
   g_case_fallback_mode = cmd_args.emu_params.case_fallback_mode;

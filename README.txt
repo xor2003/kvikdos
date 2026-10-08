@@ -283,6 +283,10 @@ General:
   Windows) by running a minimal guest.
 * `--strict' enables strict unsupported-interrupt behavior.
 * `--permissive' enables compatibility fallback behavior (default).
+* The `KVIKDOS_FLAGS' environment variable holds extra default flags
+  (whitespace-separated), prepended to the command line — handy for a
+  persistent DOS tree setup, e.g.
+  `KVIKDOS_FLAGS="--root=/opt/dos --dpmi=C:/BIN/HDPMI32.EXE"'.
 
 DOS runtime:
 
@@ -291,13 +295,23 @@ DOS runtime:
 * `--env=<NAME>=<value>' adds one DOS environment variable.
 * `--env-file=<file>' loads DOS environment variables from file
   (`NAME=VALUE' lines).
-* `--path-dos=<pathlist>' sets DOS PATH explicitly.
+* `--path-dos=<pathlist>' sets DOS PATH explicitly; it is also used to
+  resolve a bare program name on the command line.
 * `--prog=<dos-pathname>' sets DOS pathname of the running program.
 * `--cwd-dos=<path>' sets initial DOS current directory.
+* Forward slashes are accepted in the DOS-path flags above (`--path-dos',
+  `--prog', `--cwd-dos', `--dpmi') and converted to backslashes.
 
 Mounts:
 
-* `--mount=<drive><case><dirname>/' mounts Linux directory to DOS drive.
+* `--root=<dirname>' is a shortcut for running a program from a DOS
+  directory tree: it mounts <dirname> as C: (uppercase), sets the DOS
+  drive and current directory to C:\, and sets PATH to C:\;C:\BIN.
+  Equivalent to `--mount=C:<dirname> --drive=C: --cwd-dos=C:\
+  --path-dos=C:\;C:\BIN'; flags given after `--root=' still override
+  these. `~/' is expanded to $HOME.
+* `--mount=<drive><case><dirname>/' mounts Linux directory to DOS drive
+  (the trailing `/' is optional).
 * `--mount=<drive>0' hides DOS drive.
 * `--drive=<drive>' sets initial DOS drive.
 

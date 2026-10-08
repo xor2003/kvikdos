@@ -53,6 +53,21 @@ run_no_crash "missing-flag-arg" \
 run_no_crash "linux-positional-with-prog" \
   "${COMMON[@]}" --prog='C:\\BIN\\LINK.EXE' "$TMP/c/BIN/LINK.EXE" || fails=$((fails+1))
 
+run_no_crash "root-flag" \
+  --root="$TMP/c" 'C:\\BIN\\LINK.EXE' || fails=$((fails+1))
+
+run_no_crash "root-then-override" \
+  --root="$TMP/c" --cwd-dos='C:/BIN' --path-dos='C:/BIN' 'C:\\BIN\\LINK.EXE' || fails=$((fails+1))
+
+run_no_crash "mount-no-trailing-slash" \
+  --mount=C:"$TMP/c" --drive=C 'C:\\BIN\\LINK.EXE' || fails=$((fails+1))
+
+run_no_crash "dos-path-flags-slashes" \
+  "${COMMON[@]}" --drive=d --cwd-dos='D:/' --path-dos='C:/BIN;C:/' --prog='C:/BIN/LINK.EXE' 'C:/BIN/LINK.EXE' || fails=$((fails+1))
+
+KVIKDOS_FLAGS="--root=$TMP/c" run_no_crash "kvikdos-flags-env" \
+  'C:\\BIN\\LINK.EXE' || fails=$((fails+1))
+
 if [[ $fails -ne 0 ]]; then
   echo "FAIL: cli-matrix failures=$fails" >&2
   exit 1

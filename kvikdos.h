@@ -343,6 +343,7 @@ struct BatchCtx {
 #define DC_PASS    3  /* Line did not match this group's commands. */
 void init_parsed_cmd_args(ParsedCmdArgs *cmd_args, char *placeholder_for_default);
 void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const char *pre_msg, const char *usage_extra, const char *post_msg);
+char **argv_with_env_flags(char **argv);  /* Prepend KVIKDOS_FLAGS tokens. */
 void parse_option_loop(struct ArgsWork *w);
 void finish_args(struct ArgsWork *w);
 void free_extra_env_args(ParsedCmdArgs *cmd_args);
