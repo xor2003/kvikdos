@@ -38,7 +38,7 @@ pattern (cppcheck) — do not weaken the gate to hide diagnostics.
   output is a host ELF wrapping the APE image; objcopy `-O binary`
   flattens it into the real MZqFpD portable executable.
 - `make dist` — release staging: the APE is the shipped executable, staged
-  as `dist/kvikdos` (Linux) + `dist/kvikdos.com` (Windows).
+  as `dist/kvikdos.com` (one file, runs on Linux + Windows).
 
 ## Conventions
 

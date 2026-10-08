@@ -264,8 +264,8 @@ Building from source:
 
     $ make dist
 
-  Produces dist/kvikdos (Linux) and dist/kvikdos.com (Windows) — the
-  same single APE file under both names. Get the cosmopolitan toolchain
+  Produces dist/kvikdos.com — a single APE file that runs on both Linux
+  and Windows. Get the cosmopolitan toolchain
   from https://cosmo.zip/pub/cosmocc/ (cosmocc-<ver>.zip, unzip anywhere,
   put its bin/ on PATH or pass COSMOCC=/path/to/x86_64-unknown-cosmo-cc
   COOBJCOPY=/path/to/x86_64-linux-cosmo-objcopy). The APE runs DOS

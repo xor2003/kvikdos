@@ -78,8 +78,8 @@ kvikdos.diet: $(SRCDEPS)
 # merely *contains* the APE image; `objcopy -S -O binary' flattens the
 # load segments into the real MZqFpD-headered portable executable (the
 # same step the toolchain wrapper applies to .com/.exe outputs). The APE
-# is the shipped executable: `make dist' stages it as dist/kvikdos
-# (Linux) and dist/kvikdos.com (Windows).
+# is the shipped executable: `make dist' stages it as dist/kvikdos.com
+# (one file, runs on Linux + Windows).
 COSMOCC ?= x86_64-unknown-cosmo-cc
 COOBJCOPY ?= x86_64-linux-cosmo-objcopy
 kvikdos.ape: $(SRCDEPS)
@@ -89,13 +89,12 @@ kvikdos.ape: $(SRCDEPS)
 
 ape: kvikdos.ape
 
-# Release staging: the APE is the main executable — dist/kvikdos for
-# Linux, dist/kvikdos.com for Windows (same file, both names).
+# Release staging: the APE is the shipped executable — one file for Linux
+# and Windows, staged under its Windows-conventional name dist/kvikdos.com.
 dist: kvikdos.ape
 	mkdir -p dist
-	cp kvikdos.ape dist/kvikdos
 	cp kvikdos.ape dist/kvikdos.com
-	chmod 755 dist/kvikdos dist/kvikdos.com
+	chmod 755 dist/kvikdos.com
 
 # Host-native unit test for the mini instruction decoder the WHPX backend
 # uses to complete memory-access exits (no guest or hypervisor needed).

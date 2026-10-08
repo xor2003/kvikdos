@@ -99,16 +99,14 @@ jobs:
 
       - name: Smoke-test APE on Linux via KVM
         if: matrix.os == 'ubuntu-24.04' && steps.kvm.outputs.available == 'yes'
-        run: ./dist/kvikdos guest.com ci | grep -F "Hello, World!"
+        run: ./dist/kvikdos.com guest.com ci | grep -F "Hello, World!"
 
       - name: Upload binaries
         if: matrix.os == 'ubuntu-24.04'
         uses: actions/upload-artifact@v4
         with:
           name: binaries
-          path: |
-            dist/kvikdos
-            dist/kvikdos.com
+          path: dist/kvikdos.com
           if-no-files-found: error
 
   linux-distro:
@@ -224,8 +222,8 @@ jobs:
       - name: Package release assets
         run: |
           cd dist
-          chmod 755 kvikdos kvikdos.com
-          sha256sum kvikdos kvikdos.com > SHA256SUMS.txt
+          chmod 755 kvikdos.com
+          sha256sum kvikdos.com > SHA256SUMS.txt
 
       - name: Create GitHub release
         env:
@@ -235,4 +233,4 @@ jobs:
           gh release create "${{ github.ref_name }}" \
             --title "kvikdos ${{ github.ref_name }}" \
             --generate-notes \
-            kvikdos kvikdos.com SHA256SUMS.txt
+            kvikdos.com SHA256SUMS.txt
