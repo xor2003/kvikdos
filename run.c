@@ -123,6 +123,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
   current_psp_para = PSP_PARA;
   vid_tick = 0;
   vid_active = 0;  /* Each program starts in plain stdout mode. */
+  con_teardown_reset(mem);  /* And with a fresh 32RTM teardown-dump filter. */
   vid_wrap_pend = 0;
   vid_cur_shape = -2;
   find_dirp = NULL;
