@@ -1,4 +1,5 @@
 #include "kvikdos.h"
+#include "intrun.h"
 
 int main(int argc, char **argv) {
   ParsedCmdArgs cmd_args;
@@ -96,6 +97,7 @@ int main(int argc, char **argv) {
       exit_code = run_dos_prog(&emu, cmd_args.prog_filename, cmd_args.dpmi_prog, NULL, cmd_args.args, &cmd_args.dir_state, &tty_state, &cmd_args.emu_params, cmd_args.envp0, (const char* const*)cmd_args.extra_env, cmd_args.extra_env_count);
     }
     if (DEBUG || DIAG_ON(DIAG_BIT_EXEC)) fprintf(g_diag_file, "debug: DOS program exited with code: 0x%02x", exit_code);
+    con_teardown_reset(mem);  /* Emit console text still withheld by the dump filter. */
     free_extra_env_args(&cmd_args);
     return exit_code;
   }

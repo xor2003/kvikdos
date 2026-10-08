@@ -91,6 +91,7 @@ char linux_prog_buf[LINUX_PATH_SIZE];  /* Stable storage for dir_state->linux_pr
  * requested guest-memory dump, then return the DOS exit code to the host. */
 unsigned char dos_exit(void) {
   if (vid_active) vid_render(mem);  /* Flush the final frame before the screen is torn down. */
+  con_teardown_reset(mem);  /* Emit any console text withheld by the dump filter. */
   if (find_dirp) { closedir(find_dirp); find_dirp = NULL; }
   if (g_exit_regs) {
     struct kvm_sregs sr;
