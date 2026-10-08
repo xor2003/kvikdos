@@ -11,6 +11,23 @@ env:
   COSMOCC_VERSION: '4.0.2'
 
 jobs:
+  # Static-analysis gate: its own fast job (no KVM or build needed) so it runs
+  # first and reports as a named, independent check instead of a conditional
+  # step buried in one build leg.  Pinned to ubuntu-24.04's clang 18 -- the
+  # checker diagnostics' wording varies across tool versions.
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install lint tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck clang clang-tidy clang-tools
+
+      - name: Static analysis (cppcheck + clang-check + clang-tidy + clang --analyze)
+        run: STATIC_SLOW=1 bash tests/test_static.sh
+
   linux:
     strategy:
       fail-fast: false
@@ -60,12 +77,9 @@ jobs:
       - name: Decoder unit test
         run: make test-x86dec
 
-      # Lint gate + sanitizers on the newest leg only: they gate on tool
-      # diagnostics whose wording/extra findings vary across tool versions.
-      - name: Linters (cppcheck + clang-check + clang-tidy + clang --analyze)
-        if: matrix.os == 'ubuntu-24.04'
-        run: STATIC_SLOW=1 bash tests/test_static.sh
-
+      # Sanitizers on the newest leg only: their diagnostics' wording/extra
+      # findings vary across tool versions.  (Static analysis is the separate
+      # fast `lint` job.)
       - name: Sanitizers (gcc + clang ASan/UBSan)
         if: matrix.os == 'ubuntu-24.04'
         run: bash tests/test_sanitizers.sh
@@ -193,7 +207,7 @@ jobs:
           exit 0
 
   release:
-    needs: [linux, linux-distro, windows]
+    needs: [linux, linux-distro, windows, lint]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
