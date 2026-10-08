@@ -479,8 +479,23 @@ int i21_misc(void) {
               *(unsigned short*)&regs.rax = 0x21;  /* Lock violation. */
               return dos_error_21();
             }
-  }   else if (ah == 0x5d || ah == 0x5e || ah == 0x5f) {
-  /* Share/network redirector services. */
+  }   else if (ah == 0x5d) {
+  /* SHARE/server services. AL=06h is Get SDA (swappable data area): return
+   * DS:SI -> a fake SDA in the DOS data space whose wPSP field (offset 0x10)
+   * is the current-PSP mirror word. HDPMI32's client init (?SAVEPSP) reads
+   * the current PSP from there; DKRNL32 checks bInDOS (offset 1) before
+   * re-entering DOS. Other AL (0x0ah set extended error etc.) stay unknown. */
+            if (*(unsigned char*)&regs.rax == 6) {
+              SET_SREG(ds, SDA_LIN >> 4);
+              *(unsigned short*)&regs.rsi = SDA_LIN & 0xf;
+              *(unsigned short*)&regs.rcx = 0x80;  /* Bytes swappable while InDOS (msdos_player). */
+              *(unsigned short*)&regs.rdx = 0x1a;  /* Bytes always swapped. */
+              *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
+            } else {
+              return dos_unknown21();
+            }
+  }   else if (ah == 0x5e || ah == 0x5f) {
+  /* Network redirector services. */
             return dos_unknown21();
   }   else if (ah == 0x54) {
   /* Get verify flag. */

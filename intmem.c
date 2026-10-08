@@ -1,6 +1,15 @@
 #include "kvikdos.h"
 #include "intrun.h"
 
+/* Write the private psize field and stamp the "KV1KPR0G" signature. Used for
+ * psize updates on blocks that may be foreign-written (extenders like HDPMI
+ * hand-carve DOS-format MCBs without kvikdos's private fields): a correct
+ * psize makes the block checkable, and the mark records that. */
+static void mcb_set_psize(char *mcb, unsigned short psize_para) {
+  MCB_PSIZE_PARA(mcb) = psize_para;
+  memcpy(mcb + 7, default_program_mcb + 7, 9);
+}
+
 /* DOS int 21h services: mem group. Returns an IA_* action. */
 int i21_mem(void) {
   if (ah == 0x4a) {
@@ -20,6 +29,11 @@ int i21_mem(void) {
             if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: inplace_realloc block_para=0x%04x new_size_para=0x%04x old_size_para=0x%04x\n", block_para, new_size_para, MCB_SIZE_PARA(mcb));
             DEBUG_CHECK_ALL_MCBS(mem);
             old_size_para = MCB_SIZE_PARA(mcb);
+            if (memcmp(mcb + 7, default_program_mcb + 7, 9) != 0) {  /* Adopt a foreign-carved block (e.g. HDPMI's TLB): stamp signature + real psize. */
+              unsigned short prev_para = 0;
+              mcb_prev_block(mem, block_para, &prev_para);
+              mcb_set_psize(mcb, prev_para != 0 ? (unsigned short)(block_para - prev_para - 1) : 0);
+            }
             if (old_size_para != new_size_para) {
               next_mcb = MCB_TYPE(mcb) != 'Z' ? (mcb + 16 + (old_size_para << 4)) : NULL;
               if (next_mcb && is_mcb_bad(mem, block_para + 1 + old_size_para)) goto error_bad_mcb;
@@ -48,7 +62,8 @@ int i21_mem(void) {
                 memcpy(free_mcb, default_program_mcb, 16);
                 MCB_TYPE(free_mcb) = 'M';
                 MCB_PID(free_mcb) = 0;  /* Mark as free. */
-                MCB_SIZE_PARA(free_mcb) = MCB_PSIZE_PARA(next_mcb) = old_size_para - new_size_para - 1;
+                MCB_SIZE_PARA(free_mcb) = old_size_para - new_size_para - 1;
+                mcb_set_psize(next_mcb, old_size_para - new_size_para - 1);
                 MCB_PSIZE_PARA(free_mcb) = MCB_SIZE_PARA(mcb) = new_size_para;
               } else if (new_size_para == available_para) {  /* Exact size match. Merge the following free block into the current block. */
                 const char tail = MCB_TYPE(next_mcb);
@@ -56,7 +71,7 @@ int i21_mem(void) {
                 memset(next_mcb, 0, 16);
                 next_mcb = next_mcb + 16 + (next_mcb_size_para << 4);
                 if (tail == 'Z') MCB_TYPE(mcb) = 'Z';  /* Absorbed the last block: current becomes last. */
-                else MCB_PSIZE_PARA(next_mcb) = available_para;
+                else mcb_set_psize(next_mcb, available_para);
                 MCB_SIZE_PARA(mcb) = available_para;
               } else {  /* Make the following free block smaller or larger. */
                 const char tail = MCB_TYPE(next_mcb);
@@ -65,7 +80,7 @@ int i21_mem(void) {
                 MCB_TYPE(next_mcb2) = tail;  /* Remainder keeps the old signature ('Z' stays last). */
                 MCB_PID(next_mcb2) = 0;  /* Mark as free. */
                 MCB_SIZE_PARA(next_mcb2) = MCB_SIZE_PARA(next_mcb) + old_size_para - new_size_para;
-                if (tail != 'Z') MCB_PSIZE_PARA(next_mcb + 16 + (MCB_SIZE_PARA(next_mcb) << 4)) = MCB_SIZE_PARA(next_mcb2);
+                if (tail != 'Z') mcb_set_psize(next_mcb + 16 + (MCB_SIZE_PARA(next_mcb) << 4), MCB_SIZE_PARA(next_mcb2));
                 MCB_PSIZE_PARA(next_mcb2) = MCB_SIZE_PARA(mcb) = new_size_para;
                 memset(next_mcb, 0, 16);
               }
@@ -96,7 +111,14 @@ int i21_mem(void) {
                 for (;;) {
                   const char * const mcb = (const char*)mem + (block_para << 4) - 16;
                   unsigned size_para;
-                  if (is_mcb_bad(mem, block_para)) goto error_bad_mcb;
+                  if (is_mcb_bad(mem, block_para)) {
+                    if (DEBUG || DIAG_ON(DIAG_BIT_VERBOSE)) {
+                      const unsigned char *b = (const unsigned char*)mcb;
+                      fprintf(g_diag_file, "debug: malloc bad mcb at para=0x%04x bad=%d bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                              block_para, (int)is_mcb_bad(mem, block_para), b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+                    }
+                    goto error_bad_mcb;
+                  }
                   if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: malloc find block=0x%04x...0x%04x size=0x%04x psize=0x%04x mcb_type=%c is_used=%d\n", block_para, block_para + MCB_SIZE_PARA(mcb), MCB_SIZE_PARA(mcb), MCB_PSIZE_PARA(mcb), MCB_TYPE(mcb), MCB_PID(mcb) != 0);
                   size_para = MCB_SIZE_PARA(mcb);
                   if (MCB_TYPE(mcb) == 'Z' && MCB_PID(mcb) != 0) {  /* Last block is in use; the space after it is an implicit tail (only reachable if the chain lacks a free tail). */
@@ -156,6 +178,9 @@ int i21_mem(void) {
                 {  /* Change existing free block. */
                   char * const next_mcb = mcb + (MCB_SIZE_PARA(mcb) << 4) + 16;
                   MCB_PID(mcb) = PROCESS_ID;  /* Mark as in use. */
+                  if (memcmp(mcb + 7, default_program_mcb + 7, 9) != 0) {  /* Adopt a foreign-carved free block (e.g. HDPMI's freed TLB): stamp signature + real psize. */
+                    mcb_set_psize(mcb, (unsigned short)(fit_prev_block_para != 0 ? fit_block_para - fit_prev_block_para - 1 : 0));
+                  }
                   if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) {
                     fprintf(g_diag_file, "debug: malloc middle prev_block=0x%04x block=0x%04x next=0x%04x free=0x%04x is_exact_fit=%d strategy=%u\n",
                             fit_prev_block_para, fit_block_para, fit_block_para + MCB_SIZE_PARA(mcb) + 1, fit_block_para + alloc_size_para + 1,
@@ -167,7 +192,7 @@ int i21_mem(void) {
                     char * const after_mcb = mcb + ((MCB_SIZE_PARA(mcb) - alloc_size_para) << 4);
                     memcpy(after_mcb, default_program_mcb, 16);  /* 'Z' (last) by default. */
                     MCB_SIZE_PARA(after_mcb) = alloc_size_para;
-                    if (MCB_TYPE(mcb) != 'Z' && fit_block_para + alloc_size_para < DOS_ALLOC_PARA_LIMIT) MCB_PSIZE_PARA(next_mcb) = alloc_size_para;
+                    if (MCB_TYPE(mcb) != 'Z' && fit_block_para + alloc_size_para < DOS_ALLOC_PARA_LIMIT) mcb_set_psize(next_mcb, alloc_size_para);
                     MCB_PSIZE_PARA(after_mcb) = MCB_SIZE_PARA(mcb) -= alloc_size_para + 1;
                     MCB_TYPE(after_mcb) = MCB_TYPE(mcb);
                     MCB_PID(mcb) = 0;  /* Free. */
@@ -189,7 +214,7 @@ int i21_mem(void) {
                     MCB_TYPE(free_mcb) = tail;  /* Remainder keeps the old signature ('Z' stays last). */
                     MCB_PID(free_mcb) = 0;
                     MCB_SIZE_PARA(free_mcb) = size_para - alloc_size_para - 1;
-                    if (tail != 'Z') MCB_PSIZE_PARA(next_mcb) = MCB_SIZE_PARA(free_mcb);
+                    if (tail != 'Z') mcb_set_psize(next_mcb, MCB_SIZE_PARA(free_mcb));
                     mcb_error = is_mcb_bad(mem, fit_block_para + alloc_size_para + 1);
                     if (mcb_error) {  /* free_mcb. */
                       fprintf(stderr, "fatal: bad free MCB after malloc(): %d\n", mcb_error);
@@ -213,6 +238,7 @@ int i21_mem(void) {
   /* Free allocated memory (free()). */
             const unsigned block_para = (unsigned short)sregs.es.selector;
             char *mcb = (char*)mem + (block_para << 4) - 16;
+            unsigned short prev_para = 0;
             if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free(0x%04x)\n", block_para);
             DEBUG_CHECK_ALL_MCBS(mem);
             if (block_para == PSP_PARA) {  /* It's not allowed to free the program image. */
@@ -224,8 +250,8 @@ int i21_mem(void) {
               goto error_bad_mcb;
             } else if (MCB_PID(mcb) == 0) {  /* Already free. Succeed as noop just like DOSBox 0.74 and MS-DOS 6.22 do. */
               if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free: already free\n");
-            } else if (is_mcb_bad(mem, block_para - MCB_PSIZE_PARA(mcb) - 1)) {
-              if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free: bad prev MCB para=0x%04x: %d\n", block_para - MCB_PSIZE_PARA(mcb) - 1, is_mcb_bad(mem, block_para - MCB_PSIZE_PARA(mcb) - 1));
+            } else if (!mcb_prev_block(mem, block_para, &prev_para) || is_mcb_bad(mem, prev_para)) {  /* psize backpointer may be stale on foreign-carved chains; mcb_prev_block falls back to a forward scan. */
+              if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free: bad prev MCB para=0x%04x: %d\n", prev_para, prev_para ? is_mcb_bad(mem, prev_para) : -1);
               goto error_bad_mcb;
             } else if (MCB_TYPE(mcb) != 'Z' && is_mcb_bad(mem, block_para + MCB_SIZE_PARA(mcb) + 1)) {
               if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) {
@@ -235,7 +261,7 @@ int i21_mem(void) {
               }
               goto error_bad_mcb;
             } else {
-              char *prev_mcb = mcb - 16 - (MCB_PSIZE_PARA(mcb) << 4);  /* Always exists since block_para != PSP_PARA. */
+              char *prev_mcb = (char*)mem + (prev_para << 4) - 16;  /* Always exists since block_para != PSP_PARA. */
               char *next_mcb = mcb + 16 + (MCB_SIZE_PARA(mcb) << 4);
               if (MCB_TYPE(mcb) != 'Z' && MCB_PID(next_mcb) == 0) {  /* Merge it with the following free block. */
                 char *next_mcb2 = next_mcb + 16 + (MCB_SIZE_PARA(next_mcb) << 4);
@@ -248,7 +274,7 @@ int i21_mem(void) {
                 }
                 MCB_SIZE_PARA(mcb) += 1 + MCB_SIZE_PARA(next_mcb);
                 memset(next_mcb, 0, 16);
-                if (next_type != 'Z') MCB_PSIZE_PARA(next_mcb2) = MCB_SIZE_PARA(mcb);
+                if (next_type != 'Z') mcb_set_psize(next_mcb2, MCB_SIZE_PARA(mcb));
                 MCB_TYPE(mcb) = next_type;
               }
               MCB_PID(mcb) = 0;  /* Mark it as free. */
@@ -257,7 +283,7 @@ int i21_mem(void) {
                 if (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)) fprintf(g_diag_file, "debug: free: merge with prev free\n");
                 MCB_SIZE_PARA(prev_mcb) += 1 + MCB_SIZE_PARA(mcb);
                 memcpy(mcb, freed_mcb, 16);
-                if (mcb_type != 'Z') MCB_PSIZE_PARA(next_mcb) = MCB_SIZE_PARA(prev_mcb);
+                if (mcb_type != 'Z') mcb_set_psize(next_mcb, MCB_SIZE_PARA(prev_mcb));
                 MCB_TYPE(prev_mcb) = mcb_type;
                 mcb = prev_mcb;
               }

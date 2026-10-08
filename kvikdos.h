@@ -72,6 +72,7 @@
 #define INT_HLT_PARA 0x54
 #define INVARS_LIN 0x670  /* Linear address of dos_info_t.first_dpb. int 21h AH=52h returns ES:BX = 0x66:0x10, so dos_info_t spans 0x64a..0x6df, between the int stubs (0x540-0x63f) and the environment (0x940). */
 #define SYSVARS_CUR_PSP_LIN 0x93e  /* Mirrored current-PSP word at 0x66:0x2de inside the sysvars segment (the DOS 5.x SDA offset). Microsoft tools (e.g. QBX.EXE) verify that it tracks the PSP set via int 21h AH=50h before they run. */
+#define SDA_LIN (SYSVARS_CUR_PSP_LIN - 0x10)  /* Fake DOS swappable data area base: its wPSP field (offset 0x10) lands on the current-PSP mirror. Returned by int 21h AX=5D06h; read by HDPMI32's ?SAVEPSP client init. */
 #define PSP_PARA 0x100
 #define PROGRAM_MCB_PARA (PSP_PARA - 1)
 #define ENV_PARA 0x94  /* Environment block at 0x940..0xfef; 0x700..0x93f is DOS-owned data space holding the sysvars current-PSP mirror (SYSVARS_CUR_PSP_LIN). */
@@ -346,6 +347,7 @@ void parse_option_loop(struct ArgsWork *w);
 void finish_args(struct ArgsWork *w);
 void free_extra_env_args(ParsedCmdArgs *cmd_args);
 char is_mcb_bad(void *mem, unsigned short block_para);
+int mcb_prev_block(void *mem, unsigned short block_para, unsigned short *prev_out);
 void check_all_mcbs(void *mem);
 void init_dos_info(void *mem, unsigned long xmem_size);
 void set_current_psp(unsigned psp_para);

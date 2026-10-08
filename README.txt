@@ -191,8 +191,13 @@ Features and advantages:
 * kvikdos-ng runs 32-bit protected-mode DOS programs: Phar Lap
   386|DOS-Extender/TNT bound binaries run directly (Watcom compilers,
   WLINK, VI), and DPMI clients run through an external resident host
-  loaded with `--dpmi=' (CWSDPMI, HDPMI32). Extended memory is provided
-  via XMS 3.0 and int 15h AH=88h on top of the conventional arena.
+  loaded with `--dpmi=' (CWSDPMI, HDPMI32). With the HX DOS Extender
+  loaded this way it also runs native PE32 Win32 console programs
+  through DPMILD32.EXE + DKRNL32.DLL (JWasm.EXE assembling to OMF .obj,
+  Watcom's WHERE.EXE and HX's own LOCTIME.EXE were verified; the program's
+  imported CRT DLLs must sit next to it or on the DOS PATH). Extended
+  memory is provided via XMS 3.0 and int 15h AH=88h on top of the
+  conventional arena.
 
 * kvikdos-ng has a minimal 80x25 text mode for IDEs and editors (colors,
   cursor position/shape/blink, Alt-aware keyboard), rendered on the Linux
@@ -710,8 +715,9 @@ Future work / TODO:
 * Still open:
 
   * Built-in DPMI server, so `--dpmi=' isn't needed; and VCPI.
-  * Wider extender coverage: DOS4GW, CauseWay, PMODE/W, WDOSX,
-    HX DOS Extender (Win32 console tools) — untested.
+  * Wider extender coverage: DOS4GW, CauseWay, PMODE/W, WDOSX — untested.
+    (HX DOS Extender works for Win32 console tools; threading apps like
+    HX's THREAD.EXE still hang.)
   * 16-bit 286 protected-mode programs.
   * Filename mapping exceptions (e.g. `a86 long-filename.8' should
     show LONG-FIL.8 to DOS) and DOSBox-style per-file case fallback

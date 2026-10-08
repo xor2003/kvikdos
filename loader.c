@@ -16,37 +16,107 @@ const char freed_mcb[16] = {
     'K', 'V', '1', 'K', 'F', 'R', '3', '3',  /* "KV1KFR33". Program name signature. */
 };
 
+/* Walk the MCB chain forward from the head using only DOS-standard fields
+ * (type + size), returning the block paragraph of the MCB directly
+ * preceding block_para via *prev_out (0 for the first block). Needed for
+ * foreign-written MCBs: DOS extenders such as HDPMI (_AllocDosMemory)
+ * hand-carve blocks and never maintain kvikdos's private psize
+ * backpointer. Returns 1 when block_para is reached in the chain, else 0. */
+static int mcb_prev_by_scan(void *mem, unsigned short block_para, unsigned short *prev_out) {
+  unsigned bp = PSP_PARA, prev = 0;
+  while (bp < block_para) {
+    const char * const m = (const char*)mem + (bp << 4) - 16;
+    const unsigned size_para = MCB_SIZE_PARA(m);
+    if (MCB_TYPE(m) != 'M' && MCB_TYPE(m) != 'Z') return 0;
+    if (bp + size_para >= DOS_ALLOC_PARA_LIMIT) return 0;  /* Chain runs past the arena. */
+    prev = bp;
+    if (MCB_TYPE(m) == 'Z') return 0;  /* Chain ended before block_para. */
+    bp += 1 + size_para;
+  }
+  if (bp != block_para) return 0;  /* Skipped over block_para: it isn't an MCB boundary. */
+  *prev_out = (unsigned short)prev;
+  return 1;
+}
+
+/* Finds the block paragraph of the MCB directly preceding block_para.
+ * Tries the private psize backpointer first (self-consistent only when the
+ * chain segment is kvikdos-maintained); falls back to a forward scan when
+ * foreign writers left it stale or absent. Returns 1 on success. */
+int mcb_prev_block(void *mem, unsigned short block_para, unsigned short *prev_out) {
+  const char * const mcb = (const char*)mem + (block_para << 4) - 16;
+  if (block_para > PSP_PARA && block_para < DOS_ALLOC_PARA_LIMIT &&
+      memcmp(mcb + 7, default_program_mcb + 7, 9) == 0) {
+    const unsigned psize_para = MCB_PSIZE_PARA(mcb);
+    if (psize_para < (unsigned)(block_para - PSP_PARA)) {
+      const char * const prev_mcb = mcb - 16 - (psize_para << 4);
+      if (MCB_TYPE(prev_mcb) == 'M' && MCB_SIZE_PARA(prev_mcb) == psize_para) {
+        *prev_out = (unsigned short)(block_para - psize_para - 1);
+        return 1;
+      }
+    }
+  }
+  return mcb_prev_by_scan(mem, block_para, prev_out);
+}
+
 char is_mcb_bad(void *mem, unsigned short block_para) {
   const char* mcb = (const char*)mem + (block_para << 4) - 16;
   unsigned short size_para;
+  int is_signed;
   if (block_para < PSP_PARA) return 1;  /* MCB too low in memory. qblink.exe calls with block_para==0 many times, but it's still bad. */
   if (block_para >= DOS_ALLOC_PARA_LIMIT) return 2;  /* MCB too high in memory. */
-  if (memcmp(mcb + 7, default_program_mcb + 7, 9) != 0) return 3;  /* MCB has bad signature. */
-  if (MCB_TYPE(mcb) == 'Z') {
-    /* A free last MCB ('Z' with PID 0) is legal: DOS keeps the whole
-     * conventional arena chained, ending in a free 'Z' tail. */
-  } else if (MCB_TYPE(mcb) != 'M') {
-    return 5;  /* Bad MCB type. */
-  }
+  /* MCBs without the "KV1KPR0G" signature are still valid when their
+   * DOS-standard fields are consistent: resident DPMI hosts hand-carve
+   * blocks (HDPMI's _AllocDosMemory writes only type/pid/size, and
+   * _FreeDosMemory frees the TLB by zeroing the owner). Signature and
+   * psize cross-checks therefore apply only to kvikdos-written (signed)
+   * MCBs and their signed neighbors. */
+  is_signed = memcmp(mcb + 7, default_program_mcb + 7, 9) == 0;
+  if (MCB_TYPE(mcb) != 'M' && MCB_TYPE(mcb) != 'Z') return 5;  /* Bad MCB type. */
   if (MCB_PID(mcb) != 0 && MCB_PID(mcb) >= DOS_ALLOC_PARA_LIMIT) return 6;  /* Bad MCB process ID: owner must be a plausible PSP paragraph (DOS stamps the owner's PSP, e.g. Phar Lap sub-PSPs), not just kvikdos's fake PROCESS_ID. */
   size_para = MCB_SIZE_PARA(mcb);
   if (MCB_TYPE(mcb) == 'Z') {
+    /* A free last MCB ('Z' with PID 0) is legal: DOS keeps the whole
+     * conventional arena chained, ending in a free 'Z' tail. */
     if (block_para + size_para > DOS_ALLOC_PARA_LIMIT) return 7;  /* Final MCB too long. */
   } else {
     const char * const next_mcb = mcb + 16 + (size_para << 4);
     if (block_para + size_para >= DOS_ALLOC_PARA_LIMIT) return 8;  /* Non-final MCB too long. */
-    if (MCB_PSIZE_PARA(next_mcb) != size_para) return 9;  /* MCB size and next psize mismatch. */
-    if (MCB_PID(mcb) == 0 && MCB_PID(next_mcb) == 0) return 10;  /* found adjacent free MCBs in next. */
+    if (memcmp(next_mcb + 7, default_program_mcb + 7, 9) == 0) {  /* The next MCB's psize is trustworthy only if kvikdos wrote it. */
+      if (MCB_PSIZE_PARA(next_mcb) != size_para) return 9;  /* MCB size and next psize mismatch. */
+      /* Adjacent free blocks are legal once foreign code carves the chain
+         (HDPMI frees its TLB beside a free tail) — warn but don't fail. */
+      if (is_signed && MCB_PID(mcb) == 0 && MCB_PID(next_mcb) == 0 &&
+          (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)))
+        fprintf(g_diag_file, "debug: adjacent free MCBs at 0x%04x/0x%04x\n", block_para, block_para + size_para + 1);
+    }
   }
   if (block_para == PSP_PARA) {
-    if (MCB_PSIZE_PARA(mcb) != 0) return 11;  /* Nonzero PSP MCB psize. */
+    if (is_signed && MCB_PSIZE_PARA(mcb) != 0) return 11;  /* Nonzero PSP MCB psize. */
     if (MCB_PID(mcb) == 0) return 12;  /* PSP MCB is free. */
+  } else if (is_signed) {
+    /* Verify the private psize backpointer. A foreign split can stale it;
+     * then confirm the chain position by walking forward instead. */
+    const unsigned psize_para = MCB_PSIZE_PARA(mcb);
+    const char *prev_mcb = NULL;
+    unsigned short prev_para = 0;
+    if (psize_para < (unsigned)(block_para - PSP_PARA)) {
+      prev_mcb = mcb - 16 - (psize_para << 4);
+      if (MCB_TYPE(prev_mcb) == 'M' && MCB_SIZE_PARA(prev_mcb) == psize_para)
+        prev_para = (unsigned short)(block_para - psize_para - 1);
+    }
+    if (prev_para == 0) {  /* Stale/corrupt backpointer. */
+      if (!mcb_prev_by_scan(mem, block_para, &prev_para)) return 14;  /* Unreachable in the forward chain. */
+      prev_mcb = (const char*)mem + (prev_para << 4) - 16;
+    }
+    if (memcmp(prev_mcb + 7, default_program_mcb + 7, 9) == 0) {  /* prev_signed. */
+      if (block_para < PSP_PARA + 1 + MCB_PSIZE_PARA(prev_mcb)) return 13;  /* MCB psize too large. */
+      if (MCB_PID(mcb) == 0 && MCB_PID(prev_mcb) == 0 &&
+          (DEBUG || DEBUG_ALLOC || DIAG_ON(DIAG_BIT_VERBOSE)))
+        fprintf(g_diag_file, "debug: adjacent free MCBs at 0x%04x/0x%04x\n", prev_para, block_para);
+    }
   } else {
-    const char * const prev_mcb = mcb - 16 - (MCB_PSIZE_PARA(mcb) << 4);
-    if (block_para < PSP_PARA + 1 + MCB_PSIZE_PARA(prev_mcb)) return 13;  /* MCB psize too large. */
-    if (MCB_TYPE(prev_mcb) != 'M') return 14;  /* Bad prev MCB type. */
-    if (MCB_SIZE_PARA(prev_mcb) != MCB_PSIZE_PARA(mcb)) return 15;  /* MCB prev size and psize mismatch. */
-    if (MCB_PID(mcb) == 0 && MCB_PID(prev_mcb) == 0) return 16;  /* Found adjacent free MCBs in prev. */
+    unsigned short prev_para;
+    if (!mcb_prev_by_scan(mem, block_para, &prev_para)) return 13;  /* Foreign MCB unreachable in the chain. */
   }
   return 0;  /* MCB looks good. */
 }
