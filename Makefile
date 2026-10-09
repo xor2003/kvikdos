@@ -55,10 +55,10 @@ test-cli-matrix: kvikdos
 # Static-analysis gate: cppcheck + clang-tidy + clang --analyze.
 # Required after any C change (see AGENTS.md). lint-full additionally
 # runs clang-check (slow full parse/AST per TU) — CI uses it.
-lint test-static:
+lint test-static: hdpmibin.h
 	./tests/test_static.sh
 
-lint-full test-static-full:
+lint-full test-static-full: hdpmibin.h
 	STATIC_SLOW=1 ./tests/test_static.sh
 
 test-sanitizers:

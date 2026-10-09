@@ -8,6 +8,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# hdpmibin.h is generated (gitignored); TU parsing fails without it on a
+# fresh checkout, so build it first when the script runs standalone (CI).
+if [[ ! -f hdpmibin.h ]]; then make -s hdpmibin.h; fi
+
 # All kvikdos translation units (from the Makefile source list).
 SRCS="$(sed -n 's|^KVIKDOS_SRCS = ||p' Makefile)"
 CFLAGS_LINT="-DUSE_MINI_KVM -std=gnu89 -Wall -Wextra"

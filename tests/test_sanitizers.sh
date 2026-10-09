@@ -5,6 +5,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CCROOT="${CCROOT:-/home/xor/inertia_player/dos_compilers}"
 cd "$ROOT"
 
+# hdpmibin.h is generated (gitignored); needed to compile dpmiauto.c.
+if [[ ! -f hdpmibin.h ]]; then make -s hdpmibin.h; fi
+
 SRCS="$(sed -n 's|^KVIKDOS_SRCS = ||p' Makefile)"
 
 echo "[san] build gcc asan+ubsan"
