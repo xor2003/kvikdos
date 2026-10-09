@@ -9,9 +9,11 @@ low, so it can be very fast. It uses Linux KVM under the hood for
 emulating the CPU (or Windows WHPX), which is also very fast.
 
 kvikdos-ng is a fork of kvikdos by Peter Szabo
-(https://github.com/pts/kvikdos), extended with external-DPMI
-protected-mode support, an 80x25 text mode for IDEs, and the
-Windows/WHPX backend. The binary is still named `kvikdos`.
+(https://github.com/pts/kvikdos), extended with DPMI protected-mode
+support (auto-detected hosts plus an embedded HDPMI32 fallback), an
+embedded HX DOS Extender for Win32 PE console apps, an 80x25 text
+mode for IDEs, and the Windows/WHPX backend. The binary is still
+named `kvikdos`.
 
 kvikdos-ng is free software, GNU GPL >=2.0. There is NO WARRANTY. Use at your risk.
 
@@ -23,9 +25,10 @@ Features at a glance:
 * Fast: CPU runs natively under Linux KVM (Intel VT-x/AMD-V); I/O calls
   map directly to Linux syscalls; quick startup for short-lived tools.
 * Real mode and protected mode: 16-bit DOS programs run directly;
-  32-bit protected-mode programs run either through a bound extender
-  (Phar Lap 386|DOS-Extender/TNT) or through an external resident DPMI
-  host loaded with `--dpmi=' (CWSDPMI, HDPMI32, DPMIRES-style stubs).
+  32-bit protected-mode programs run through a bound extender
+  (Phar Lap 386|DOS-Extender/TNT) or a resident DPMI host —
+  auto-detected on disk or the embedded HDPMI32 fallback
+  (`--dpmi=' to pick one explicitly, `--dpmi=off' to disable).
 * Memory: fully-chained conventional MCB arena (msdos_player semantics:
   per-PSP owners, free `Z' tail) plus up to 1 GiB guest memory
   (`--mem-mb=', 128 MiB default) exposed via XMS 3.0 (incl. 0x88/0x89
@@ -47,7 +50,8 @@ Features at a glance:
   `copy`, `del` ...).
 * Integration: propagates DOS exit codes, passes environment variables,
   runs Linux ELF/scripts natively, runs PE executables natively on
-  Windows, and otherwise delegates PE/NE/LE/LX to wine.
+  Windows, delegates PE/NE/LE/LX to wine when present, and runs PE32
+  console apps via the embedded HX DOS Extender when it isn't.
 * Hosts: Linux/KVM natively; the cosmopolitan (APE) build adds
   Windows/WHPX — a single binary picks its backend at runtime.
 
@@ -213,14 +217,15 @@ Features and advantages:
 
 * kvikdos-ng runs 32-bit protected-mode DOS programs: Phar Lap
   386|DOS-Extender/TNT bound binaries run directly (Watcom compilers,
-  WLINK, VI), and DPMI clients run through an external resident host
-  loaded with `--dpmi=' (CWSDPMI, HDPMI32). With the HX DOS Extender
-  loaded this way it also runs native PE32 Win32 console programs
-  through DPMILD32.EXE + DKRNL32.DLL (JWasm.EXE assembling to OMF .obj,
-  Watcom's WHERE.EXE and HX's own LOCTIME.EXE were verified; the program's
-  imported CRT DLLs must sit next to it or on the DOS PATH). Extended
-  memory is provided via XMS 3.0 and int 15h AH=88h on top of the
-  conventional arena.
+  WLINK, VI), and DPMI clients run through a resident host —
+  auto-detected beside the program/on PATH/on D:, with embedded
+  HDPMI32 as fallback. Win32 PE32 console apps also run through an
+  embedded HX kit (HDPMI32 + DPMILD32 + DKRNL32/DUSER32/DGDI32/
+  DADVAPI/VERSION/OLE32/OLEAUT32/SECUR32) — JWasm.EXE assembling to
+  OMF .obj, Watcom's WHERE.EXE and HX's LOCTIME.EXE verified on a
+  bare directory; apps importing other DLLs (MSVCRT, sockets) still
+  need them on the DOS PATH. Extended memory is provided via XMS 3.0
+  and int 15h AH=88h on top of the conventional arena.
 
 * kvikdos-ng has a minimal 80x25 text mode for IDEs and editors (colors,
   cursor position/shape/blink, Alt-aware keyboard), rendered on the Linux
@@ -750,7 +755,10 @@ Future work / TODO:
 * Done since the original kvikdos.c TODO list:
 
   * Run 32-bit (protected-mode) DOS programs: Phar Lap/TNT directly,
-    DPMI clients through an external resident host (`--dpmi=').
+    DPMI clients through a resident host (auto-detected, embedded
+    HDPMI32 fallback).
+  * Run PE32 Win32 console apps through the embedded HX DOS Extender.
+  * Run PE executables natively on Windows (WoW64 for 32-bit).
   * More memory: `--mem-mb=' up to 1 GiB, XMS 3.0 and int 15h AH=88h.
   * Run Linux ELF programs and scripts natively.
   * Turbo C compatibility (2.0 validated).
@@ -759,10 +767,12 @@ Future work / TODO:
 
 * Still open:
 
-  * Built-in DPMI server, so `--dpmi=' isn't needed; and VCPI.
-  * Wider extender coverage: DOS4GW, CauseWay, PMODE/W, WDOSX — untested.
-    (HX DOS Extender works for Win32 console tools; threading apps like
-    HX's THREAD.EXE still hang.)
+  * Built-in DPMI server (the resident-host model works; a real
+    in-emulator server and VCPI remain open).
+  * Wider extender coverage: DOS4GW (stub-bound apps hang on timer
+    waits), CauseWay, WDOSX — untested; PMODE/W evaluated, rejected
+    (exec-loader, not a resident host). Threading apps like HX's
+    THREAD.EXE still hang.
   * 16-bit 286 protected-mode programs.
   * Filename mapping exceptions (e.g. `a86 long-filename.8' should
     show LONG-FIL.8 to DOS) and DOSBox-style per-file case fallback
