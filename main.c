@@ -79,17 +79,24 @@ int main(int argc, char **argv) {
          ((subfmt == MZ_SUBFMT_NE || subfmt == MZ_SUBFMT_LE || subfmt == MZ_SUBFMT_LX) &&
           !is_probable_borland_dual_mode_ne(cmd_args.prog_filename) &&
           is_probable_windows_message_stub(cmd_args.prog_filename)))) {
-    if (!has_wine_in_path()) {
+      if (has_wine_in_path()) {
+        fprintf(stderr, "info: detected Windows executable, delegating to wine: %s\n", cmd_args.prog_filename);
+        {
+          int rc = run_with_wine(cmd_args.prog_filename, cmd_args.args, NULL);
+          free_extra_env_args(&cmd_args);
+          return rc;
+        }
+      }
+      /* No wine on a non-Windows host: a PE32 console app can still run
+       * through the embedded HX kit (HDPMI32 + DPMILD32 + DKRNL32) inside
+       * the DOS emulator. setup_hx_pe_run() rewrites prog/dpmi_prog/args
+       * for that chain; on failure we report the wine miss as before. */
+      if (!(subfmt == MZ_SUBFMT_PE && setup_hx_pe_run(&cmd_args))) {
         fprintf(stderr, "error: detected Windows executable, but 'wine' is not in PATH: %s\n", cmd_args.prog_filename);
         free_extra_env_args(&cmd_args);
-      return 1;
-    }
-      fprintf(stderr, "info: detected Windows executable, delegating to wine: %s\n", cmd_args.prog_filename);
-      {
-        int rc = run_with_wine(cmd_args.prog_filename, cmd_args.args, NULL);
-        free_extra_env_args(&cmd_args);
-        return rc;
+        return 1;
       }
+      fprintf(stderr, "info: no wine found; running PE32 console app through embedded HX DOS extender: %s\n", cmd_args.args[0]);
     }
   }
   { int exit_code;

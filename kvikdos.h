@@ -366,6 +366,8 @@ int is_probable_dos_extender_program(const char *path);
  * its DOS pathname or NULL. force!=0 skips the image marker check. */
 const char *auto_dpmi_host(const char *prog_filename, const DirState *dir_state, const char *dos_path, int force);
 int is_windows_host(void);  /* 1 when the APE/native binary runs on Windows. */
+const char *hx_ensure_kit(void);  /* Extract embedded HX files to a temp dir. */
+int setup_hx_pe_run(struct ParsedCmdArgs *cmd);  /* Chain a PE32 console app via embedded HX. */
 int map_fd_open(int fd);
 void map_handle_close(unsigned short handle);
 int get_linux_fd(unsigned short handle);

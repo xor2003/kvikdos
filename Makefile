@@ -11,12 +11,31 @@ XCFLAGS =  # To be overridden from the command-line.
 # Split translation units (was a single kvikdos.c). kvikdos.h is the shared
 # internal header with the common types, constants, externs and prototypes.
 KVIKDOS_SRCS = util.c diag.c resolve.c dospath.c args.c argsparse.c argspost.c batchline.c batchcmd_a.c batchcmd_b.c batchcmd_c.c loader.c mzdetect.c fds.c video.c tty.c ttydec.c mouse.c conout.c vm.c hv_kvm.c hv_whpx.c hvpick.c x86dec.c spawn.c dpmiauto.c runstate.c run.c vmexit.c intmisc.c intdos.c intcon.c intopen.c intio.c intmem.c intfcb.c intfind.c intexec.c intdmisc.c intvid.c intems.c intxms.c batch.c main.c
-SRCDEPS = $(KVIKDOS_SRCS) kvikdos.h mini_kvm.h mini_whpx.h hv.h x86dec.h
+SRCDEPS = $(KVIKDOS_SRCS) kvikdos.h mini_kvm.h mini_whpx.h hv.h x86dec.h hdpmibin.h
 
 all: $(ALL)
 
+# Embedded last-resort DPMI host: Japheth's HDPMI32 from the HX DOS
+# extender runtime (freeware; "can be freely distributed with any
+# application" — HXRT.TXT section 8). dpmiauto.c extracts it to a temp
+# file when a DPMI client has no on-disk host. Regenerated from
+# hosts/hdpmi32.exe with plain od+sed.
+hdpmibin.h: hosts/hdpmi32.exe hosts/dpmild32.exe hosts/dkrnl32.dll
+	{ echo 'static const unsigned char embedded_dpmi_host[] = {'; \
+	  od -v -An -tu1 hosts/hdpmi32.exe | tr -s ' ' | sed 's/^ //;s/ /,/g;s/^/  /;s/$$/,/'; \
+	  echo '};'; \
+	  echo 'enum { embedded_dpmi_host_size = sizeof(embedded_dpmi_host) };'; \
+	  echo 'static const unsigned char embedded_dpmild32[] = {'; \
+	  od -v -An -tu1 hosts/dpmild32.exe | tr -s ' ' | sed 's/^ //;s/ /,/g;s/^/  /;s/$$/,/'; \
+	  echo '};'; \
+	  echo 'enum { embedded_dpmild32_size = sizeof(embedded_dpmild32) };'; \
+	  echo 'static const unsigned char embedded_dkrnl32[] = {'; \
+	  od -v -An -tu1 hosts/dkrnl32.dll | tr -s ' ' | sed 's/^ //;s/ /,/g;s/^/  /;s/$$/,/'; \
+	  echo '};'; \
+	  echo 'enum { embedded_dkrnl32_size = sizeof(embedded_dkrnl32) };'; } > $@
+
 clean:
-	rm -rf $(ALL) kvikdos32 kvikdos64 kvikdos.static kvikdos.ape kvikdos.ape.elf dist
+	rm -rf $(ALL) kvikdos32 kvikdos64 kvikdos.static kvikdos.ape kvikdos.ape.elf dist hdpmibin.h
 
 run: kvikdos guest.com
 	./kvikdos guest.com hello world

@@ -133,7 +133,12 @@ Limitations:
 
   For DPMI, kvikdos-ng loads an external resident DPMI host (e.g. CWSDPMI or
   HDPMI32) into the guest with `--dpmi=<dos-pathname>', then runs the real
-  program on top of it; there is no built-in DPMI server.
+  program on top of it; there is no built-in DPMI server. In most cases
+  `--dpmi=' isn't even needed: kvikdos-ng scans the program for DPMI/extender
+  markers and auto-loads a resident host found beside the program, on the DOS
+  PATH, or on the emulator's own D: mount, falling back to an embedded copy
+  of HDPMI32.EXE. `--dpmi=auto' forces the search, `--dpmi=off'/`--dpmi=none'
+  disables it entirely.
 
 * kvikdos-ng doesn't support graphics. Use udosrun or DOSBox instead.
 
@@ -165,6 +170,11 @@ Limitations:
 
 * Otherwise, if the target file is a Windows executable format
   (PE/NE/LE/LX), kvikdos-ng delegates execution to `wine` automatically.
+  If wine isn't installed but the file is a PE32 console application,
+  kvikdos-ng runs it inside the emulator through an embedded HX DOS
+  Extender kit (HDPMI32.EXE + DPMILD32.EXE + DKRNL32.DLL, extracted to a
+  per-user temp dir and mounted as drive H:) — no external files needed.
+  GUI/subsystem != console PEs are not attempted this way.
 
 * `--force-dos' disables all of the above native/wine delegation and always
   runs the program in the DOS emulator.
