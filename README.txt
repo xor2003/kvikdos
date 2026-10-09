@@ -172,8 +172,12 @@ Limitations:
   (PE/NE/LE/LX), kvikdos-ng delegates execution to `wine` automatically.
   If wine isn't installed but the file is a PE32 console application,
   kvikdos-ng runs it inside the emulator through an embedded HX DOS
-  Extender kit (HDPMI32.EXE + DPMILD32.EXE + DKRNL32.DLL, extracted to a
-  per-user temp dir and mounted as drive H:) — no external files needed.
+  Extender kit (HDPMI32.EXE + DPMILD32.EXE + the D* DLL set DKRNL32,
+  DUSER32, DGDI32, DADVAPI, VERSION, OLE32, OLEAUT32, SECUR32 — the
+  KERNEL32/USER32/GDI32/... import closure for console apps), extracted
+  to a per-user temp dir and mounted on a spare DOS drive — no external
+  files needed. Apps importing other libraries (MSVCRT, sockets, ...)
+  still need those DLLs beside them or on the DOS PATH.
   GUI/subsystem != console PEs are not attempted this way.
 
 * `--force-dos' disables all of the above native/wine delegation and always

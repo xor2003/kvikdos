@@ -15,24 +15,22 @@ SRCDEPS = $(KVIKDOS_SRCS) kvikdos.h mini_kvm.h mini_whpx.h hv.h x86dec.h hdpmibi
 
 all: $(ALL)
 
-# Embedded last-resort DPMI host: Japheth's HDPMI32 from the HX DOS
-# extender runtime (freeware; "can be freely distributed with any
-# application" — HXRT.TXT section 8). dpmiauto.c extracts it to a temp
-# file when a DPMI client has no on-disk host. Regenerated from
-# hosts/hdpmi32.exe with plain od+sed.
-hdpmibin.h: hosts/hdpmi32.exe hosts/dpmild32.exe hosts/dkrnl32.dll
-	{ echo 'static const unsigned char embedded_dpmi_host[] = {'; \
-	  od -v -An -tu1 hosts/hdpmi32.exe | tr -s ' ' | sed 's/^ //;s/ /,/g;s/^/  /;s/$$/,/'; \
-	  echo '};'; \
-	  echo 'enum { embedded_dpmi_host_size = sizeof(embedded_dpmi_host) };'; \
-	  echo 'static const unsigned char embedded_dpmild32[] = {'; \
-	  od -v -An -tu1 hosts/dpmild32.exe | tr -s ' ' | sed 's/^ //;s/ /,/g;s/^/  /;s/$$/,/'; \
-	  echo '};'; \
-	  echo 'enum { embedded_dpmild32_size = sizeof(embedded_dpmild32) };'; \
-	  echo 'static const unsigned char embedded_dkrnl32[] = {'; \
-	  od -v -An -tu1 hosts/dkrnl32.dll | tr -s ' ' | sed 's/^ //;s/ /,/g;s/^/  /;s/$$/,/'; \
-	  echo '};'; \
-	  echo 'enum { embedded_dkrnl32_size = sizeof(embedded_dkrnl32) };'; } > $@
+# Embedded HX DOS extender runtime: Japheth's HDPMI32 + DPMILD32 +
+# the D* console-DLL set from HXRT (freeware; "can be freely
+# distributed with any application" — HXRT.TXT section 8). dpmiauto.c
+# extracts these to a per-user temp dir: HDPMI32 alone when a DPMI
+# client has no on-disk host, or the whole kit to run a PE32 console
+# app without wine. Regenerated with plain od+sed; array names are
+# embedded_<basename in lowercase with '.' -> '_'>.
+EMBEDDED_HX = hosts/hdpmi32.exe hosts/dpmild32.exe hosts/dkrnl32.dll hosts/DUSER32.DLL hosts/DGDI32.DLL hosts/DADVAPI.DLL hosts/VERSION.DLL hosts/OLE32.DLL hosts/OLEAUT32.DLL hosts/SECUR32.DLL
+hdpmibin.h: $(EMBEDDED_HX)
+	{ for f in $(EMBEDDED_HX); do \
+	    v=embedded_$$(basename $$f | tr 'A-Z.' 'a-z_'); \
+	    echo "static const unsigned char $$v[] = {"; \
+	    od -v -An -tu1 $$f | tr -s ' ' | sed 's/^ //;s/ /,/g;s/^/  /;s/$$/,/'; \
+	    echo '};'; \
+	    echo "enum { $${v}_size = sizeof($$v) };"; \
+	  done; } > $@
 
 clean:
 	rm -rf $(ALL) kvikdos32 kvikdos64 kvikdos.static kvikdos.ape kvikdos.ape.elf dist hdpmibin.h

@@ -1,5 +1,5 @@
 #include "kvikdos.h"
-#include "hdpmibin.h"  /* embedded_dpmi_host[] — HDPMI32.EXE from HX (freeware). */
+#include "hdpmibin.h"  /* embedded_*_exe/dll — HX runtime files (freeware). */
 
 /* Auto-detect a resident DPMI host for programs that look like DPMI clients,
  * so that --dpmi= is usually unnecessary. If the program's own image mentions
@@ -33,7 +33,29 @@ static char host_dos_buf[DOS_PATH_SIZE];
 static char probe_dos_buf[DOS_PATH_SIZE];
 static char probe_linux_buf[LINUX_PATH_SIZE];
 static char host_tmp_buf[LINUX_PATH_SIZE];
+static char kit_scratch[LINUX_PATH_SIZE];  /* Scratch for kit file paths; never aliased out. */
 static char hx_kit_dir[LINUX_PATH_SIZE];
+
+/* The embedded HX runtime kit: HDPMI32 (resident DPMI host) first, then
+ * DPMILD32 and the D* console-DLL closure (KERNEL32/USER32/GDI32/
+ * ADVAPI32/VERSION/OLE32/OLEAUT32/SECUR32 providers). Index 0 is the
+ * host — also used alone as the last-resort auto-DPMI fallback. */
+static const struct {
+  const char *dos_name;
+  const unsigned char *data;
+  unsigned size;
+} hx_kit_files[] = {
+  { "HDPMI32.EXE",  embedded_hdpmi32_exe,  embedded_hdpmi32_exe_size },
+  { "DPMILD32.EXE", embedded_dpmild32_exe, embedded_dpmild32_exe_size },
+  { "DKRNL32.DLL",  embedded_dkrnl32_dll,  embedded_dkrnl32_dll_size },
+  { "DUSER32.DLL",  embedded_duser32_dll,  embedded_duser32_dll_size },
+  { "DGDI32.DLL",   embedded_dgdi32_dll,   embedded_dgdi32_dll_size },
+  { "DADVAPI.DLL",  embedded_dadvapi_dll,  embedded_dadvapi_dll_size },
+  { "VERSION.DLL",  embedded_version_dll,  embedded_version_dll_size },
+  { "OLE32.DLL",    embedded_ole32_dll,    embedded_ole32_dll_size },
+  { "OLEAUT32.DLL", embedded_oleaut32_dll, embedded_oleaut32_dll_size },
+  { "SECUR32.DLL",  embedded_secur32_dll,  embedded_secur32_dll_size },
+};
 
 static int write_if_missing(const char *path, const unsigned char *data, unsigned size) {
   int fd;
@@ -72,22 +94,22 @@ static char *join_path(char *out, size_t out_size, const char *dir, const char *
  * run_dos_prog() accepts those for the host too. */
 static const char *extract_embedded_host(void) {
   if (make_kit_dir(hx_kit_dir, sizeof(hx_kit_dir), "kvikdos-dpmi") != 0) return NULL;
-  join_path(host_tmp_buf, sizeof(host_tmp_buf), hx_kit_dir, "HDPMI32.EXE");
-  if (write_if_missing(host_tmp_buf, embedded_dpmi_host, embedded_dpmi_host_size) != 0) return NULL;
+  join_path(host_tmp_buf, sizeof(host_tmp_buf), hx_kit_dir, hx_kit_files[0].dos_name);
+  if (write_if_missing(host_tmp_buf, hx_kit_files[0].data, hx_kit_files[0].size) != 0) return NULL;
   return host_tmp_buf;
 }
 
-/* Extract the whole embedded HX kit (HDPMI32 + DPMILD32 + DKRNL32.DLL) to a
- * per-user temp dir and return its Linux path, or NULL. The caller mounts the
- * dir as a DOS drive so the guest can see DPMILD32.EXE and DKRNL32.DLL. */
+/* Extract the whole embedded HX kit to a per-user temp dir and return its
+ * Linux path, or NULL. The caller mounts the dir as a DOS drive so the guest
+ * can see DPMILD32.EXE and the D* DLLs. */
 const char *hx_ensure_kit(void) {
+  unsigned i;
+  /* NB: kit_scratch only — host_tmp_buf may already be returned as dpmi_prog. */
   if (make_kit_dir(hx_kit_dir, sizeof(hx_kit_dir), "kvikdos-hx") != 0) return NULL;
-  join_path(host_tmp_buf, sizeof(host_tmp_buf), hx_kit_dir, "HDPMI32.EXE");
-  if (write_if_missing(host_tmp_buf, embedded_dpmi_host, embedded_dpmi_host_size) != 0) return NULL;
-  join_path(host_tmp_buf, sizeof(host_tmp_buf), hx_kit_dir, "DPMILD32.EXE");
-  if (write_if_missing(host_tmp_buf, embedded_dpmild32, embedded_dpmild32_size) != 0) return NULL;
-  join_path(host_tmp_buf, sizeof(host_tmp_buf), hx_kit_dir, "DKRNL32.DLL");
-  if (write_if_missing(host_tmp_buf, embedded_dkrnl32, embedded_dkrnl32_size) != 0) return NULL;
+  for (i = 0; i < sizeof(hx_kit_files) / sizeof(hx_kit_files[0]); ++i) {
+    join_path(kit_scratch, sizeof(kit_scratch), hx_kit_dir, hx_kit_files[i].dos_name);
+    if (write_if_missing(kit_scratch, hx_kit_files[i].data, hx_kit_files[i].size) != 0) return NULL;
+  }
   return hx_kit_dir;
 }
 
@@ -161,6 +183,26 @@ int setup_hx_pe_run(ParsedCmdArgs *cmd) {
     cmd->dir_state.drive = drv;
   }
   cmd->dir_state.dos_prog_abs = kit_dos;
+  /* DPMILD32 resolves DKRNL32.DLL via the guest PATH (or the auto-generated
+   * PATH = program dir, which is already the kit drive). With --path-dos or
+   * --root a PATH= entry exists in extra_env; prepend the kit dir to it. */
+  { unsigned ei;
+    for (ei = 0; ei < cmd->extra_env_count; ++ei) {
+      if (cmd->extra_env[ei] && strncmp(cmd->extra_env[ei], "PATH=", 5) == 0) {
+        /* extra_env entries are all heap-owned (free_extra_env_args frees
+         * each), so build a fresh malloc'd "PATH=<kitdir>;<old>" entry. */
+        const char *old = cmd->extra_env[ei] + 5;
+        size_t m = 6 + 3 + 1 + strlen(old) + 1;  /* "PATH=" + "H:\" + ";" + old + NUL */
+        char *path_env = (char*)malloc(m);
+        if (path_env) {
+          snprintf(path_env, m, "PATH=%c:\\;", kit_drv);
+          strcat(path_env, old);
+          cmd->extra_env[ei] = path_env;
+        }
+        break;
+      }
+    }
+  }
   if (!cmd->dpmi_prog) {  /* An explicit --dpmi= stays in charge. */
     static char host_path[LINUX_PATH_SIZE];
     join_path(host_path, sizeof(host_path), kit, "HDPMI32.EXE");
