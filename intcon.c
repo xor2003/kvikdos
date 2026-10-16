@@ -59,7 +59,9 @@ int i21_con(void) {
             emit_stdout(); return IA_NEXT;
   }   else if (ah == 0x0b) {
   /* Check input status. */
-            *(unsigned char*)&regs.rax = 0;  /* No input ready. 0xff would be input. */
+            unsigned short result_ax;
+            process_key(tty_state, 1, &result_ax, (unsigned short*)&regs.rflags);  /* Peek without consuming; sets ZF when no key. */
+            *(unsigned char*)&regs.rax = (*(unsigned short*)&regs.rflags & (1 << 6)) ? 0 : 0xff;
             /* If we detect Ctrl-<Break>, we should run `int 0x23'. */
   }   else if (ah == 0x0a) {
   /* Buffered keyboard input. */
