@@ -21,6 +21,8 @@ void init_parsed_cmd_args(ParsedCmdArgs *cmd_args, char *placeholder_for_default
   cmd_args->emu_params.is_hlt_ok = 0;
   cmd_args->emu_params.hlt_dump_filename = NULL;
   cmd_args->emu_params.diag_filename = NULL;
+  cmd_args->emu_params.video_dump_filename = NULL;
+  cmd_args->emu_params.video_emitter = VID_EMIT_ASCII;
   cmd_args->emu_params.diag_mask = 1;  /* compat */
   cmd_args->emu_params.case_fallback_mode = 2;  /* all */
   cmd_args->emu_params.strict_mode = 0;  /* permissive */
@@ -80,6 +82,10 @@ void parse_args(char **argv, struct ParsedCmdArgs *cmd_args_out, const char *pre
                     "\n"
                     "Compatibility:\n"
                     "  --case-fallback=off|prog|all  Case-insensitive program lookup (default: all)\n"
+                    "\n"
+                    "Video (VGA mode 13h):\n"
+                    "  --video=ascii|ansi|off          Terminal renderer (default: ascii luminance grid)\n"
+                    "  --video-dump=<filename.png>     Dump framebuffer to PNG on SIGUSR1 and exit\n"
                     "\n"
                     "Diagnostics:\n"
                     "  --diag=compat|exec|int|fs|all|off   Runtime diagnostics (default: compat)\n"

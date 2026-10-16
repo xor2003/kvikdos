@@ -90,6 +90,7 @@ char linux_prog_buf[LINUX_PATH_SIZE];  /* Stable storage for dir_state->linux_pr
 /* do_exit: flush the final video frame, close findfirst state and emit the
  * requested guest-memory dump, then return the DOS exit code to the host. */
 unsigned char dos_exit(void) {
+  vid_gfx_flush = 1;  /* Bypass the ~30 fps graphics gate for the last frame. */
   if (vid_active) vid_render(mem);  /* Flush the final frame before the screen is torn down. */
   con_teardown_reset(mem);  /* Emit any console text withheld by the dump filter. */
   if (find_dirp) { closedir(find_dirp); find_dirp = NULL; }

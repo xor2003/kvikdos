@@ -436,6 +436,22 @@ void parse_option_loop(struct ArgsWork *w) {
         w->cmd.extra_env[w->cmd.extra_env_count++] = xstrdup(p);
       }
       fclose(f);
+    } else if (0 == strcmp(arg, "--video")) {  /* Typical example: --video=ansi */
+      if (!w->argv[0]) goto missing_argument;
+      arg = *w->argv++;
+     do_video:
+      if (strcmp(arg, "ascii") == 0) w->cmd.emu_params.video_emitter = VID_EMIT_ASCII;
+      else if (strcmp(arg, "ansi") == 0) w->cmd.emu_params.video_emitter = VID_EMIT_ANSI;
+      else if (strcmp(arg, "off") == 0) w->cmd.emu_params.video_emitter = VID_EMIT_OFF;
+      else { fprintf(stderr, "fatal: bad --video value (want ascii|ansi|off): %s\n", arg); exit(1); }
+    } else if (0 == strncmp(arg, "--video=", 8)) {
+      arg += 8;
+      goto do_video;
+    } else if (0 == strcmp(arg, "--video-dump")) {  /* Typical example: --video-dump=frame.png */
+      if (!w->argv[0]) goto missing_argument;
+      w->cmd.emu_params.video_dump_filename = *w->argv++;
+    } else if (0 == strncmp(arg, "--video-dump=", 13)) {
+      w->cmd.emu_params.video_dump_filename = arg + 13;
     } else if (0 == strcmp(arg, "--diag")) {
       if (!w->argv[0]) goto missing_argument;
       arg = *w->argv++;

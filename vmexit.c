@@ -97,6 +97,15 @@ int io_dispatch(void) {
     }
     trace_guest_io(hx.io.port, hx.io.direction, hx.io.size, hx.io.count, p);
     return IA_NEXT;
+  } else if (hx.io.port - 0x3c6 <= 3 && hx.io.size == 1) {
+    /* VGA RAMDAC: 0x3c6 PEL mask, 0x3c7 read-address/status, 0x3c8 write
+     * address, 0x3c9 sequential RGB data.  The byte loop covers rep
+     * insb/outsb palette dumps. */
+    unsigned i;
+    for (i = 0; i < hx.io.count; ++i)
+      vidgfx_port(hx.io.port, hx.io.direction, (unsigned char*)p + i);
+    trace_guest_io(hx.io.port, hx.io.direction, hx.io.size, hx.io.count, p);
+    return IA_NEXT;
   } else if ((hx.io.port == 0x3ba || hx.io.port == 0x3da) && hx.io.size == 1 && hx.io.direction == 0) {
     /* MDA/CGA status register — the call QuickBASIC spins on before drawing.
      * bit0: horizontal retrace in progress; bit3: vertical retrace in

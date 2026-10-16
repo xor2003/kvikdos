@@ -9,6 +9,7 @@ int int10_dispatch(void) {
   if (ah == 0x00) {  /* Set video mode; a text mode (re)starts the renderer. */
     const unsigned char mode = (unsigned char)regs.rax & 0x7f;
     if (mode <= 3 || mode == 7) {  /* 40x25/80x25 color, mode 7 = 80x25 mono. */
+      vid_gfx = 0;  /* Leaving graphics mode (idempotent). */
       vid_bda_init(mem, mode);
       vid_enter();
       if (!(regs.rax & 0x80)) {  /* bit7 of AL: keep screen contents. */
@@ -20,13 +21,44 @@ int int10_dispatch(void) {
       vid_render(mem);
       return IA_NEXT;
     }
-    /* Graphics modes are out of scope: ignore (the caller sees a text mode
-     * still in effect, which is closer to CGA behavior than a crash). */
+    if (mode == 0x13) {  /* VGA 320x200x256: enter the graphics path. */
+      vidgfx_enter(mem, (unsigned char)regs.rax & 0x80);
+      vid_render(mem);
+      return IA_NEXT;
+    }
+    /* Other graphics modes are out of scope: ignore (the caller sees a text
+     * mode still in effect, which is closer to CGA behavior than a crash). */
     if (vid_active) { vid_render(mem); return IA_NEXT; }
   }
   if (vid_active) {  /* Text mode: operate directly on the framebuffer. */
     const unsigned page = ((unsigned char*)mem)[0x462] < VID_PAGES
                           ? ((unsigned char*)mem)[0x462] : 0;
+    if (vid_gfx &&
+        (ah == 0x0c || ah == 0x0d || ah == 0x0e || ah == 0x09 || ah == 0x0a ||
+         ah == 0x13 || ah == 0x08 || ah == 0x05 || ah == 0x10 || ah == 0x04 ||
+         ah == 0x0b || ah == 0x06 || ah == 0x07)) {
+      /* Mode 13h services.  Text-drawing calls are nops (no glyph
+       * rasterization); cursor/state/probe calls below are BDA-only and
+       * stay shared between text and graphics modes. */
+      if (ah == 0x0c) {  /* Write pixel: AL color (bit7 XOR), CX=x, DX=y. */
+        vidgfx_wr_px(mem, *(unsigned short*)&regs.rcx, *(unsigned short*)&regs.rdx,
+                     (unsigned char)regs.rax);
+      } else if (ah == 0x0d) {  /* Read pixel at CX,DX -> AL. */
+        *(unsigned char*)&regs.rax = vidgfx_rd_px(mem, *(unsigned short*)&regs.rcx,
+                                                  *(unsigned short*)&regs.rdx);
+      } else if (ah == 0x06 || ah == 0x07) {  /* Scroll window; BH = fill color. */
+        vidgfx_scroll(mem, ((unsigned char*)&regs.rcx)[1], (unsigned char)regs.rcx,
+                      ((unsigned char*)&regs.rdx)[1], (unsigned char)regs.rdx,
+                      (unsigned char)regs.rax, ah == 0x07,
+                      (unsigned char)(regs.rbx >> 8));
+      } else if (ah == 0x10) {
+        vidgfx_palette(mem);
+      } else if (ah == 0x08) {  /* Read char+attr: no font matching in gfx. */
+        *(unsigned short*)&regs.rax = 0;
+      }
+      vid_render(mem);
+      return IA_NEXT;
+    }
     if (ah == 0x02) {  /* Set cursor position of page BH. */
       const unsigned bp = ((unsigned char*)&regs.rbx)[1];
       if (bp < VID_PAGES)
@@ -120,7 +152,7 @@ int int10_dispatch(void) {
     } else if (ah == 0x1a) {  /* Display combination code. */
       if ((unsigned char)regs.rax == 0) {
         ((unsigned char*)&regs.rax)[0] = 0x1a;  /* Function supported. */
-        *(unsigned char*)&regs.rbx = 0x02;      /* BL=2: CGA color display (per ntvdm; a 0 answer makes QuickC misdetect EGA). */
+        *(unsigned char*)&regs.rbx = 0x08;      /* BL=8: VGA analog color display (mode 13h exists now; a 0 answer makes QuickC misdetect EGA). */
         ((unsigned char*)&regs.rbx)[1] = 0;     /* No alternate display. */
       }
     } else if (ah == 0x1b) {  /* Functionality/state information: unsupported. */
@@ -204,11 +236,17 @@ int int10_dispatch(void) {
     }
   } else if (ah == 0x01) {  /* Set cursor type. */
     *(unsigned short*)((char*)mem + 0x460) = *(unsigned short*)&regs.rcx;
+  } else if (ah == 0x1a) {  /* Display combination code (pre-mode-set probes). */
+    if ((unsigned char)regs.rax == 0) {
+      *(unsigned short*)&regs.rax = 0x1a;  /* AL=0x1a: supported, AH=0. */
+      *(unsigned char*)&regs.rbx = 0x08;   /* BL=8: VGA analog color. */
+      ((unsigned char*)&regs.rbx)[1] = 0;
+    }
   } else if (ah == 0x12) {  /* Video subsystem configuration. https://stanislavs.org/helppc/int_10-12.html */
     const unsigned char bl = (unsigned char)regs.rbx;
     if (bl == 0x10) {  /* Get video configuration information. */
       sphinx_cmm_flags |= 2;
-      *(unsigned short*)&regs.rbx = 1 << 8 | 0;  /* Mono, 64 KiB EGA memory. */
+      *(unsigned short*)&regs.rbx = 0x0003;  /* BH=0 color, BL=3: 256 KiB video memory. */
       *(unsigned short*)&regs.rcx = 0;  /* Feature bits and switch settings. */
     } else {
       fprintf(stderr, "fatal: unsupported subcall for video subsystem configuration: 0x%02x\n", bl);

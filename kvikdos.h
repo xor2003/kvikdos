@@ -124,6 +124,15 @@
 #define VID_BUFSZ  (VID_COLS * VID_ROWS * 2)
 #define VID_PAGE_STRIDE 0x1000  /* BIOS page size for 80x25 (regen word 0x44c). */
 #define VID_PAGES  8            /* 8 pages fit in 0xb8000..0xc0000. */
+#define GFX_BASE   0xa0000      /* VGA mode 13h framebuffer (320x200 linear). */
+#define GFX_W      320
+#define GFX_H      200
+#define GFX_CELLW  160          /* Half-block/ascii emitter grid: 2:1 h-decimation. */
+#define GFX_CELLH  50
+/* --video= emitter selection for graphics modes (EmuParams.video_emitter). */
+#define VID_EMIT_ASCII 0        /* Luminance grid: legible to humans and agents. */
+#define VID_EMIT_ANSI  1        /* U+2580 half-block cells in 24-bit color. */
+#define VID_EMIT_OFF   2        /* No drawing; framebuffer+palette still run. */
 
 typedef struct DirState {
   char drive;  /* 'A', 'B', 'C', 'D', ... ('A' + DRIVE_COUNT - 1). */
@@ -139,6 +148,8 @@ typedef struct EmuParams {
   unsigned mem_mb;
   const char *hlt_dump_filename;
   const char *diag_filename;
+  const char *video_dump_filename;  /* --video-dump=FILE.png: dump on SIGUSR1 and exit. */
+  char video_emitter;               /* --video=: VID_EMIT_* below. */
   unsigned diag_mask;
   unsigned case_fallback_mode;  /* 0=off 1=prog 2=all */
   char strict_mode;  /* 0=permissive 1=strict */
@@ -228,6 +239,8 @@ extern unsigned short load_parent_para;       /* PSP[0x16] parent seg for an in-
 /* Text-mode renderer state shared between video.c (rendering) and tty.c (raw
  * tty takeover when text mode is active). */
 extern char vid_active;
+extern char vid_gfx;          /* Nonzero: VGA mode 13h is the current mode. */
+extern char vid_gfx_flush;    /* Set to bypass the ~30 fps graphics-render gate once. */
 extern char vid_blink;
 extern char vid_wrap_pend;
 extern int vid_cur_shape;
@@ -430,6 +443,16 @@ void vid_fill(void *mem, unsigned page, int top, int left, int bottom, int right
 void vid_scroll(void *mem, unsigned page, unsigned char al, unsigned char bh, unsigned short cx, unsigned short dx, int down);
 void vid_putc(void *mem, unsigned page, unsigned char ch);
 void vid_write_str(void *mem, const char *p, const char *end);
+/* VGA mode 13h graphics (vidgfx.c): mode entry, ~30 fps diff renderer,
+ * DAC port model, BIOS pixel ops, and the optional PNG dump. */
+void vidgfx_enter(void *mem, int keep_fb);
+void vidgfx_render(void *mem);
+int vidgfx_port(unsigned port, int is_out, unsigned char *v);
+void vidgfx_wr_px(void *mem, unsigned x, unsigned y, unsigned char c);
+unsigned char vidgfx_rd_px(const void *mem, unsigned x, unsigned y);
+void vidgfx_scroll(void *mem, int top, int left, int bottom, int right, int n, int down, unsigned char fill);
+void vidgfx_palette(void *mem);
+void vidgfx_dump(void *mem);
 int run_dos_child_subprocess(const char *dos_filename, const char *dos_args, const char *env, const char *env_end, const DirState *dir_state, unsigned char *exit_code_out);
 int run_with_wine(const char *prog_filename, const char *const *args, const char *linux_cwd);
 int has_wine_in_path(void);

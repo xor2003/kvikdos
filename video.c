@@ -166,6 +166,7 @@ void vid_render(void *mem) {
   char *o = out;
   int i, row, col, at, la, expect;
   unsigned cur;
+  if (vid_gfx) { vidgfx_render(mem); return; }  /* VGA mode 13h path. */
   if (pg0 != vid_last_page) {  /* Page flip: the shadow diff is per-page — force a repaint. */
     vid_last_page = pg0;
     memset(vid_shadow, 0xff, sizeof(vid_shadow));
@@ -308,6 +309,7 @@ void vid_putc(void *mem, unsigned page, unsigned char ch) {
   /* Teletype output operates on the page given; its cursor slot advances. */
   unsigned short *cur = (unsigned short*)((unsigned char*)mem + 0x450 + 2 * (page < VID_PAGES ? page : 0));
   int row = (*cur >> 8) & 0xff, col = *cur & 0xff;
+  if (vid_gfx) return;  /* No font rasterization in graphics mode. */
   if (col >= VID_COLS) col = VID_COLS - 1;   /* Clamp a stray cursor column to the 80-column width. */
   if (row >= VID_ROWS) row = VID_ROWS - 1;
   switch (ch) {
