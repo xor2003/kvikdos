@@ -406,6 +406,7 @@ typedef struct __seg
     unsigned short attr;
     PUCHAR data;
     PUCHAR datmask;
+    long *datmod;
 } SEG, *PSEG, **PPSEG;
 
 typedef struct __datablock
@@ -586,6 +587,7 @@ int defaultLibSuppressed(const char *libname);
 #define strdup _strdup
 
 extern char case_sensitive;
+extern char dosseg;
 extern char padsegments;
 extern char mapfile;
 extern PCHAR mapname;

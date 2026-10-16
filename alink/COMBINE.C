@@ -190,6 +190,15 @@ void fixpubsegs(int src, int dest, UINT shift)
 	    q = (PPUBLIC)publics[i].object[j];
 	    if (q->segnum == src)
 	    {
+		const char *pubFilter = getenv("ALINK_DEBUG_PUB");
+
+		if (pubFilter && publics[i].id &&
+		    strstr(publics[i].id, pubFilter))
+		{
+		    fprintf(stderr, "PUBFIX %s mod=%s src=%d->%d ofs+=%x (was %x)\n",
+			    publics[i].id, modname[q->modnum] ? modname[q->modnum] : "?",
+			    src, dest, (unsigned)shift, (unsigned)q->ofs);
+		}
 		q->segnum = dest;
 		q->ofs += shift;
 	    }
@@ -277,7 +286,7 @@ void redirect_segment(long dest, long src)
 
     free(seglist[src]->data);
     free(seglist[src]->datmask);
-    free(seglist[src]);
+    free(seglist[src]->datmod);
     seglist[src] = 0;
 }
 
@@ -285,6 +294,7 @@ void combine_segments(long dest, long src)
 {
     UINT k;
     PUCHAR p, q;
+    long *r;
     long a1, a2;
 
     k = seglist[dest]->length;
@@ -357,23 +367,36 @@ void combine_segments(long dest, long src)
 	break;
     }
     seglist[src]->base = k;
+    if (getenv("ALINK_DEBUG_MERGE"))
+    {
+	fprintf(stderr, "SEG-MERGE src=%d(%s) dest=%d(%s) ofs=%04lx len=%lx\n",
+		(int)src,
+		seglist[src]->nameindex >= 0 ? namelist[seglist[src]->nameindex] : "?",
+		(int)dest,
+		seglist[dest]->nameindex >= 0 ? namelist[seglist[dest]->nameindex] : "?",
+		(unsigned long)k, (unsigned long)seglist[src]->length);
+    }
     p = checkMalloc(k + seglist[src]->length);
     q = checkMalloc((k + seglist[src]->length + 7) / 8);
+    r = checkMalloc((k + seglist[src]->length) * sizeof(long));
     for (k = 0; k < seglist[dest]->length; k++)
     {
 	if (GetNbit(seglist[dest]->datmask, k))
 	{
 	    SetNbit(q, k);
 	    p[k] = seglist[dest]->data[k];
+	    r[k] = seglist[dest]->datmod ? seglist[dest]->datmod[k] : -1;
 	}
 	else
 	{
 	    ClearNbit(q, k);
+	    r[k] = -1;
 	}
     }
     for (; k < seglist[src]->base; k++)
     {
 	ClearNbit(q, k);
+	r[k] = -1;
     }
     for (; k < (seglist[src]->base + seglist[src]->length); k++)
     {
@@ -381,10 +404,12 @@ void combine_segments(long dest, long src)
 	{
 	    p[k] = seglist[src]->data[k - seglist[src]->base];
 	    SetNbit(q, k);
+	    r[k] = seglist[src]->datmod ? seglist[src]->datmod[k - seglist[src]->base] : -1;
 	}
 	else
 	{
 	    ClearNbit(q, k);
+	    r[k] = -1;
 	}
     }
     seglist[dest]->length = k;
@@ -395,8 +420,11 @@ void combine_segments(long dest, long src)
     free(seglist[src]->data);
     free(seglist[dest]->datmask);
     free(seglist[src]->datmask);
+    free(seglist[dest]->datmod);
+    free(seglist[src]->datmod);
     seglist[dest]->data = p;
     seglist[dest]->datmask = q;
+    seglist[dest]->datmod = r;
 
     fixpubsegs(src, dest, seglist[src]->base);
 

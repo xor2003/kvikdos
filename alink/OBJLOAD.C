@@ -123,6 +123,14 @@ static void EnsureSegmentSize(long segnum, UINT size)
     newbytes = (size + 7) / 8;
     seglist[segnum]->data = (PUCHAR)checkRealloc(seglist[segnum]->data, size);
     seglist[segnum]->datmask = (PUCHAR)checkRealloc(seglist[segnum]->datmask, newbytes);
+    if (seglist[segnum]->datmod)
+    {
+	seglist[segnum]->datmod = (long *)checkRealloc(seglist[segnum]->datmod, size * sizeof(long));
+	for (i = seglist[segnum]->length; i < size; i++)
+	{
+	    seglist[segnum]->datmod[i] = -1;
+	}
+    }
     for (i = seglist[segnum]->length; i < size; i++)
     {
 	seglist[segnum]->data[i] = 0;
@@ -204,7 +212,21 @@ static void EmitSegmentByte(long segnum, long ofs, unsigned char val)
 			debugModName, segnum, namelist[seglist[segnum]->nameindex], ofs,
 			seglist[segnum]->data[ofs], val);
 	    }
-	    ReportError(ERR_OVERWRITE);
+	    /* MSC 6 emits multiple LEDATA records for the same segment whose
+	       ranges overlap by a few bytes; MS LINK resolves this as
+	       last-writer-wins. Tolerate it when the earlier writer is the
+	       same module, keep erroring on cross-module conflicts. */
+	    if (!seglist[segnum]->datmod || seglist[segnum]->datmod[ofs] != nummods)
+	    {
+		ReportError(ERR_OVERWRITE);
+	    }
+	    else
+	    {
+		fprintf(stderr,
+			"ALINK warning: overlapping data seg=%ld ofs=%ld old=%u new=%u mod=%ld/%s\n",
+			segnum, ofs, seglist[segnum]->data[ofs], val, debugModNum,
+			debugModName ? debugModName : "");
+	    }
 	}
     }
     moduleFilter = getenv("ALINK_DEBUG_MODULE");
@@ -219,6 +241,10 @@ static void EmitSegmentByte(long segnum, long ofs, unsigned char val)
     }
     seglist[segnum]->data[ofs] = val;
     SetNbit(seglist[segnum]->datmask, ofs);
+    if (seglist[segnum]->datmod)
+    {
+	seglist[segnum]->datmod[ofs] = nummods;
+    }
 }
 
 static unsigned short GetComdatAlign(unsigned char align, long assocSeg)
@@ -825,6 +851,7 @@ long loadmod(FILE *objfile)
 		    }
 		    break;
 		case COMENT_DOSSEG:
+		    dosseg = 1;
 		    break;
 		case COMENT_TRANSLATOR:
 		case COMENT_INTEL_COPYRIGHT:
@@ -939,15 +966,21 @@ long loadmod(FILE *objfile)
 	    {
 		seglist[segcount]->data = checkMalloc(seglist[segcount]->length);
 		seglist[segcount]->datmask = checkMalloc((seglist[segcount]->length + 7) / 8);
+		seglist[segcount]->datmod = checkMalloc(seglist[segcount]->length * sizeof(long));
 		for (i = 0; i < (seglist[segcount]->length + 7) / 8; i++)
 		{
 		    seglist[segcount]->datmask[i] = 0;
+		}
+		for (i = 0; i < seglist[segcount]->length; i++)
+		{
+		    seglist[segcount]->datmod[i] = -1;
 		}
 	    }
 	    else
 	    {
 		seglist[segcount]->data = 0;
 		seglist[segcount]->datmask = 0;
+		seglist[segcount]->datmod = 0;
 		seglist[segcount]->attr &= (0xffff - SEG_COMBINE);
 		seglist[segcount]->attr |= SEG_PRIVATE;
 	    }

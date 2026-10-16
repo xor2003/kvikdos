@@ -5,6 +5,7 @@
 #endif
 
 char case_sensitive = 1;
+char dosseg = 0;
 char padsegments = 0;
 char mapfile = 0;
 PCHAR mapname = 0;
@@ -266,85 +267,71 @@ static void applyBSSBoundaryValues(void)
     UINT bssEnd = 0;
     long i;
     int foundBSS = FALSE;
+    PGRP grp = NULL;
 
-    for (i = 0; i < (long)outcount; i++)
+    /* MS LINK's _edata/_end describe the uninitialized-data region inside
+       DGROUP only; unrelated BSS-class segments elsewhere in the image
+       must not move the boundaries. */
+    for (i = 0; i < (long)grpcount; i++)
     {
-	if (!isBSSSegment(outlist[i]))
+	if (!grplist[i])
 	    continue;
-	if (!foundBSS)
-	{
-	    bssStart = outlist[i]->base;
-	    foundBSS = TRUE;
-	}
-	bssEnd = outlist[i]->base + outlist[i]->length;
+	if ((grplist[i]->nameindex < 0) ||
+	    strcmp("DGROUP", namelist[grplist[i]->nameindex]))
+	    continue;
+	grp = grplist[i];
+	break;
     }
-
-    if (isSpecialBSSBoundarySymbol("_edata"))
+    if (grp)
     {
-	PSORTENTRY listnode;
-	PPUBLIC pubdef;
-	int n;
-
-	listnode = binarySearch(publics, pubcount, "_edata");
-	if (listnode)
+	for (i = 0; i < grp->numsegs; i++)
 	{
-	    for (n = 0; n < (int)listnode->count; n++)
+	    PSEG seg = seglist[grp->segindex[i]];
+
+	    if (!seg || !isBSSSegment(seg))
+		continue;
+	    if (!foundBSS || (seg->base < bssStart))
 	    {
-		pubdef = (PPUBLIC)listnode->object[n];
-		if (!pubdef->aliasName && (pubdef->segnum < 0))
-		    pubdef->ofs = bssStart;
+		bssStart = seg->base;
+		foundBSS = TRUE;
 	    }
+	    if (bssEnd < (seg->base + seg->length))
+		bssEnd = seg->base + seg->length;
 	}
     }
-    if (isSpecialBSSBoundarySymbol("__edata"))
+    else
     {
-	PSORTENTRY listnode;
-	PPUBLIC pubdef;
-	int n;
-
-	listnode = binarySearch(publics, pubcount, "__edata");
-	if (listnode)
+	for (i = 0; i < (long)outcount; i++)
 	{
-	    for (n = 0; n < (int)listnode->count; n++)
+	    if (!isBSSSegment(outlist[i]))
+		continue;
+	    if (!foundBSS)
 	    {
-		pubdef = (PPUBLIC)listnode->object[n];
-		if (!pubdef->aliasName && (pubdef->segnum < 0))
-		    pubdef->ofs = bssStart;
+		bssStart = outlist[i]->base;
+		foundBSS = TRUE;
 	    }
+	    bssEnd = outlist[i]->base + outlist[i]->length;
 	}
     }
-    if (isSpecialBSSBoundarySymbol("_end"))
-    {
-	PSORTENTRY listnode;
-	PPUBLIC pubdef;
-	int n;
 
-	listnode = binarySearch(publics, pubcount, "_end");
-	if (listnode)
-	{
-	    for (n = 0; n < (int)listnode->count; n++)
-	    {
-		pubdef = (PPUBLIC)listnode->object[n];
-		if (!pubdef->aliasName && (pubdef->segnum < 0))
-		    pubdef->ofs = bssEnd;
-	    }
-	}
-    }
-    if (isSpecialBSSBoundarySymbol("__end"))
+    /* the synthesized publics were keyed under whatever spelling the
+       referencing extern used (_END, _end, ...), so walk the publics
+       table once rather than binary-searching for fixed spellings. */
+    for (i = 0; i < (long)pubcount; i++)
     {
-	PSORTENTRY listnode;
-	PPUBLIC pubdef;
+	PSORTENTRY listnode = &publics[i];
 	int n;
+	int isEnd;
 
-	listnode = binarySearch(publics, pubcount, "__end");
-	if (listnode)
+	if (!isSpecialBSSBoundarySymbol(listnode->id))
+	    continue;
+	isEnd = (toupper(listnode->id[strlen(listnode->id) - 1]) == 'D');
+	for (n = 0; n < (int)listnode->count; n++)
 	{
-	    for (n = 0; n < (int)listnode->count; n++)
-	    {
-		pubdef = (PPUBLIC)listnode->object[n];
-		if (!pubdef->aliasName && (pubdef->segnum < 0))
-		    pubdef->ofs = bssEnd;
-	    }
+	    PPUBLIC pubdef = (PPUBLIC)listnode->object[n];
+
+	    if (!pubdef->aliasName && (pubdef->segnum < 0))
+		pubdef->ofs = isEnd ? bssEnd : bssStart;
 	}
     }
 }
@@ -750,20 +737,18 @@ void processArgs(int argc, char **argv)
 		}
 	    }
 	    else if (((p = (char *)matchMsvcOptionArg(msarg, "STACK")) != NULL) ||
-		     ((p = (char *)matchMsvcOptionArg(msarg, "STACKSIZE")) != NULL))
+		     ((p = (char *)matchMsvcOptionArg(msarg, "STACKSIZE")) != NULL) ||
+		     ((p = (char *)matchMsvcOptionArg(msarg, "ST")) != NULL))
 	    {
 		if (*p)
 		{
-		    if (output_type == OUTPUT_PE)
+		    setstack = strtoul(p, &endp, 0);
+		    if (endp[0])
 		    {
-			setstack = strtoul(p, &endp, 0);
-			if (endp[0])
-			{
-			    printf("Bad stack size\n");
-			    exit(1);
-			}
-			gotstack = TRUE;
+			printf("Bad stack size\n");
+			exit(1);
 		    }
+		    gotstack = TRUE;
 		}
 	    }
 	    else if (((p = (char *)matchMsvcOptionArg(msarg, "ALIGNMENT")) != NULL) ||
@@ -1378,8 +1363,14 @@ void processArgs(int argc, char **argv)
 	printf("    -heapcommitsize xxx Set heap commit size to xxx\n");
 	exit(0);
     }
+    if ((output_type == OUTPUT_COM) &&
+	(gotstack || gotstackcommit))
+    {
+	printf("Option not supported for COM output\n");
+	exit(1);
+    }
     if ((output_type != OUTPUT_PE) &&
-	(gotoalign || gotfalign || gotbase || gotsubsys || gotstack || gotstackcommit || gotheap ||
+	(gotoalign || gotfalign || gotbase || gotsubsys || gotstackcommit || gotheap ||
 	 gotheapcommit || buildDll || stubName || gotsubsysver || gotosver))
     {
 	printf("Option not supported for non-PE output formats\n");
@@ -1824,8 +1815,8 @@ void matchExterns()
 		    }
 		    else if (getenv("ALINK_TRACE"))
 		    {
-			printf("  -> no match in %s (case=%u flags=%u)\n", libfiles[k].filename,
-			       case_sensitive, libfiles[k].flags);
+			printf("  -> no match in %s (case=%d flags=%d)\n", libfiles[k].filename,
+			       (int)case_sensitive, (int)libfiles[k].flags);
 		    }
 		    free(name);
 		}
@@ -1881,6 +1872,7 @@ void matchComDefs()
     int i, j;
     int comseg;
     int comfarseg;
+    long comgrpnum = -1;
     PSORTENTRY listnode;
     PPUBLIC pubdef;
 
@@ -1941,16 +1933,26 @@ void matchComDefs()
     namelist = (PPCHAR)checkRealloc(namelist, (namecount + 1) * sizeof(PCHAR));
     namelist[namecount] = checkStrdup("COMDEFS");
     seglist[segcount]->nameindex = namecount;
-    seglist[segcount]->classindex = -1;
     seglist[segcount]->overlayindex = -1;
     seglist[segcount]->length = 0;
     seglist[segcount]->data = NULL;
     seglist[segcount]->datmask = NULL;
+    seglist[segcount]->datmod = NULL;
     seglist[segcount]->attr = SEG_PRIVATE | SEG_PARA;
     seglist[segcount]->winFlags = WINF_READABLE | WINF_WRITEABLE | WINF_NEG_FLAGS;
     comseg = segcount;
     segcount++;
     namecount++;
+    /* commons are uninitialized data: give the segment class BSS like
+       MS LINK's c_common so it sorts into the BSS tier and falls inside
+       the [_edata,_end) region crt0 zeroes. */
+    namelist = (PPCHAR)checkRealloc(namelist, (namecount + 1) * sizeof(PCHAR));
+    namelist[namecount] = checkStrdup("BSS");
+    seglist[comseg]->classindex = namecount;
+    namecount++;
+    if (getenv("ALINK_DEBUG_COMDEF"))
+	printf("dbg: comseg=%d classindex=%ld cls=%s\n", (int)comseg, seglist[comseg]->classindex,
+	       namelist[seglist[comseg]->classindex]);
 
     for (i = 0; i < grpcount; i++)
     {
@@ -1966,6 +1968,7 @@ void matchComDefs()
 	    /* else add to group */
 	    grplist[i]->segindex[grplist[i]->numsegs] = comseg;
 	    grplist[i]->numsegs++;
+	    comgrpnum = i;
 	    break;
 	}
     }
@@ -1980,6 +1983,7 @@ void matchComDefs()
     seglist[segcount]->length = 0;
     seglist[segcount]->data = NULL;
     seglist[segcount]->datmask = NULL;
+    seglist[segcount]->datmod = NULL;
     seglist[segcount]->attr = SEG_PRIVATE | SEG_PARA;
     seglist[segcount]->winFlags = WINF_READABLE | WINF_WRITEABLE | WINF_NEG_FLAGS;
     namecount++;
@@ -2004,6 +2008,7 @@ void matchComDefs()
 		seglist[segcount]->overlayindex = -1;
 		seglist[segcount]->length = comdefs[i]->length;
 		seglist[segcount]->data = NULL;
+		seglist[segcount]->datmod = NULL;
 		seglist[segcount]->datmask = (PUCHAR)checkMalloc((comdefs[i]->length + 7) / 8);
 		for (j = 0; j < (comdefs[i]->length + 7) / 8; j++)
 		    seglist[segcount]->datmask[j] = 0;
@@ -2031,6 +2036,7 @@ void matchComDefs()
 		seglist[segcount]->length = comdefs[i]->length;
 		seglist[segcount]->data = NULL;
 		seglist[segcount]->datmask = NULL;
+		seglist[segcount]->datmod = NULL;
 		seglist[segcount]->attr = SEG_PRIVATE | SEG_PARA;
 		seglist[segcount]->winFlags = WINF_READABLE | WINF_WRITEABLE | WINF_NEG_FLAGS;
 		comfarseg = segcount;
@@ -2053,7 +2059,9 @@ void matchComDefs()
 	    seglist[comseg]->length += comdefs[i]->length;
 	}
 	pubdef->modnum = comdefs[i]->modnum;
-	pubdef->grpnum = -1;
+	/* near commons live in comseg, which was added to DGROUP above:
+	   record the group so group-relative frame resolution works */
+	pubdef->grpnum = (pubdef->segnum == comseg) ? comgrpnum : -1;
 	pubdef->typenum = 0;
 	pubdef->aliasName = NULL;
 	if ((listnode = binarySearch(publics, pubcount, comdefs[i]->name)) != NULL)
@@ -2124,11 +2132,46 @@ void matchComDefs()
     }
 }
 
+static int segClassIsCode(PSEG seg)
+{
+    PCHAR cls;
+    long len;
+
+    if (seg->classindex < 0 || seg->classindex >= (long)namecount)
+	return 0;
+    cls = namelist[seg->classindex];
+    len = strlen(cls);
+    return len >= 4 && !stricmp(cls + len - 4, "CODE");
+}
+
+static long dossegSegRank(PSEG seg)
+{
+    PCHAR cls;
+
+    if (seg->classindex < 0 || seg->classindex >= (long)namecount)
+	return 3;
+    cls = namelist[seg->classindex];
+    if (!stricmp(cls, "BEGDATA"))
+	return 0;
+    if (!stricmp(cls, "DATA"))
+	return 1;
+    if (!stricmp(cls, "CONST"))
+	return 2;
+    if (!stricmp(cls, "BSS"))
+	return 4;
+    if (!stricmp(cls, "STACK"))
+	return 5;
+    return 3;
+}
+
 void sortSegments()
 {
     long i, j, k;
     UINT base, align;
     long baseSeg = -1;
+    long *order, *ordergrp, ordercount = 0;
+    char *inGroup = NULL;
+    long m, n, oi;
 
     for (i = 0; i < segcount; i++)
     {
@@ -2144,169 +2187,230 @@ void sortSegments()
     outcount = 0;
     base = 0;
     outlist = checkMalloc(sizeof(PSEG) * segcount);
+    oi = segcount;
     for (i = 0; i < grpcount; i++)
     {
 	if (grplist[i])
 	{
-	    grplist[i]->segnum = -1;
+	    oi += grplist[i]->numsegs;
+	}
+    }
+    order = checkMalloc(sizeof(long) * (oi + 1));
+    ordergrp = checkMalloc(sizeof(long) * (oi + 1));
+    if (dosseg)
+    {
+	/* MS LINK DOSSEG ordering: code-class segments not in a group
+	   first (in definition order), then the remaining non-group
+	   segments, then each group's members ordered by class rank
+	   (BEGDATA, DATA, CONST, other, BSS, STACK), keeping definition
+	   order within each rank. */
+	inGroup = checkMalloc(segcount);
+	for (i = 0; i < (long)segcount; i++)
+	{
+	    inGroup[i] = 0;
+	}
+	for (i = 0; i < grpcount; i++)
+	{
+	    if (grplist[i])
+	    {
+		grplist[i]->segnum = -1;
+		for (j = 0; j < grplist[i]->numsegs; j++)
+		{
+		    k = grplist[i]->segindex[j];
+		    if (!seglist[k])
+		    {
+			printf("Error - group %s contains non-existent segment\n",
+			       namelist[grplist[i]->nameindex]);
+			exit(1);
+		    }
+		    inGroup[k] = 1;
+		}
+	    }
+	}
+	for (i = 0; i < (long)segcount; i++)
+	{
+	    if (seglist[i] && !inGroup[i] &&
+		((seglist[i]->attr & SEG_ALIGN) != SEG_ABS) &&
+		segClassIsCode(seglist[i]))
+	    {
+		order[ordercount] = i;
+		ordergrp[ordercount++] = -1;
+	    }
+	}
+	for (i = 0; i < (long)segcount; i++)
+	{
+	    if (seglist[i] && !inGroup[i] &&
+		((seglist[i]->attr & SEG_ALIGN) != SEG_ABS) &&
+		!segClassIsCode(seglist[i]))
+	    {
+		order[ordercount] = i;
+		ordergrp[ordercount++] = -1;
+	    }
+	}
+	for (i = 0; i < grpcount; i++)
+	{
+	    if (!grplist[i])
+		continue;
+	    /* sort members by class rank, stable on seglist index */
+	    for (m = 1; m < (long)grplist[i]->numsegs; m++)
+	    {
+		int rankk, rankj;
+
+		k = grplist[i]->segindex[m];
+		if ((k < 0) || (k >= (long)segcount) || !seglist[k])
+		    continue;
+		rankk = dossegSegRank(seglist[k]);
+		for (n = m; n > 0; n--)
+		{
+		    j = grplist[i]->segindex[n - 1];
+		    if ((j < 0) || (j >= (long)segcount) || !seglist[j])
+			break;
+		    rankj = dossegSegRank(seglist[j]);
+		    if ((rankj < rankk) || ((rankj == rankk) && (j < k)))
+			break;
+		    grplist[i]->segindex[n] = j;
+		}
+		grplist[i]->segindex[n] = k;
+	    }
 	    for (j = 0; j < grplist[i]->numsegs; j++)
 	    {
 		k = grplist[i]->segindex[j];
-		if (!seglist[k])
-		{
-		    printf("Error - group %s contains non-existent segment\n",
-			   namelist[grplist[i]->nameindex]);
-		    exit(1);
-		}
-		/* don't add removed sections */
-		if (seglist[k]->winFlags & WINF_REMOVE)
-		{
-		    continue;
-		}
-		/* add non-absolute segment */
 		if ((seglist[k]->attr & SEG_ALIGN) != SEG_ABS)
 		{
-		    switch (seglist[k]->attr & SEG_ALIGN)
-		    {
-		    case SEG_WORD:
-			align = 2;
-			break;
-		    case SEG_DWORD:
-			align = 4;
-			break;
-		    case SEG_8BYTE:
-			align = 0x8;
-			break;
-		    case SEG_PARA:
-			align = 0x10;
-			break;
-		    case SEG_32BYTE:
-			align = 0x20;
-			break;
-		    case SEG_64BYTE:
-			align = 0x40;
-			break;
-		    case SEG_PAGE:
-			align = 0x100;
-			break;
-		    case SEG_MEMPAGE:
-			align = 0x1000;
-			break;
-		    case SEG_BYTE:
-		    default:
-			align = 1;
-			break;
-		    }
-		    if (align < objectAlign)
-		    {
-			align = objectAlign;
-		    }
-		    base = (base + align - 1) & (0xffffffff - (align - 1));
-		    seglist[k]->base = base;
-		    if (seglist[k]->length > 0)
-		    {
-			base += seglist[k]->length;
-			if (seglist[k]->absframe != 0)
-			{
-			    printf("Error - Segment %s part of more than one group\n",
-				   namelist[seglist[k]->nameindex]);
-			    exit(1);
-			}
-			seglist[k]->absframe = 1;
-			seglist[k]->absofs = i + 1;
-			if (grplist[i]->segnum < 0)
-			{
-			    grplist[i]->segnum = k;
-			}
-			if (outcount == 0)
-			{
-			    baseSeg = k;
-			}
-			else
-			{
-			    outlist[outcount - 1]->virtualSize =
-				seglist[k]->base - outlist[outcount - 1]->base;
-			}
-			outlist[outcount] = seglist[k];
-			outcount++;
-		    }
+		    order[ordercount] = k;
+		    ordergrp[ordercount++] = i;
 		}
 	    }
 	}
+	free(inGroup);
     }
-    for (i = 0; i < segcount; i++)
+    else
     {
-	if (seglist[i])
+	for (i = 0; i < grpcount; i++)
 	{
-	    /* don't add removed sections */
-	    if (seglist[i]->winFlags & WINF_REMOVE)
+	    if (grplist[i])
 	    {
-		continue;
-	    }
-	    /* add non-absolute segment, not already dealt with */
-	    if (((seglist[i]->attr & SEG_ALIGN) != SEG_ABS) && !seglist[i]->absframe)
-	    {
-		switch (seglist[i]->attr & SEG_ALIGN)
+		grplist[i]->segnum = -1;
+		for (j = 0; j < grplist[i]->numsegs; j++)
 		{
-		case SEG_WORD:
-		    align = 2;
-		    break;
-		case SEG_DWORD:
-		    align = 4;
-		    break;
-		case SEG_8BYTE:
-		    align = 0x8;
-		    break;
-		case SEG_PARA:
-		    align = 0x10;
-		    break;
-		case SEG_32BYTE:
-		    align = 0x20;
-		    break;
-		case SEG_64BYTE:
-		    align = 0x40;
-		    break;
-		case SEG_PAGE:
-		    align = 0x100;
-		    break;
-		case SEG_MEMPAGE:
-		    align = 0x1000;
-		    break;
-		case SEG_BYTE:
-		default:
-		    align = 1;
-		    break;
-		}
-		if (align < objectAlign)
-		{
-		    align = objectAlign;
-		}
-		base = (base + align - 1) & (0xffffffff - (align - 1));
-		seglist[i]->base = base;
-		if (seglist[i]->length > 0)
-		{
-		    base += seglist[i]->length;
-		    seglist[i]->absframe = 1;
-		    seglist[i]->absofs = 0;
-		    if (outcount == 0)
+		    k = grplist[i]->segindex[j];
+		    if (!seglist[k])
 		    {
-			baseSeg = i;
+			printf("Error - group %s contains non-existent segment\n",
+			       namelist[grplist[i]->nameindex]);
+			exit(1);
 		    }
-		    else
+		    if ((seglist[k]->attr & SEG_ALIGN) != SEG_ABS)
 		    {
-			outlist[outcount - 1]->virtualSize =
-			    seglist[i]->base - outlist[outcount - 1]->base;
+			order[ordercount] = k;
+			ordergrp[ordercount++] = i;
 		    }
-		    outlist[outcount] = seglist[i];
-		    outcount++;
 		}
 	    }
-	    else if ((seglist[i]->attr & SEG_ALIGN) == SEG_ABS)
+	}
+	for (i = 0; i < (long)segcount; i++)
+	{
+	    if (seglist[i] && ((seglist[i]->attr & SEG_ALIGN) != SEG_ABS))
 	    {
-		seglist[i]->base = (seglist[i]->absframe << 4) + seglist[i]->absofs;
+		order[ordercount] = i;
+		ordergrp[ordercount++] = -1;
 	    }
 	}
     }
+    for (oi = 0; oi < ordercount; oi++)
+    {
+	i = order[oi];
+	/* don't add removed sections */
+	if (seglist[i]->winFlags & WINF_REMOVE)
+	{
+	    continue;
+	}
+	if ((ordergrp[oi] < 0) && seglist[i]->absframe)
+	{
+	    continue;	/* already emitted as a group member */
+	}
+	switch (seglist[i]->attr & SEG_ALIGN)
+	{
+	case SEG_WORD:
+	    align = 2;
+	    break;
+	case SEG_DWORD:
+	    align = 4;
+	    break;
+	case SEG_8BYTE:
+	    align = 0x8;
+	    break;
+	case SEG_PARA:
+	    align = 0x10;
+	    break;
+	case SEG_32BYTE:
+	    align = 0x20;
+	    break;
+	case SEG_64BYTE:
+	    align = 0x40;
+	    break;
+	case SEG_PAGE:
+	    align = 0x100;
+	    break;
+	case SEG_MEMPAGE:
+	    align = 0x1000;
+	    break;
+	case SEG_BYTE:
+	default:
+	    align = 1;
+	    break;
+	}
+	if (align < objectAlign)
+	{
+	    align = objectAlign;
+	}
+	base = (base + align - 1) & (0xffffffff - (align - 1));
+	seglist[i]->base = base;
+	if (seglist[i]->length > 0)
+	{
+	    base += seglist[i]->length;
+	    if (ordergrp[oi] >= 0)
+	    {
+		if (seglist[i]->absframe != 0)
+		{
+		    printf("Error - Segment %s part of more than one group\n",
+			   namelist[seglist[i]->nameindex]);
+		    exit(1);
+		}
+		seglist[i]->absofs = ordergrp[oi] + 1;
+		if (grplist[ordergrp[oi]]->segnum < 0)
+		{
+		    grplist[ordergrp[oi]]->segnum = i;
+		}
+	    }
+	    else
+	    {
+		seglist[i]->absofs = 0;
+	    }
+	    seglist[i]->absframe = 1;
+	    if (outcount == 0)
+	    {
+		baseSeg = i;
+	    }
+	    else
+	    {
+		outlist[outcount - 1]->virtualSize =
+		    seglist[i]->base - outlist[outcount - 1]->base;
+	    }
+	    outlist[outcount] = seglist[i];
+	    outcount++;
+	}
+    }
+    for (i = 0; i < (long)segcount; i++)
+    {
+	if (seglist[i] && !(seglist[i]->winFlags & WINF_REMOVE) &&
+	    ((seglist[i]->attr & SEG_ALIGN) == SEG_ABS))
+	{
+	    seglist[i]->base = (seglist[i]->absframe << 4) + seglist[i]->absofs;
+	}
+    }
+    free(order);
+    free(ordergrp);
     /* build size of last segment in output list */
     if (outcount)
     {
@@ -2480,6 +2584,10 @@ void generateMap()
 		fprintf(afile, "'%s'\n", namelist[seglist[i]->classindex]);
 	    else
 		fprintf(afile, "\n");
+	    if (getenv("ALINK_DEBUG_COMDEF") &&
+		!strcmp(namelist[seglist[i]->nameindex], "COMDEFS"))
+		fprintf(afile, "; dbg comdefs i=%ld classindex=%ld\n", i,
+			seglist[i]->classindex);
 	    fprintf(afile, "  at %08X, length %08X\n", seglist[i]->base, seglist[i]->length);
 	}
     }
@@ -2708,8 +2816,6 @@ int main(int argc, char *argv[])
     matchComDefs();
     printf("matched ComDefs\n");
 
-    applyBSSBoundaryValues();
-
     for (i = 0; i < expcount; i++)
     {
 	if (!expdefs[i].pubdef)
@@ -2750,6 +2856,10 @@ int main(int argc, char *argv[])
 
     combineBlocks();
     sortSegments();
+
+    /* _edata/__edata/_end/__end resolve to BSS boundaries, which are only
+       known once sortSegments() has laid out outlist and assigned bases. */
+    applyBSSBoundaryValues();
 
     if (mapfile)
 	generateMap();

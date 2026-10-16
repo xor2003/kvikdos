@@ -353,6 +353,7 @@ void loadcoff(FILE *objfile)
 	seglist[segcount]->base = buf[PE_OBJECT_RAWPTR] + (buf[PE_OBJECT_RAWPTR + 1] << 8) +
 				  (buf[PE_OBJECT_RAWPTR + 2] << 16) +
 				  (buf[PE_OBJECT_RAWPTR + 3] << 24);
+	seglist[segcount]->datmod = NULL;
 
 	if (seglist[segcount]->winFlags & WINF_ALIGN_NOPAD)
 	{

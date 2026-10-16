@@ -63,11 +63,29 @@ static PCHAR GetCOMFallbackEXEName(PCHAR outname)
     return exename;
 }
 
+static long FindSegGroup(long segnum)
+{
+    long i, j;
+
+    for (i = 0; i < grpcount; i++)
+    {
+	if (!grplist[i])
+	    continue;
+	for (j = 0; j < grplist[i]->numsegs; j++)
+	{
+	    if (grplist[i]->segindex[j] == segnum)
+		return i;
+	}
+    }
+    return -1;
+}
+
 void GetFixupTarget(PRELOC r, long *bseg, UINT *tofs, int isFlat)
 {
     long baseseg = -1;
     long targseg = -1;
     UINT targofs = 0;
+    long grpnum;
 
     r->outputPos = seglist[r->segnum]->base + r->ofs;
     switch (r->ftype)
@@ -97,6 +115,19 @@ void GetFixupTarget(PRELOC r, long *bseg, UINT *tofs, int isFlat)
 	    else
 	    {
 		baseseg = externs[r->frame].pubdef->segnum;
+		/* When the frame extern's segment is a group member, the
+		   runtime addresses it through the group's segment register
+		   value (e.g. DS=DGROUP). MS LINK resolves the frame to the
+		   group base; using the member segment's own base yields
+		   offsets that are too small by the member's in-group
+		   displacement. */
+		grpnum = externs[r->frame].pubdef->grpnum;
+		if (grpnum < 0)
+		    grpnum = FindSegGroup(baseseg);
+		if (!isFlat && grpnum >= 0 && grplist[grpnum] && grplist[grpnum]->segnum >= 0)
+		{
+		    baseseg = grplist[grpnum]->segnum;
+		}
 	    }
 	    break;
 	case EXT_MATCHEDIMPORT:
@@ -239,13 +270,32 @@ void GetFixupTarget(PRELOC r, long *bseg, UINT *tofs, int isFlat)
 	*/
 	if ((seglist[baseseg]->attr & SEG_ALIGN) == SEG_ABS)
 	{
-	    printf("Warning: Reloc frame is absolute segment\n");
-	    targseg = baseseg;
+	    printf("Warning: Reloc frame is absolute segment (seg %s ofs %x rtype %x ttype %d ftype %d)\n",
+		   (r->segnum >= 0 && seglist[r->segnum]) ?
+		       namelist[seglist[r->segnum]->nameindex] : "?",
+		   r->ofs, r->rtype, r->ttype, r->ftype);
+	    /* For DOS output keep both bases so the frame-relative offset
+	       below resolves correctly; redirecting discards the absolute
+	       address on either side. */
+	    if (isFlat)
+	    {
+		targseg = baseseg;
+	    }
 	}
 	else if ((seglist[targseg]->attr & SEG_ALIGN) == SEG_ABS)
 	{
-	    printf("Warning: Reloc target is in absolute segment\n");
-	    targseg = baseseg;
+	    printf("Warning: Reloc target is in absolute segment (seg %s ofs %x rtype %x ttype %d ftype %d)\n",
+		   (r->segnum >= 0 && seglist[r->segnum]) ?
+		       namelist[seglist[r->segnum]->nameindex] : "?",
+		   r->ofs, r->rtype, r->ttype, r->ftype);
+	    /* For DOS output an absolute public (e.g. the linker-synthesised
+	       _end/__edata symbols) must keep its linear address in the target
+	       base so the frame-relative offset below resolves correctly;
+	       redirecting to the frame would discard it entirely. */
+	    if (isFlat)
+	    {
+		targseg = baseseg;
+	    }
 	}
 	if (!isFlat || ((seglist[baseseg]->attr & SEG_ALIGN) == SEG_ABS))
 	{
@@ -254,6 +304,12 @@ void GetFixupTarget(PRELOC r, long *bseg, UINT *tofs, int isFlat)
 		printf("Error: target address out of frame\n");
 		printf("Base=%08X,target=%08X\n", seglist[baseseg]->base,
 		       seglist[targseg]->base + targofs);
+		if (r->segnum >= 0)
+		    printf("  seg=%s ofs=%x ttype=%d ftype=%d target=%ld frame=%ld disp=%x\n",
+			   namelist[seglist[r->segnum]->nameindex], r->ofs,
+			   r->ttype, r->ftype, r->target, r->frame, r->disp);
+		if ((r->ttype == REL_EXTDISP) || (r->ttype == REL_EXTONLY))
+		    printf("  target extern=%s\n", externs[r->target].name);
 		errcount++;
 	    }
 	    targofs += seglist[targseg]->base - seglist[baseseg]->base;
@@ -338,6 +394,21 @@ void OutputCOMfile(PCHAR outname)
     for (i = 0; i < fixcount; i++)
     {
 	GetFixupTarget(relocs[i], &targseg, &targofs, FALSE);
+	if (getenv("ALINK_DEBUG_ALLRELOC"))
+	{
+	    long sseg = relocs[i]->segnum;
+	    long ni1 = (sseg >= 0 && sseg < segcount && seglist[sseg]) ?
+		seglist[sseg]->nameindex : -1;
+	    long ni2 = (targseg >= 0 && targseg < segcount && seglist[targseg]) ?
+		seglist[targseg]->nameindex : -1;
+	    printf("  Reloc %li: rtype=%x seg=%s ofs=%x targseg=%s targofs=%x disp=%x ttype=%d ftype=%d\n",
+		   i, relocs[i]->rtype,
+		   (ni1 >= 0) ? namelist[ni1] : "?ABS?",
+		   relocs[i]->ofs,
+		   (ni2 >= 0) ? namelist[ni2] : "?ABS?",
+		   targofs, relocs[i]->disp,
+		   relocs[i]->ttype, relocs[i]->ftype);
+	}
 	switch (relocs[i]->rtype)
 	{
 	case FIX_BASE:
@@ -403,10 +474,31 @@ void OutputCOMfile(PCHAR outname)
 	    break;
 	case FIX_OFS16:
 	case FIX_OFS16_2:
+	    if (getenv("ALINK_DEBUG_RELOC") &&
+		!stricmp(namelist[seglist[targseg]->nameindex], "STACK"))
+	    {
+		printf("  Reloc %li: STACK target rtype=%x seg=%s ofs=%x targofs=%x disp=%x ttype=%d ftype=%d\n",
+		       i, relocs[i]->rtype, namelist[seglist[relocs[i]->segnum]->nameindex],
+		       relocs[i]->ofs, targofs, relocs[i]->disp, relocs[i]->ttype,
+		       relocs[i]->ftype);
+	    }
 	    if (targofs > 0xffff)
 	    {
-		printf("Relocs %li:Offset out of range\n", i);
-		errcount++;
+		/* MS LINK truncates 16-bit offset fixups whose group-relative
+		   target exceeds 64K (DGROUP can exceed 64K when it holds
+		   several members; MSC6 crt0dat relies on this). Warn but
+		   keep the low 16 bits like LINK. */
+		printf("Warning: Relocs %li:Offset exceeds 16 bits, truncated\n", i);
+		if (getenv("ALINK_DEBUG_RELOC"))
+		{
+		    printf("  rtype=%x seg=%s ofs=%x targseg=%s targofs=%x disp=%x ttype=%d ftype=%d\n",
+			   relocs[i]->rtype, namelist[seglist[relocs[i]->segnum]->nameindex],
+			   relocs[i]->ofs, namelist[seglist[targseg]->nameindex], targofs,
+			   relocs[i]->disp, relocs[i]->ttype, relocs[i]->ftype);
+		    if ((relocs[i]->ttype == REL_EXTDISP) || (relocs[i]->ttype == REL_EXTONLY))
+			printf("  target extern=%s\n", externs[relocs[i]->target].name);
+		}
+		targofs &= 0xffff;
 	    }
 	    temps = seglist[relocs[i]->segnum]->data[relocs[i]->ofs];
 	    temps += seglist[relocs[i]->segnum]->data[relocs[i]->ofs + 1] << 8;
@@ -432,11 +524,31 @@ void OutputCOMfile(PCHAR outname)
 	    }
 	    else
 	    {
-		j = seglist[targseg]->base + targofs;
-		j -= seglist[relocs[i]->segnum]->base + relocs[i]->ofs + 1;
+		/* OMF self-relative fixups are computed from raw offsets within the
+	   frame, not absolute linear addresses. MS LINK resolves MSC6 crt0dat
+	   table entries (dw target - site) whose target/frame segment differs
+	   from the fixup's LEDATA segment; using bases would both corrupt
+	   same-segment table entries and falsely trip the range check. */
+		j = (long)targofs - ((long)relocs[i]->ofs + 1);
 		if ((j < -128) || (j > 127))
 		{
 		    printf("Error: Reloc %li out of range\n", i);
+		    if (getenv("ALINK_DEBUG_RELOC"))
+		    {
+			printf("  seg=%s ofs=%x targseg=%s targofs=%x delta=%lx\n",
+			       namelist[seglist[relocs[i]->segnum]->nameindex], relocs[i]->ofs,
+			       namelist[seglist[targseg]->nameindex], targofs, j);
+			if ((relocs[i]->ttype == REL_EXTDISP) || (relocs[i]->ttype == REL_EXTONLY))
+			    printf("  target extern=%s pubseg=%ld pubofs=%x\n",
+				   externs[relocs[i]->target].name,
+				   externs[relocs[i]->target].pubdef ? externs[relocs[i]->target].pubdef->segnum : -1,
+				   externs[relocs[i]->target].pubdef ? externs[relocs[i]->target].pubdef->ofs : 0);
+			if ((relocs[i]->ftype == REL_EXTFRAME))
+			    printf("  frame extern=%s\n", externs[relocs[i]->frame].name);
+			printf("  ftype=%d ttype=%d frame=%ld target=%ld disp=%x\n",
+			       relocs[i]->ftype, relocs[i]->ttype, relocs[i]->frame,
+			       relocs[i]->target, relocs[i]->disp);
+		    }
 		}
 		else
 		{
@@ -453,11 +565,31 @@ void OutputCOMfile(PCHAR outname)
 	    }
 	    else
 	    {
-		j = seglist[targseg]->base + targofs;
-		j -= seglist[relocs[i]->segnum]->base + relocs[i]->ofs + 2;
+		/* OMF self-relative fixups are computed from raw offsets within the
+	   frame, not absolute linear addresses. MS LINK resolves MSC6 crt0dat
+	   table entries (dw target - site) whose target/frame segment differs
+	   from the fixup's LEDATA segment; using bases would both corrupt
+	   same-segment table entries and falsely trip the range check. */
+		j = (long)targofs - ((long)relocs[i]->ofs + 2);
 		if ((j < -32768) || (j > 32767))
 		{
 		    printf("Error: Reloc %li out of range\n", i);
+		    if (getenv("ALINK_DEBUG_RELOC"))
+		    {
+			printf("  seg=%s ofs=%x targseg=%s targofs=%x delta=%lx\n",
+			       namelist[seglist[relocs[i]->segnum]->nameindex], relocs[i]->ofs,
+			       namelist[seglist[targseg]->nameindex], targofs, j);
+			if ((relocs[i]->ttype == REL_EXTDISP) || (relocs[i]->ttype == REL_EXTONLY))
+			    printf("  target extern=%s pubseg=%ld pubofs=%x\n",
+				   externs[relocs[i]->target].name,
+				   externs[relocs[i]->target].pubdef ? externs[relocs[i]->target].pubdef->segnum : -1,
+				   externs[relocs[i]->target].pubdef ? externs[relocs[i]->target].pubdef->ofs : 0);
+			if ((relocs[i]->ftype == REL_EXTFRAME))
+			    printf("  frame extern=%s\n", externs[relocs[i]->frame].name);
+			printf("  ftype=%d ttype=%d frame=%ld target=%ld disp=%x\n",
+			       relocs[i]->ftype, relocs[i]->ttype, relocs[i]->frame,
+			       relocs[i]->target, relocs[i]->disp);
+		    }
 		}
 		else
 		{
@@ -478,8 +610,12 @@ void OutputCOMfile(PCHAR outname)
 	    }
 	    else
 	    {
-		j = seglist[targseg]->base + targofs;
-		j -= seglist[relocs[i]->segnum]->base + relocs[i]->ofs + 4;
+		/* OMF self-relative fixups are computed from raw offsets within the
+	   frame, not absolute linear addresses. MS LINK resolves MSC6 crt0dat
+	   table entries (dw target - site) whose target/frame segment differs
+	   from the fixup's LEDATA segment; using bases would both corrupt
+	   same-segment table entries and falsely trip the range check. */
+		j = (long)targofs - ((long)relocs[i]->ofs + 4);
 		templ = seglist[relocs[i]->segnum]->data[relocs[i]->ofs];
 		templ += seglist[relocs[i]->segnum]->data[relocs[i]->ofs + 1] << 8;
 		templ += seglist[relocs[i]->segnum]->data[relocs[i]->ofs + 2] << 16;
@@ -650,6 +786,27 @@ void OutputEXEfile(PCHAR outname)
 		    exit(1);
 		}
 		gotstack = 1;
+		if (stackSize)
+		{
+		    /* /ST: override the linker-reserved stack space, like
+		       MS LINK: grow the STACK segment to the requested
+		       size (it sits last in the image). */
+		    if (stackSize > outlist[i]->length)
+		    {
+			if (outlist[i]->datmask)
+			{
+			    UINT oldmask = (outlist[i]->length + 7) / 8;
+			    UINT newmask = (stackSize + 7) / 8;
+			    outlist[i]->datmask = checkRealloc(outlist[i]->datmask, newmask);
+			    for (j = oldmask; j < newmask; j++)
+			    {
+				outlist[i]->datmask[j] = 0;
+			    }
+			}
+			outlist[i]->length = stackSize;
+			totlength = outlist[i]->base + outlist[i]->length;
+		    }
+		}
 		if ((outlist[i]->length > 65536) || (outlist[i]->length == 0))
 		{
 		    printf("SP value out of range\n");
@@ -681,7 +838,30 @@ void OutputEXEfile(PCHAR outname)
 
     for (i = 0; i < fixcount; i++)
     {
+	/* fixups in segments that are not written to the image (e.g.
+	   $$SYMBOLS/$$TYPES debug segments or absolute segments) have no
+	   loadable location; skip them entirely. */
+	if ((seglist[relocs[i]->segnum]->winFlags & WINF_REMOVE) ||
+	    ((seglist[relocs[i]->segnum]->attr & SEG_ALIGN) == SEG_ABS))
+	{
+	    continue;
+	}
 	GetFixupTarget(relocs[i], &targseg, &targofs, FALSE);
+	if (getenv("ALINK_DEBUG_ALLRELOC"))
+	{
+	    long sseg = relocs[i]->segnum;
+	    long ni1 = (sseg >= 0 && sseg < segcount && seglist[sseg]) ?
+		seglist[sseg]->nameindex : -1;
+	    long ni2 = (targseg >= 0 && targseg < segcount && seglist[targseg]) ?
+		seglist[targseg]->nameindex : -1;
+	    printf("  Reloc %li: rtype=%x seg=%s ofs=%x targseg=%s targofs=%x disp=%x ttype=%d ftype=%d\n",
+		   i, relocs[i]->rtype,
+		   (ni1 >= 0) ? namelist[ni1] : "?ABS?",
+		   relocs[i]->ofs,
+		   (ni2 >= 0) ? namelist[ni2] : "?ABS?",
+		   targofs, relocs[i]->disp,
+		   relocs[i]->ttype, relocs[i]->ftype);
+	}
 	switch (relocs[i]->rtype)
 	{
 	case FIX_BASE:
@@ -722,6 +902,16 @@ void OutputEXEfile(PCHAR outname)
 		if (seglist[targseg]->base > 0xfffff)
 		{
 		    printf("Relocs %li:Segment base out of range\n", i);
+		    if (getenv("ALINK_DEBUG_RELOC"))
+		    {
+			printf("  rtype=%x seg=%s ofs=%x targseg=%s targofs=%x base=%x ttype=%d ftype=%d\n",
+			       relocs[i]->rtype,
+			       namelist[seglist[relocs[i]->segnum]->nameindex],
+			       relocs[i]->ofs,
+			       namelist[seglist[targseg]->nameindex], targofs,
+			       seglist[targseg]->base, relocs[i]->ttype,
+			       relocs[i]->ftype);
+		    }
 		    errcount++;
 		}
 		temps = seglist[relocs[i]->segnum]->data[j];
@@ -761,10 +951,31 @@ void OutputEXEfile(PCHAR outname)
 	    break;
 	case FIX_OFS16:
 	case FIX_OFS16_2:
+	    if (getenv("ALINK_DEBUG_RELOC") &&
+		!stricmp(namelist[seglist[targseg]->nameindex], "STACK"))
+	    {
+		printf("  Reloc %li: STACK target rtype=%x seg=%s ofs=%x targofs=%x disp=%x ttype=%d ftype=%d\n",
+		       i, relocs[i]->rtype, namelist[seglist[relocs[i]->segnum]->nameindex],
+		       relocs[i]->ofs, targofs, relocs[i]->disp, relocs[i]->ttype,
+		       relocs[i]->ftype);
+	    }
 	    if (targofs > 0xffff)
 	    {
-		printf("Relocs %li:Offset out of range\n", i);
-		errcount++;
+		/* MS LINK truncates 16-bit offset fixups whose group-relative
+		   target exceeds 64K (DGROUP can exceed 64K when it holds
+		   several members; MSC6 crt0dat relies on this). Warn but
+		   keep the low 16 bits like LINK. */
+		printf("Warning: Relocs %li:Offset exceeds 16 bits, truncated\n", i);
+		if (getenv("ALINK_DEBUG_RELOC"))
+		{
+		    printf("  rtype=%x seg=%s ofs=%x targseg=%s targofs=%x disp=%x ttype=%d ftype=%d\n",
+			   relocs[i]->rtype, namelist[seglist[relocs[i]->segnum]->nameindex],
+			   relocs[i]->ofs, namelist[seglist[targseg]->nameindex], targofs,
+			   relocs[i]->disp, relocs[i]->ttype, relocs[i]->ftype);
+		    if ((relocs[i]->ttype == REL_EXTDISP) || (relocs[i]->ttype == REL_EXTONLY))
+			printf("  target extern=%s\n", externs[relocs[i]->target].name);
+		}
+		targofs &= 0xffff;
 	    }
 	    temps = seglist[relocs[i]->segnum]->data[relocs[i]->ofs];
 	    temps += seglist[relocs[i]->segnum]->data[relocs[i]->ofs + 1] << 8;
@@ -790,11 +1001,31 @@ void OutputEXEfile(PCHAR outname)
 	    }
 	    else
 	    {
-		j = seglist[targseg]->base + targofs;
-		j -= seglist[relocs[i]->segnum]->base + relocs[i]->ofs + 1;
+		/* OMF self-relative fixups are computed from raw offsets within the
+	   frame, not absolute linear addresses. MS LINK resolves MSC6 crt0dat
+	   table entries (dw target - site) whose target/frame segment differs
+	   from the fixup's LEDATA segment; using bases would both corrupt
+	   same-segment table entries and falsely trip the range check. */
+		j = (long)targofs - ((long)relocs[i]->ofs + 1);
 		if ((j < -128) || (j > 127))
 		{
 		    printf("Error: Reloc %li out of range\n", i);
+		    if (getenv("ALINK_DEBUG_RELOC"))
+		    {
+			printf("  seg=%s ofs=%x targseg=%s targofs=%x delta=%lx\n",
+			       namelist[seglist[relocs[i]->segnum]->nameindex], relocs[i]->ofs,
+			       namelist[seglist[targseg]->nameindex], targofs, j);
+			if ((relocs[i]->ttype == REL_EXTDISP) || (relocs[i]->ttype == REL_EXTONLY))
+			    printf("  target extern=%s pubseg=%ld pubofs=%x\n",
+				   externs[relocs[i]->target].name,
+				   externs[relocs[i]->target].pubdef ? externs[relocs[i]->target].pubdef->segnum : -1,
+				   externs[relocs[i]->target].pubdef ? externs[relocs[i]->target].pubdef->ofs : 0);
+			if ((relocs[i]->ftype == REL_EXTFRAME))
+			    printf("  frame extern=%s\n", externs[relocs[i]->frame].name);
+			printf("  ftype=%d ttype=%d frame=%ld target=%ld disp=%x\n",
+			       relocs[i]->ftype, relocs[i]->ttype, relocs[i]->frame,
+			       relocs[i]->target, relocs[i]->disp);
+		    }
 		}
 		else
 		{
@@ -811,11 +1042,31 @@ void OutputEXEfile(PCHAR outname)
 	    }
 	    else
 	    {
-		j = seglist[targseg]->base + targofs;
-		j -= seglist[relocs[i]->segnum]->base + relocs[i]->ofs + 2;
+		/* OMF self-relative fixups are computed from raw offsets within the
+	   frame, not absolute linear addresses. MS LINK resolves MSC6 crt0dat
+	   table entries (dw target - site) whose target/frame segment differs
+	   from the fixup's LEDATA segment; using bases would both corrupt
+	   same-segment table entries and falsely trip the range check. */
+		j = (long)targofs - ((long)relocs[i]->ofs + 2);
 		if ((j < -32768) || (j > 32767))
 		{
 		    printf("Error: Reloc %li out of range\n", i);
+		    if (getenv("ALINK_DEBUG_RELOC"))
+		    {
+			printf("  seg=%s ofs=%x targseg=%s targofs=%x delta=%lx\n",
+			       namelist[seglist[relocs[i]->segnum]->nameindex], relocs[i]->ofs,
+			       namelist[seglist[targseg]->nameindex], targofs, j);
+			if ((relocs[i]->ttype == REL_EXTDISP) || (relocs[i]->ttype == REL_EXTONLY))
+			    printf("  target extern=%s pubseg=%ld pubofs=%x\n",
+				   externs[relocs[i]->target].name,
+				   externs[relocs[i]->target].pubdef ? externs[relocs[i]->target].pubdef->segnum : -1,
+				   externs[relocs[i]->target].pubdef ? externs[relocs[i]->target].pubdef->ofs : 0);
+			if ((relocs[i]->ftype == REL_EXTFRAME))
+			    printf("  frame extern=%s\n", externs[relocs[i]->frame].name);
+			printf("  ftype=%d ttype=%d frame=%ld target=%ld disp=%x\n",
+			       relocs[i]->ftype, relocs[i]->ttype, relocs[i]->frame,
+			       relocs[i]->target, relocs[i]->disp);
+		    }
 		}
 		else
 		{
@@ -836,8 +1087,12 @@ void OutputEXEfile(PCHAR outname)
 	    }
 	    else
 	    {
-		j = seglist[targseg]->base + targofs;
-		j -= seglist[relocs[i]->segnum]->base + relocs[i]->ofs + 4;
+		/* OMF self-relative fixups are computed from raw offsets within the
+	   frame, not absolute linear addresses. MS LINK resolves MSC6 crt0dat
+	   table entries (dw target - site) whose target/frame segment differs
+	   from the fixup's LEDATA segment; using bases would both corrupt
+	   same-segment table entries and falsely trip the range check. */
+		j = (long)targofs - ((long)relocs[i]->ofs + 4);
 		templ = seglist[relocs[i]->segnum]->data[relocs[i]->ofs];
 		templ += seglist[relocs[i]->segnum]->data[relocs[i]->ofs + 1] << 8;
 		templ += seglist[relocs[i]->segnum]->data[relocs[i]->ofs + 2] << 16;
@@ -906,6 +1161,19 @@ void OutputEXEfile(PCHAR outname)
     {
 	if (outlist[i] && ((outlist[i]->attr & SEG_ALIGN) != SEG_ABS))
 	{
+	    if (getenv("ALINK_DEBUG_ORDER"))
+	    {
+		fprintf(stderr, "EMIT %s base=%x len=%x lastout=%x started=%x\n",
+			outlist[i]->nameindex >= 0 ? namelist[outlist[i]->nameindex] : "?",
+			(unsigned)outlist[i]->base, (unsigned)outlist[i]->length,
+			(unsigned)lastout, (unsigned)started);
+	    }
+	    if (getenv("ALINK_DEBUG_MERGE") && lastout > outlist[i]->base)
+	    {
+		fprintf(stderr, "EMIT-ORDER seg=%s base=%x lastout=%x len=%x\n",
+			namelist[outlist[i]->nameindex] ? namelist[outlist[i]->nameindex] : "?",
+			(unsigned)outlist[i]->base, (unsigned)lastout, (unsigned)outlist[i]->length);
+	    }
 	    if (started > outlist[i]->base)
 	    {
 		printf("Segment overlap\n");
@@ -960,6 +1228,11 @@ void OutputEXEfile(PCHAR outname)
 	{
 	    printf("Memory requirements too high\n");
 	}
+	if (getenv("ALINK_DEBUG_HEADER"))
+	{
+	    printf("  totlength=%lx lastout=%lx minalloc=%lx\n", (unsigned long)totlength,
+		   (unsigned long)lastout, (unsigned long)i);
+	}
 	headbuf[0x0a] = i & 0xff;
 	headbuf[0x0b] = i >> 8;
 	if (fwrite(headbuf, 1, 12, outfile) != 12)
@@ -993,6 +1266,7 @@ long createOutputSection(char *name, UINT winFlags)
     outlist[outcount]->base = j;
     outlist[outcount]->length = 0;
     outlist[outcount]->data = outlist[outcount]->datmask = NULL;
+    outlist[outcount]->datmod = NULL;
     outlist[outcount]->absofs = segcount;
     outlist[outcount]->attr = SEG_BYTE | SEG_PRIVATE;
     outlist[outcount]->winFlags = winFlags ^ WINF_NEG_FLAGS;
