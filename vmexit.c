@@ -6,8 +6,8 @@
  * (permissive) or fatal. Returns IA_NEXT to keep running, IA_FATAL on error. */
 int io_dispatch(void) {
   char *p = (char*)hx.io.data;
-  if (hx.io.port == 0x40 && hx.io.size == 1 && hx.io.direction == 0) {
-    *p = (char)bda_ticks_now();  /* Low byte of the live PIT channel-0 count. */
+  if ((hx.io.port == 0x40 || hx.io.port == 0x43) && hx.io.size == 1) {
+    pit_port(hx.io.port, hx.io.direction, (unsigned char*)p);
     trace_guest_io(hx.io.port, hx.io.direction, hx.io.size, hx.io.count, p);
     return IA_NEXT;
   } else if ((hx.io.port == 0x60 || hx.io.port == 0x64) && hx.io.size == 1 && hx.io.direction == 0) {
@@ -97,7 +97,7 @@ int io_dispatch(void) {
     }
     trace_guest_io(hx.io.port, hx.io.direction, hx.io.size, hx.io.count, p);
     return IA_NEXT;
-  } else if (hx.io.port - 0x3c6 <= 3 && hx.io.size == 1) {
+  } else if (hx.io.port >= 0x3c6 && hx.io.port <= 0x3c9 && hx.io.size == 1) {
     /* VGA RAMDAC: 0x3c6 PEL mask, 0x3c7 read-address/status, 0x3c8 write
      * address, 0x3c9 sequential RGB data.  The byte loop covers rep
      * insb/outsb palette dumps. */
@@ -123,7 +123,7 @@ int io_dispatch(void) {
     if (hx.io.direction == 0) {  /* IN: bit 1 = A20 enabled, bit 0 = fast reset. */
       *p = (port_0x92_a20 << 1);
     } else {  /* OUT: track A20 state; bit 0 (fast reset) ignored. */
-      port_0x92_a20 = (*p >> 1) & 1;
+      emu_set_a20(emu, (*p >> 1) & 1);
     }
     return IA_NEXT;
   } else if (hx.io.port == 0x70 && hx.io.size == 1 && hx.io.direction == 1) {  /* CMOS index select. */
@@ -173,7 +173,9 @@ int io_dispatch(void) {
  * Returns IA_NEXT to keep running, IA_FATAL on error. */
 int mmio_dispatch(void) {
   const unsigned mmio_len = hx.mmio.len;
-  const unsigned addr = (unsigned)hx.mmio.phys_addr;
+  const unsigned addr = !port_0x92_a20 && hx.mmio.phys_addr >= 0x100000 &&
+      hx.mmio.phys_addr < 0x110000 ?
+      (unsigned)hx.mmio.phys_addr & 0xfffff : (unsigned)hx.mmio.phys_addr;
   char highmsg[2];
   /* CS:IP points to the instruction doing the memory operation (not after). */
   if (!(mmio_len == 1 || mmio_len == 2 || mmio_len == 4 || mmio_len == 8)) {

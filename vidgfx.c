@@ -29,7 +29,6 @@ static unsigned char dac_stat = 0;    /* 0x3c7 read: 0 = write mode, 3 = read. *
 static unsigned char dac_wlatch = 0;  /* Last 0x3c8 write (port read-back). */
 static unsigned char pel_mask = 0xff;
 
-static unsigned char shd_ansi[GFX_CELLW * GFX_CELLH * 6];  /* Emitted fg+bg RGB. */
 static unsigned char shd_ascii[GFX_CELLW * GFX_CELLH];     /* Emitted ramp chars. */
 static char gfx_repaint = 0;          /* Emit every cell, resize-aware. */
 static unsigned gfx_tw = 0, gfx_th = 0;  /* Last terminal size used. */
@@ -263,7 +262,8 @@ static void wchunk(FILE *f, const char *type, const unsigned char *data, unsigne
 void vidgfx_dump(void *mem) {
   static const unsigned char sig[8] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
   static const unsigned char ihdr[13] = {
-    (GFX_W >> 8) & 0xff, GFX_W & 0xff, (GFX_H >> 8) & 0xff, GFX_H & 0xff,
+    0, 0, (GFX_W >> 8) & 0xff, GFX_W & 0xff,
+    0, 0, (GFX_H >> 8) & 0xff, GFX_H & 0xff,
     8, 2, 0, 0, 0 };
   const char * const path = emu_params ? emu_params->video_dump_filename : NULL;
   const unsigned char * const fb = (const unsigned char*)mem + GFX_BASE;
@@ -388,55 +388,6 @@ static void pal_rgb(unsigned char idx, unsigned char *rgb) {
   rgb[2] = (unsigned char)((d[2] << 2) | (d[2] >> 4));
 }
 
-/* Expand two palette indices to 8-bit RGB and store their average. */
-static void avg_rgb(unsigned char a, unsigned char b, unsigned char *rgb) {
-  const unsigned char * const x = vga_dac + a * 3;
-  const unsigned char * const y = vga_dac + b * 3;
-  rgb[0] = (unsigned char)((((x[0] << 2) | (x[0] >> 4)) + ((y[0] << 2) | (y[0] >> 4)) + 1) >> 1);
-  rgb[1] = (unsigned char)((((x[1] << 2) | (x[1] >> 4)) + ((y[1] << 2) | (y[1] >> 4)) + 1) >> 1);
-  rgb[2] = (unsigned char)((((x[2] << 2) | (x[2] >> 4)) + ((y[2] << 2) | (y[2] >> 4)) + 1) >> 1);
-}
-
-static void emit_ansi(const void *mem, int roff, int coff, unsigned tw, unsigned th, int have_ws) {
-  char out[16384];
-  char *o = out;
-  const unsigned char * const fb = (const unsigned char*)mem + GFX_BASE;
-  unsigned char rgb[6];
-  unsigned long lfg = ~0UL, lbg = ~0UL;
-  int r, c, expect = -1;
-  for (r = 0; r < GFX_CELLH; ++r) {
-    const unsigned char * const rowT = fb + r * 2 * GFX_W;
-    const unsigned char * const rowB = rowT + GFX_W;
-    for (c = 0; c < GFX_CELLW; ++c) {
-      const int cell = r * GFX_CELLW + c;
-      unsigned char * const sh = shd_ansi + cell * 6;
-      unsigned long fgp, bgp;
-      avg_rgb(rowT[c * 2], rowT[c * 2 + 1], rgb);       /* fg = top pixel. */
-      avg_rgb(rowB[c * 2], rowB[c * 2 + 1], rgb + 3);   /* bg = bottom. */
-      if (!gfx_repaint && memcmp(sh, rgb, 6) == 0) continue;
-      if (have_ws && ((unsigned)(r + roff) >= th || (unsigned)(c + coff) >= tw)) continue;  /* Leave the shadow stale for a grow-repaint. */
-      memcpy(sh, rgb, 6);
-      if (o > out + sizeof(out) - 96) { (void)!write(1, out, o - out); o = out; lfg = lbg = ~0UL; expect = -1; }
-      if (cell != expect || c == 0) {
-        o += sprintf(o, "\x1b[%d;%dH", r + roff + 1, c + coff + 1);
-      }
-      expect = cell + 1;
-      fgp = (unsigned long)rgb[0] << 16 | (unsigned long)rgb[1] << 8 | rgb[2];
-      bgp = (unsigned long)rgb[3] << 16 | (unsigned long)rgb[4] << 8 | rgb[5];
-      if (fgp != lfg) {
-        lfg = fgp;
-        o += sprintf(o, "\x1b[38;2;%d;%d;%dm", rgb[0], rgb[1], rgb[2]);
-      }
-      if (bgp != lbg) {
-        lbg = bgp;
-        o += sprintf(o, "\x1b[48;2;%d;%d;%dm", rgb[3], rgb[4], rgb[5]);
-      }
-      *o++ = (char)0xe2; *o++ = (char)0x96; *o++ = (char)0x80;  /* U+2580. */
-    }
-  }
-  if (o != out) { memcpy(o, "\x1b[0m", 4); o += 4; (void)!write(1, out, o - out); }
-}
-
 static void emit_ascii(const void *mem, int roff, int coff, unsigned tw, unsigned th, int have_ws) {
   static const char ramp[] = " .:-=+*#%@";
   char out[16384];
@@ -476,7 +427,7 @@ void vidgfx_render(void *mem) {
   struct timeval tv;
   struct winsize ws;
   unsigned long now;
-  unsigned tw, th;
+  unsigned tw, th, cols = GFX_CELLW, rows = GFX_CELLH;
   int have_ws, roff, coff;
   if (gfx_dump_req) { gfx_dump_req = 0; vidgfx_dump(mem); }
   if (emu_params->video_emitter == VID_EMIT_OFF) return;
@@ -492,11 +443,19 @@ void vidgfx_render(void *mem) {
     gfx_tw = tw;
     gfx_th = th;
     gfx_repaint = 1;
+    if (emu_params->video_emitter == VID_EMIT_ANSI)
+      (void)!write(1, "\x1b[2J", 4);
   }
-  roff = have_ws && th > GFX_CELLH ? (int)(th - GFX_CELLH) / 2 : 0;
-  coff = have_ws && tw > GFX_CELLW ? (int)(tw - GFX_CELLW) / 2 : 0;
+  if (emu_params->video_emitter == VID_EMIT_ANSI && have_ws) {
+    if (cols > tw) { cols = tw; rows = cols * GFX_CELLH / GFX_CELLW; }
+    if (!rows) rows = 1;
+    if (rows > th) { rows = th; cols = rows * GFX_CELLW / GFX_CELLH; }
+    if (!cols) cols = 1;
+  }
+  roff = have_ws && th > rows ? (int)(th - rows) / 2 : 0;
+  coff = have_ws && tw > cols ? (int)(tw - cols) / 2 : 0;
   if (emu_params->video_emitter == VID_EMIT_ANSI)
-    emit_ansi(mem, roff, coff, tw, th, have_ws);
+    vidansi_emit(mem, vga_dac, gfx_repaint, roff, coff, cols, rows);
   else
     emit_ascii(mem, roff, coff, tw, th, have_ws);
   gfx_repaint = 0;

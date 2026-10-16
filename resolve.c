@@ -201,6 +201,9 @@ char set_int(unsigned char int_num, unsigned value_seg_ofs, void *mem, char had_
               int_num, (unsigned short)(value_seg_ofs >> 16), (unsigned short)value_seg_ofs);
     }
   }
+  /* BIOS-serviced keys must not be replayed as raw IRQs to a new owner. */
+  if (int_num == 9 && *p == MAGIC_INT_VALUE(9) && value_seg_ofs != *p)
+    tty_keyboard_reset();
   *p = value_seg_ofs;
   return 0;  /* Success. */
 }

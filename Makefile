@@ -1,4 +1,4 @@
-.PHONY: all clean run test test-batch test-mem test-cli test-cli-matrix test-static test-static-full test-sanitizers test-valgrind test-tooling test-x86dec ape dist lint lint-full
+.PHONY: all clean run test test-devices test-batch test-mem test-cli test-cli-matrix test-static test-static-full test-sanitizers test-valgrind test-tooling test-x86dec ape dist lint lint-full
 .SUFFIXES:
 MAKEFLAGS += -r
 
@@ -10,7 +10,7 @@ XCFLAGS =  # To be overridden from the command-line.
 
 # Split translation units (was a single kvikdos.c). kvikdos.h is the shared
 # internal header with the common types, constants, externs and prototypes.
-KVIKDOS_SRCS = util.c diag.c resolve.c dospath.c args.c argsparse.c argspost.c batchline.c batchcmd_a.c batchcmd_b.c batchcmd_c.c loader.c mzdetect.c fds.c video.c vidgfx.c tty.c ttydec.c mouse.c conout.c vm.c hv_kvm.c hv_whpx.c hvpick.c x86dec.c spawn.c dpmiauto.c runstate.c run.c vmexit.c intmisc.c intdos.c intcon.c intopen.c intio.c intmem.c intfcb.c intfind.c intexec.c intdmisc.c intvid.c intems.c intxms.c batch.c main.c
+KVIKDOS_SRCS = util.c diag.c resolve.c dospath.c args.c argsparse.c argspost.c batchline.c batchcmd_a.c batchcmd_b.c batchcmd_c.c loader.c mzdetect.c fds.c video.c vidgfx.c vidansi.c tty.c ttydec.c mouse.c conout.c vm.c a20.c hv_kvm.c hv_whpx.c hvpick.c x86dec.c spawn.c dpmiauto.c runstate.c run.c pit.c vmexit.c intmisc.c intdos.c intcon.c intopen.c intio.c intmem.c intfcb.c intfind.c intexec.c intdmisc.c intvid.c intems.c intxms.c batch.c main.c
 SRCDEPS = $(KVIKDOS_SRCS) kvikdos.h mini_kvm.h mini_whpx.h hv.h x86dec.h hdpmibin.h
 
 all: $(ALL)
@@ -38,7 +38,7 @@ clean:
 run: kvikdos guest.com
 	./kvikdos guest.com hello world
 
-test: test-batch test-mem test-cli test-cli-matrix
+test: test-batch test-mem test-cli test-cli-matrix test-devices
 
 test-batch: kvikdos
 	./tests/test_batch.sh ./kvikdos
@@ -51,6 +51,9 @@ test-cli: kvikdos
 
 test-cli-matrix: kvikdos
 	./tests/test_cli_matrix.sh ./kvikdos
+
+test-devices: kvikdos
+	python3 ./tests/test_devices.py ./kvikdos
 
 # Static-analysis gate: cppcheck + clang-tidy + clang --analyze.
 # Required after any C change (see AGENTS.md). lint-full additionally

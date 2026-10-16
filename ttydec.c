@@ -69,7 +69,7 @@ static unsigned rdnum(const unsigned char *b, int n, int *pi) {
 
 static void raw_pair(unsigned key) {  /* Synthesized make+break for legacy encodings. */
   tty_raw_push(key >> 8);
-  tty_raw_push((key >> 8) | 0x80);
+  tty_raw_release((key >> 8) | 0x80);
 }
 
 /* E0-prefixed make/break: on a real AT keyboard the dedicated editing and
@@ -87,7 +87,8 @@ static void raw_break_e(unsigned scan, int e0) {
 }
 static void raw_pair_e(unsigned key, int e0) {
   raw_make_e(key >> 8, e0);
-  raw_break_e(key >> 8, e0);
+  if (e0) tty_raw_release(0xe0);
+  tty_raw_release((key >> 8) | 0x80);
 }
 
 /* US-layout shifted chars, used only when the terminal reports neither the

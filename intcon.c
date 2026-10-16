@@ -1,6 +1,20 @@
 #include "kvikdos.h"
 #include "intrun.h"
 
+/* DOS console input uses the same BIOS queue as int 16h and IRQ1. Polling
+ * the host fd separately loses keys already drained into the BDA. */
+static int console_key(int wait, unsigned short *key) {
+  const unsigned short saved_ax = (unsigned short)regs.rax;
+  const unsigned char saved_ah = ah;
+  int action;
+  ah = wait ? 0 : 1;
+  action = int16_dispatch();
+  *key = (unsigned short)regs.rax;
+  *(unsigned short*)&regs.rax = saved_ax;
+  ah = saved_ah;
+  return action;
+}
+
 /* DOS int 21h services: con group. Returns an IA_* action. */
 int i21_con(void) {
   if (ah == 0x06) {
@@ -11,21 +25,25 @@ int i21_con(void) {
               stdout_write_end = stdout_write_p + 1; emit_stdout(); return IA_NEXT;
             } else {  /* Input. */
               unsigned short result_ax;
-              process_key(tty_state, 1, &result_ax, (unsigned short*)&regs.rflags);  /* Check availability without reading. */
-              if (*(unsigned short*)&regs.rflags & (1 << 6)) {  /* ZF==1. */
-                process_key(tty_state, 0, &result_ax, (unsigned short*)&regs.rflags);  /* Read. */
-                *(unsigned char*)&regs.rax = (unsigned char)result_ax;  /* Return only the keycode. */
-              }
+              int action;
+              (void)console_key(0, &result_ax);
+              if (!(regs.rflags & (1u << 6))) {  /* ZF=0: a key is available. */
+                action = console_key(1, &result_ax);
+                if (action != IA_NEXT) return action;
+                *(unsigned char*)&regs.rax = (unsigned char)result_ax;
+              } else *(unsigned char*)&regs.rax = 0;  /* Nonblocking, no key. */
             }
   }   else if (ah == 0x07 || ah == 0x08) {
   /* Wait for console input without echo. */
             unsigned short result_ax;
+            int action;
            func_0x07_or_0x08:
             /* We should check Ctrl-<Break> with ah == 0x08, but the
              * difference doesn't matter, bcause in kvikdos Ctrl-<Break> is
              * never delivered.
              */
-            process_key(tty_state, 0, &result_ax, (unsigned short*)&regs.rflags);  /* Read. */
+            action = console_key(1, &result_ax);
+            if (action != IA_NEXT) return action;
             *(unsigned char*)&regs.rax = (unsigned char)result_ax;  /* Return only the keycode. */
   }   else if (ah == 0x02) {
   /* Display output. */
@@ -60,7 +78,7 @@ int i21_con(void) {
   }   else if (ah == 0x0b) {
   /* Check input status. */
             unsigned short result_ax;
-            process_key(tty_state, 1, &result_ax, (unsigned short*)&regs.rflags);  /* Peek without consuming; sets ZF when no key. */
+            (void)console_key(0, &result_ax);
             *(unsigned char*)&regs.rax = (*(unsigned short*)&regs.rflags & (1 << 6)) ? 0 : 0xff;
             /* If we detect Ctrl-<Break>, we should run `int 0x23'. */
   }   else if (ah == 0x0a) {
@@ -82,16 +100,22 @@ int i21_con(void) {
               p[-1] = q - p;  /* Return number of bytes read. */
             }
   }   else if (ah == 0x01) {
-  /* Keyboard input with echo. */
+  /* Keyboard input with echo. process_key puts the tty in raw mode for the
+   * duration of the read, so each keypress arrives at once — a canonical
+   * read(0) would hold input until <Enter>, which is not DOS behavior. */
+            unsigned short result_ax;
             char c;
-            int got;
+            int action;
            func_0x01:
-            if ((got = read(0, &c, 1)) <= 0) {  /* STDIN_FILENO. */
-              c = 0x1a;  /* Ctrl-<Z>, EOF. */
-            } else if (c == '\0') {
-              c = '\1';  /* Never report control keys: '\0' + another character. */
-            }
-            *(unsigned char*)&regs.rax = c;
+            action = console_key(1, &result_ax);
+            if (action != IA_NEXT) return action;
+            c = (char)result_ax;
+            if (c == '\0') c = '\1';  /* Never report control keys: '\0' + another character. */
+            *(unsigned char*)&regs.rax = (unsigned char)c;
+            stdout_write_p = (const char*)&c;  /* DOS AH=01 echoes the character. */
+            stdout_write_end = stdout_write_p + 1;
+            emit_stdout();
+            return IA_NEXT;
   }   else if (ah == 0x0c) {
   /* Clear keyboard buffer and invoke keyboard function. */
             const unsigned char al = (unsigned char)regs.rax;

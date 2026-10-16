@@ -42,11 +42,11 @@ int int43_dispatch(void) {
           *(unsigned short*)&regs.rax = 1;
           *(unsigned char*)&regs.rbx = 0;
         } else if (ah == 0x03 || ah == 0x05) {  /* Global/local A20 enable. */
-          port_0x92_a20 = 1;
+          emu_set_a20(emu, 1);
           *(unsigned short*)&regs.rax = 1;
           *(unsigned char*)&regs.rbx = 0;
         } else if (ah == 0x04 || ah == 0x06) {  /* Global/local A20 disable. */
-          port_0x92_a20 = 0;
+          emu_set_a20(emu, 0);
           *(unsigned short*)&regs.rax = 1;
           *(unsigned char*)&regs.rbx = 0;
         } else if (ah == 0x07) {  /* Query A20. */

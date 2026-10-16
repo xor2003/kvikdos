@@ -8,7 +8,7 @@ int dos_error_21(void) {
   last_dos_error_code = *(unsigned short*)&regs.rax;
   if (last_dos_error_code > 0x12) *(unsigned short*)&regs.rax = 0x0d;  /* Invalid data. Query via ah == 0x59. */
   *(unsigned short*)&regs.rflags |= 1 << 0;  /* CF=1. */
-  if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: int 0x21 call error\n");
+  if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: int 0x21 call error ah:%02x al:%02x dos_err:%04x\n", ah, (unsigned char)regs.rax, (unsigned)*(unsigned short*)&regs.rax);
   return IA_NEXT;
 }
 

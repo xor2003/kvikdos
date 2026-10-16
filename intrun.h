@@ -26,6 +26,7 @@ enum malloc_strategy_t { MS_FIRST_FIT = 0, MS_BEST_FIT = 1, MS_LAST_FIT = 2 };
 /* Action codes returned by the int_*_dispatch() service handlers, consumed by
  * the KVM run loop in run.c. */
 enum {
+  IA_WAIT_KEY,   /* Keep the BIOS frame pending while hardware IRQs run. */
   IA_NEXT,       /* Return from the interrupt and continue the guest (done_int_call). */
   IA_EXEC,       /* Reload the program image (do_exec). */
   IA_EXIT,       /* Terminate the guest; regs.rax holds the DOS exit code (do_exit). */

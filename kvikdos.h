@@ -207,6 +207,7 @@ typedef struct EmuState {
   void *bios_rom;  /* Read-only BIOS ROM page mapped at 0xf0000-0xfffff. */
   char *ems_pool;  /* Host backing store for the EMS page frame, lazily allocated. */
   unsigned ems_pool_pages;
+  char hma_mapped;  /* A20 window slots 4/5 currently exist. */
 } EmuState;
 
 enum { K_UP, K_DOWN, K_RIGHT, K_LEFT, K_HOME, K_END, K_PGUP, K_PGDN, K_INS, K_DEL,
@@ -365,6 +366,7 @@ void free_extra_env_args(ParsedCmdArgs *cmd_args);
 char is_mcb_bad(void *mem, unsigned short block_para);
 int mcb_prev_block(void *mem, unsigned short block_para, unsigned short *prev_out);
 void check_all_mcbs(void *mem);
+void free_psp_mcbs(void *mem, unsigned short psp_para);
 void init_dos_info(void *mem, unsigned long xmem_size);
 void set_current_psp(unsigned psp_para);
 int detect_dos_executable_program(int img_fd, const char *prog_filename, char *p);
@@ -407,6 +409,16 @@ int tty_wait_key(TtyState *tty_state, int *mods_out);
 void kbd_push(void *mem, unsigned key, int mods);
 int kbd_pop(void *mem);
 int kbd_peek(void *mem);
+void vidansi_emit(const void *mem, const unsigned char *dac, int repaint,
+                  int roff, int coff, unsigned cols, unsigned rows);
+void emu_set_a20(EmuState *state, int enabled);
+void pit_reset(void);
+void pit_port(unsigned port, int output, unsigned char *value);
+int pit_irq_due(void);
+void tty_raw_release(unsigned scan);  /* Legacy terminals have no key-up events. */
+void tty_irq_begin(void);
+void tty_keyboard_reset(void);
+int tty_bios_scan(void);
 int tty_raw_pending(void);
 int tty_raw_pop(void);
 void tty_raw_push(unsigned scan);  /* Feed one byte to the port-0x60 make/break ring (called by ttydec.c). */

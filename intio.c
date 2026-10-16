@@ -181,7 +181,7 @@ int i21_io(void) {
                   /* DOSBox 0.74-4 PRN: 0x80a0; DOSBox 0.74-4 CON: 0x80d3; DOSBox 0.74-4 file on drive C: 0x0002. */
                   static const char fake_drive = 'C';
                   /* Without the 1 << 15 bit, the VAL 1995-05-27 linker val.exe fprintf(stdout, ...) function wouldn't write anything to stdout. DOSBox 0.74-4 doesn't set 1 << 15 on regular files. */
-                  *(unsigned short*)&regs.rdx = S_ISCHR(st.st_mode) ? 1 << 15 /* reserved */ | 1 << 5  /* binary */ | 1 << 7  /* character device */ : 1 << 15 | (fake_drive - 'A') /* regular file on block device */;
+                  *(unsigned short*)&regs.rdx = S_ISCHR(st.st_mode) ? 1 << 15 /* reserved */ | 1 << 5  /* binary */ | 1 << 7  /* character device */ : (*(unsigned short*)&regs.rbx <= 4 ? 1 << 15 : 0) | (fake_drive - 'A') /* regular file on block device */;
                   if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: ioctl get_device_info dos_fd=%d linux_fd=%d result=0x%04x\n", *(unsigned short*)&regs.rbx, fd, *(unsigned short*)&regs.rdx);
                   *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
                 } else {

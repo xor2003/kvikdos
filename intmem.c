@@ -10,6 +10,56 @@ static void mcb_set_psize(char *mcb, unsigned short psize_para) {
   memcpy(mcb + 7, default_program_mcb + 7, 9);
 }
 
+/* DOS frees every memory block owned by an exiting process (int 21h
+ * AH=4Ch releases each MCB whose PID is the exiting PSP, merging with
+ * adjacent free blocks). In-VM exec children depend on this: without it
+ * each chained program leaks its env+image blocks, and a later program in
+ * the chain (e.g. F-15's EGAME.EXE, MINALLOC 0x048e over a ~169 KiB image)
+ * can no longer fit in conventional memory. TSR exits (AH=31h) skip this
+ * in the caller — resident memory must survive. */
+void free_psp_mcbs(void *mem, unsigned short psp_para) {
+  unsigned bp = PSP_PARA, prev_bp = 0;
+  char * const mem_end = (char*)mem + (DOS_ALLOC_PARA_LIMIT << 4);
+  while (bp < DOS_ALLOC_PARA_LIMIT) {
+    char * const mcb = (char*)mem + (bp << 4) - 16;
+    const unsigned size_para = MCB_SIZE_PARA(mcb);
+    const char type = MCB_TYPE(mcb);
+    if (type != 'M' && type != 'Z') break;  /* Corrupt chain: stop rather than scribble. */
+    if (MCB_PID(mcb) == psp_para) {
+      char *next = mcb + 16 + (size_para << 4);
+      char tail_type = type;
+      unsigned total = size_para;
+      MCB_PID(mcb) = 0;
+      while (tail_type != 'Z' && next < mem_end - 16 && MCB_PID(next) == 0) {  /* Merge following free blocks. */
+        const unsigned nsize = MCB_SIZE_PARA(next);
+        tail_type = MCB_TYPE(next);
+        memset(next, 0, 16);
+        total += 1 + nsize;
+        next = mcb + 16 + (total << 4);
+      }
+      MCB_SIZE_PARA(mcb) = (unsigned short)total;
+      MCB_TYPE(mcb) = tail_type;
+      if (prev_bp != 0 && MCB_PID((char*)mem + (prev_bp << 4) - 16) == 0) {  /* Merge into the preceding free block. */
+        char * const prev = (char*)mem + (prev_bp << 4) - 16;
+        MCB_SIZE_PARA(prev) += 1 + (unsigned short)total;
+        memcpy(mcb, freed_mcb, 16);
+        MCB_TYPE(prev) = tail_type;
+        if (tail_type != 'Z') mcb_set_psize(next, MCB_SIZE_PARA(prev));
+        /* prev_bp already names the merged free block. */
+      } else {
+        if (tail_type != 'Z') mcb_set_psize(next, (unsigned short)total);
+        prev_bp = bp;
+      }
+      if (tail_type == 'Z') break;
+      bp = (unsigned)((next - (char*)mem) >> 4) + 1;
+    } else {
+      if (type == 'Z') break;
+      prev_bp = bp;
+      bp += 1 + size_para;
+    }
+  }
+}
+
 /* DOS int 21h services: mem group. Returns an IA_* action. */
 int i21_mem(void) {
   if (ah == 0x4a) {

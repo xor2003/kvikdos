@@ -4,16 +4,30 @@
 static const unsigned short fake_keys[3] = {
     0x011b /* <Esc> */, 0x4400 /* <F10> */, 0x1c0d /* <Enter> */ };
 
+static double tty_time(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0) return 0;
+  return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
 int tty_getc(TtyState *tty_state, int ms) {
   struct pollfd pfd;
   unsigned char c;
+  int remaining = ms;
+  const double deadline = ms > 0 ? tty_time() + ms * 0.001 : 0;
   pfd.fd = (tty_state->tty_in_fd == -2) ? 0 : tty_state->tty_in_fd;
   pfd.events = POLLIN;
-  /* Retry on EINTR: the 18.2 Hz SIGALRM tick interrupts blocking waits. */
+  /* Retry blocking waits after a tick, but preserve the deadline of escape
+   * sequence probes: a fast guest PIT must not restart their timeout forever. */
   for (;;) {
-    const int r = poll(&pfd, 1, ms);
+    const int r = poll(&pfd, 1, remaining);
     if (r > 0) break;
-    if (r == 0 || errno != EINTR) return -1;
+    if (r == 0 || errno != EINTR || ms == 0) return -1;
+    if (ms > 0) {
+      const double left = deadline - tty_time();
+      if (left <= 0) return -1;
+      remaining = (int)(left * 1000) + 1;
+    }
   }
   if (read(pfd.fd, &c, 1) < 1) return -1;
   return c;
@@ -62,19 +76,19 @@ void process_key(TtyState *tty_state, unsigned char ah, unsigned short *ax, unsi
     }
     if (!tty_state->raw_on && !tty_state->is_tty_in_error) {  /* Per-call raw mode (non-text-mode path). */
       struct termios tio;
-      if (tcgetattr(tty_state->tty_in_fd, &tio) != 0) {
+      if (tcgetattr(fd, &tio) != 0) {
         tty_state->is_tty_in_error = 1;
       } else {
         old_lflag = tio.c_lflag;
         tio.c_lflag &= ~(ICANON | ECHO);  /* As a side effect, ECHOCTL is also disabled, so Ctrl-<C> won't show up as ^C, but it will still send SIGINT. */
-        if (tcsetattr(tty_state->tty_in_fd, 0, &tio) != 0) tty_state->is_tty_in_error = 1;
+        if (tcsetattr(fd, 0, &tio) != 0) tty_state->is_tty_in_error = 1;
         else {
           /* Publish the transient raw state so the signal/exit release
            * restores it if we die while blocked on a key. */
           applied = 1;
           tio.c_lflag = old_lflag;
           vid_saved_tio = tio;
-          vid_tty_fd = tty_state->tty_in_fd;
+          vid_tty_fd = fd;
           vid_raw_taken = 1;
           vid_install_release();
         }
@@ -112,9 +126,9 @@ void process_key(TtyState *tty_state, unsigned char ah, unsigned short *ax, unsi
      * with ah == 0x00 will echo the character to the Linux terminal. */
     if (applied) {  /* Restore the saved line flags for the non-text-mode path. */
       struct termios tio;
-      if (tcgetattr(tty_state->tty_in_fd, &tio) == 0) {
+      if (tcgetattr(fd, &tio) == 0) {
         tio.c_lflag = old_lflag;
-        if (tcsetattr(tty_state->tty_in_fd, 0, &tio) != 0) tty_state->is_tty_in_error = 1;
+        if (tcsetattr(fd, 0, &tio) != 0) tty_state->is_tty_in_error = 1;
       }
       vid_raw_taken = 0;
     }
@@ -248,7 +262,10 @@ static void tty_soft_raw_undo(TtyState *tty_state, int applied, tcflag_t old_lfl
  * ports (0x64 status / 0x60 data) directly instead of using int 16h —
  * e.g. QuickBASIC's IDE idle loop.  Fed alongside the BDA buffer. */
 static unsigned char raw_scans[64];
+static double raw_ready[64];
 static unsigned raw_head = 0, raw_tail = 0;
+static int irq_scan = -1;
+static int irq_scan_read;
 
 /* BIOS keycode ring: decoded words (scan<<8|ascii) for our BIOS int 9
  * handler, with host-detected modifier bits in the high half.  Kept separate
@@ -261,13 +278,39 @@ static unsigned bk_head = 0, bk_tail = 0;
 
 void tty_raw_push(unsigned scan) {
   const unsigned n = (raw_tail + 1) & 63;
-  if (n != raw_head) { raw_scans[raw_tail] = (unsigned char)scan; raw_tail = n; }
+  if (n != raw_head) {
+    raw_scans[raw_tail] = (unsigned char)scan; raw_ready[raw_tail] = 0;
+    raw_tail = n;
+  }
 }
-int tty_raw_pending(void) { return raw_head != raw_tail; }
+
+void tty_raw_release(unsigned scan) {
+  const unsigned slot = raw_tail;
+  tty_raw_push(scan);
+  if (slot != raw_tail) raw_ready[slot] = tty_time() + 0.12;
+}
+
+int tty_raw_pending(void) {
+  return raw_head != raw_tail &&
+      (!raw_ready[raw_head] || tty_time() >= raw_ready[raw_head]);
+}
+void tty_irq_begin(void) { irq_scan_read = 0; irq_scan = -1; }
+
+void tty_keyboard_reset(void) {
+  raw_head = raw_tail = 0;
+  bk_head = bk_tail = 0;
+  tty_irq_begin();
+}
+
 int tty_raw_pop(void) {
-  if (raw_head == raw_tail) return -1;
+  if (!tty_raw_pending()) return -1;
   { const int s = raw_scans[raw_head]; raw_head = (raw_head + 1) & 63;
+    irq_scan = s; irq_scan_read = 1;
     return s; }
+}
+
+int tty_bios_scan(void) {
+  return irq_scan_read ? irq_scan : tty_raw_pop();
 }
 
 static void bk_push(unsigned key, unsigned mods) {

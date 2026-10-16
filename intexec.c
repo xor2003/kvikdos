@@ -275,6 +275,15 @@ int i21_exec(void) {
                 if (exec_depth < EXEC_SAVE_MAX) {
                   unsigned bp, free_size = 0;
                   char *fmcb = NULL;
+                  if (DEBUG || DIAG_ON(DIAG_BIT_EXEC)) {
+                    unsigned wbp;
+                    for (wbp = PSP_PARA; !is_mcb_bad(mem, wbp);) {
+                      char * const m = (char*)mem + (wbp << 4) - 16;
+                      fprintf(g_diag_file, "debug: exec: mcb bp=0x%04x type=%c pid=0x%04x size=0x%04x\n", wbp, MCB_TYPE(m), MCB_PID(m) & 0xffff, MCB_SIZE_PARA(m));
+                      if (MCB_TYPE(m) == 'Z') break;
+                      wbp += 1 + MCB_SIZE_PARA(m);
+                    }
+                  }
                   for (bp = PSP_PARA; !is_mcb_bad(mem, bp);) {
                     char * const m = (char*)mem + (bp << 4) - 16;
                     if (MCB_PID(m) == 0) { fmcb = m; free_size = MCB_SIZE_PARA(m); break; }

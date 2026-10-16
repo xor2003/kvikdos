@@ -64,6 +64,7 @@ void guest_inject_irq(struct hv *hv, void *mem, unsigned int_no) {
   unsigned short sp;
   (void)hv;
   if (!(regs.rflags & (1u << 9))) return;  /* IF=0: guest isn't taking IRQs now. */
+  if (int_no == 9) tty_irq_begin();
   sp = (unsigned short)(regs.rsp - 6);
   *(unsigned short*)(m + sregs.ss.base + sp + 4) = (unsigned short)regs.rflags;
   *(unsigned short*)(m + sregs.ss.base + sp + 2) = sregs.cs.selector;
@@ -82,7 +83,7 @@ void kbd_maybe_inject_irq(void) {
    * it is in service (pic_isr, cleared by the ISR's EOI to port 0x20) or
    * masked (pic_imr, port 0x21).  The ISR drains 0x60 one byte per IRQ, so
    * the make+break pair arrives over two injections — exactly like hardware. */
-  if (guest_int9_hooked(mem) && (tty_raw_pending() || (tty_bk_pending() && kbd_can_push(mem))) && !(pic_isr & 2) && !(pic_imr & 2)) {
+  if (guest_int9_hooked(mem) && tty_raw_pending() && !(pic_isr & 2) && !(pic_imr & 2)) {
     guest_inject_irq(emu->hv, mem, 9);
   }
 }
@@ -97,9 +98,15 @@ int int09_dispatch(void) {
    * A raw-queue pop here would race the break byte: the ISR's own 0x60 read
    * already consumed the make code, so the next byte is the release. */
   unsigned key, mods;
+  const int scan = tty_bios_scan();
+  /* A chained BIOS ISR consumes the controller byte if the guest did not
+   * read it. Prefixes and releases never consume a decoded keycode. */
+  const int make = scan >= 0 && scan < 0x80 && scan != 0x2a &&
+      scan != 0x36 && scan != 0x1d && scan != 0x38 && scan != 0x3a &&
+      scan != 0x45 && scan != 0x46;
   /* Wait for BDA room: the staged queue holds the key until the app drains
    * the 16-entry buffer (burst-safe). */
-  if (kbd_can_push(mem) && tty_bk_pop(&key, &mods) == 0) {
+  if (make && kbd_can_push(mem) && tty_bk_pop(&key, &mods) == 0) {
     kbd_push(mem, key, (int)mods);
   }
   pic_isr &= (unsigned char)~2u;  /* IRQ1 EOI — what `out 0x20,0x20` does. */
@@ -149,13 +156,8 @@ int int16_dispatch(void) {
                 *(unsigned short*)&regs.rflags &= ~(1 << 6);  /* ZF=0, key available. */
               }
             } else {
-              int k = kbd_pop(mem);
-              if (k < 0) {
-                int mods = 0;
-                k = tty_wait_key(tty_state, &mods);  /* Block for one host keypress. */
-                kbd_push(mem, (unsigned)k, mods);
-                k = kbd_pop(mem);
-              }
+              const int k = kbd_pop(mem);
+              if (k < 0) return IA_WAIT_KEY;
               *(unsigned short*)&regs.rax = (unsigned short)(k < 0 ? 0 : k);
             }
           }
@@ -237,6 +239,16 @@ int int15_dispatch(void) {
 /* System BIOS. */
         const unsigned short ax = (unsigned short)regs.rax;
         const unsigned long ext_kb = emu->xmem_size >> 10;
+        if (ah == 0x24) {  /* BIOS A20 gate services. */
+          const unsigned sub = (unsigned char)regs.rax;
+          if (sub <= 1) emu_set_a20(emu, sub != 0);
+          else if (sub == 2) *(unsigned char*)&regs.rax = port_0x92_a20;
+          else if (sub == 3) *(unsigned short*)&regs.rbx = 2;  /* Fast gate. */
+          else return IA_FATAL_UIC;
+          *((unsigned char*)&regs.rax + 1) = 0;
+          regs.rflags &= ~1u;
+          return IA_NEXT;
+        }
         if (ax == 0xe801) {  /* Check for large free extended memory (XMS). */
           if (ext_kb) {
             *(unsigned short*)&regs.rax = *(unsigned short*)&regs.rbx = ext_kb > 0x3c00UL ? 0x3c00 : (unsigned short)ext_kb;  /* KiB between 1 MiB and 16 MiB. */
@@ -357,7 +369,8 @@ int int_dispatch(void) {
   case 0x09: return int09_dispatch();
   case 0x0d: return int0d_dispatch();
   case 0x00: return int00_dispatch();
-  case 0x08: return IA_NEXT;  /* IRQ0 timer landing on our stub (no guest handler): the BDA tick is updated by the run loop, so a plain iret is the right no-op — like a BIOS default handler. */
+  case 0x08: pic_isr &= (unsigned char)~1u;  /* IRQ0 EOI — the BIOS int-8 handler we replaced issues `out 0x20,0x20` before iret; handlers that chain to us (e.g. F-15's ISR when its accumulator overflows) rely on that to clear the PIC in-service bit. Without it the first chained IRQ0 stays in service forever and no further timer ticks are injected. */
+             return IA_NEXT;  /* The BDA tick is updated by the run loop, so a plain iret is otherwise the right no-op — like a BIOS default handler. */
   case 0x03: return int03_dispatch();
   case 0x33: return int33_dispatch();
   }

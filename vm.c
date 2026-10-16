@@ -8,6 +8,7 @@ void init_emu(struct EmuState *emu) {
   emu->bios_rom = NULL;
   emu->ems_pool = NULL;
   emu->ems_pool_pages = 0;
+  emu->hma_mapped = 0;
 }
 
 char *guest_ptr(const EmuState *emu, unsigned long gpa) {
@@ -57,7 +58,8 @@ void reset_emu(struct EmuState *emu, const EmuParams *emu_params) {
         perror("fatal: mmap xmem");
         exit(252);
       }
-      if (hv_set_memory(emu->hv, 2, 0x100000, emu->xmem_size, emu->xmem, 0) < 0) {
+      if (hv_set_memory(emu->hv, 2, 0x110000, emu->xmem_size - 0x10000,
+                        (char*)emu->xmem + 0x10000, 0) < 0) {
         perror("fatal: hv_set_memory xmem");
         exit(252);
       }
@@ -92,5 +94,6 @@ void reset_emu(struct EmuState *emu, const EmuParams *emu_params) {
     memset(mem, '\0', ENV_PARA << 4);
     memset((char*)mem + ENV_LIMIT, '\0', (PSP_PARA << 4) - ENV_LIMIT);
   }
+  emu_set_a20(emu, 0);  /* DOS starts with 20-bit address wrapping. */
   mouse_reset();  /* int 33h driver state is per-program, like a real MOUSE.COM reload. */
 }

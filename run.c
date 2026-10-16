@@ -1,19 +1,22 @@
 #include "kvikdos.h"
 #include "intrun.h"
 
-static void sigalrm_bda_tick(int sig) {
-  /* Async-signal-safe enough: one aligned 32-bit store into guest RAM. */
-  (void)sig;
-  if (mem) bda_update_ticks(mem);
-}
+static volatile sig_atomic_t heartbeat_pending;
+static volatile sig_atomic_t bda_day_offset;
 
-/* PIT IRQ0 pacing: true once per ~55 ms BIOS tick. Shared by the hlt-idle
- * and TICK injection sites so a fast hlt loop can't overdrive IRQ0. */
-static int irq0_due(unsigned long ticks_now) {
-  static unsigned long irq0_last = ~0UL;
-  if (irq0_last != ~0UL && ticks_now - irq0_last < 1) return 0;
-  irq0_last = ticks_now;
-  return 1;
+static void sigalrm_bda_tick(int sig) {
+  struct timespec ts;
+  (void)sig;
+  heartbeat_pending = 1;
+  /* Never call localtime here: interrupting localtime in the main loop
+   * would deadlock on libc's timezone lock. clock_gettime is signal-safe. */
+  if (mem && clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+    const unsigned long seconds = (unsigned long)
+        ((ts.tv_sec % 86400 + bda_day_offset + 86400) % 86400);
+    *(unsigned*)((char*)mem + 0x46c) = (unsigned)
+        (seconds * (1193180.0 / 65536.0) +
+         ts.tv_nsec * (1193180.0 / (65536.0 * 1e9)));
+  }
 }
 
 /* Borland's 32-bit DPMI tools (BCC32.EXE, TLINK32.EXE, ...) carry a real-mode
@@ -114,7 +117,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
   ems_phys_handle[0] = ems_phys_handle[1] = ems_phys_handle[2] = ems_phys_handle[3] = 0xffff;
   ems_total_pages = ems_free_pages = 256;  /* 4 MiB EMS in 16 KiB pages. */
   ems_pool_next = 0;
-  port_0x92_a20 = 1;  /* A20 enabled by default; programs may toggle it. */
+  port_0x92_a20 = 0;  /* Real-mode DOS starts with A20 disabled. */
   port_0x70_index = 0;
   call_hlt_cs = call_hlt_ip = 0;
   cleanup_fn[0] = '\0';
@@ -446,11 +449,16 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
   {
     struct sigaction sa;
     struct itimerval it;
+    const time_t now = time(NULL);
+    const struct tm * const lt = localtime(&now);
+    bda_day_offset = lt ? (sig_atomic_t)(lt->tm_hour * 3600 +
+        lt->tm_min * 60 + lt->tm_sec - now % 86400) : 0;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigalrm_bda_tick;
     sa.sa_flags = SA_RESTART;  /* Keep poll/KVM_RUN calls from churning EINTR. */
     sigemptyset(&sa.sa_mask);
     (void)sigaction(SIGALRM, &sa, NULL);
+    pit_reset();
     it.it_interval.tv_sec = 0;
     it.it_interval.tv_usec = 54925;  /* ~18.2 Hz: 1000000/(1193182/65536). */
     it.it_value = it.it_interval;
@@ -493,6 +501,24 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
         rtot = 0; memset(rc, 0, sizeof(rc));
       }
     }
+    /* A signal can arrive between KVM_RUN calls during a port/MMIO polling
+     * loop. Such a loop never produces HV_EXIT_TICK, but hardware IRQs must
+     * still run. Queue interrupts through the backend so an outstanding I/O
+     * instruction completes before the CPU enters the guest ISR. */
+    if (heartbeat_pending && (hx.reason == HV_EXIT_IO ||
+        hx.reason == HV_EXIT_MMIO || hx.reason == HV_EXIT_DEBUG)) {
+      const int isr = guest_int9_hooked(mem);
+      heartbeat_pending = 0;
+      (void)tty_drain(tty_state, mem, !isr);
+      if (regs.rflags & (1u << 9)) {
+        if (isr && tty_raw_pending() && !(pic_isr & 3) && !(pic_imr & 2)) {
+          if (hv_interrupt(hv, 1) == 0) { tty_irq_begin(); pic_isr |= 2; }
+        } else if (!(pic_isr & 1) && !(pic_imr & 1) && pit_irq_due()) {
+          if (hv_interrupt(hv, 0) == 0) pic_isr |= 1;
+        }
+      }
+      vid_render(mem);
+    }
     if (hx.reason != HV_EXIT_HLT) hlt_spin_count = 0;
     if (++vid_tick >= 512) { vid_tick = 0; vid_render(mem); }  /* Periodic repaint of the guest text screen. */
     switch (hx.reason) {
@@ -517,6 +543,20 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
         int_ip = csip_ptr[0]; int_cs = csip_ptr[1];  /* Return address. */  /* !! Security: check bounds, also check that rsp <= 0xfffe. */
         ah = ((unsigned)regs.rax >> 8) & 0xff;
         if (DEBUG || DEBUG_INT || DIAG_ON(DIAG_BIT_INT)) fprintf(g_diag_file, "debug: int 0x%02x ah:%02x al:%02x cs:%04x ip:%04x\n", int_num, ah, (unsigned char)regs.rax, int_cs, int_ip);
+        if (int_num == 0x0d) {  /* TEMP: find the caller instruction for the IRQ5-vector call storm. */
+          static int d13_seen = 0;
+          if (d13_seen < 3) {
+            const unsigned char *cp = (const unsigned char*)mem + ((unsigned)int_cs << 4) + int_ip - 8;
+            const unsigned char *spb = (const unsigned char*)mem + ((unsigned)sregs.ss.base & 0xfffff) + (*(unsigned short*)&regs.rsp);
+            int ti;
+            fprintf(g_diag_file, "tr13: caller bytes:");
+            for (ti = 0; ti < 12; ++ti) fprintf(g_diag_file, " %02x", cp[ti]);
+            fprintf(g_diag_file, " sp=%04x stack:", *(unsigned short*)&regs.rsp);
+            for (ti = 0; ti < 12; ++ti) fprintf(g_diag_file, " %02x", spb[ti]);
+            fprintf(g_diag_file, "\n");
+            ++d13_seen;
+          }
+        }
         if (getenv("KVIKDOS_TR21") && int_num == 0x21) {  /* Temp trace: resolve ds:dx for bridge calls. */
           const char * const bp = (const char*)mem + (((unsigned)sregs.ds.selector << 4) & 0xfffff) + (*(unsigned short*)&regs.rdx);
           char tbuf[64]; unsigned ti;
@@ -528,6 +568,20 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
         (void)ah;
         /* Documentation about DOS and BIOS int calls: https://stanislavs.org/helppc/idx_interrupt.html */
         switch (int_dispatch()) {
+        case IA_WAIT_KEY:
+          /* Real BIOS int 16h waits with interrupts enabled. Keep its
+           * caller frame on the stack and retry the HLT stub after IRQs,
+           * rather than blocking the host and starving the guest timer. */
+          --regs.rip;
+          regs.rflags |= 1u << 9;
+          usleep(1000);
+          kbd_maybe_inject_irq();
+          if ((regs.rflags & (1u << 9)) && !(pic_isr & 1) &&
+              !(pic_imr & 1) && pit_irq_due()) {
+            if (hv_interrupt(hv, 0) == 0) pic_isr |= 1;
+          }
+          vid_render(mem);
+          goto set_sregs_regs_and_continue;
         case IA_NEXT:
           goto done_int_call;
         case IA_EXEC:
@@ -541,6 +595,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
             memcpy((char*)mem + (0x22 << 2), cpsp + 0x0a, 4);
             memcpy((char*)mem + (0x23 << 2), cpsp + 0x0e, 4);
             memcpy((char*)mem + (0x24 << 2), cpsp + 0x12, 4);
+            if (last_exec_exit_type != 3) free_psp_mcbs(mem, sv->child_psp_para);  /* DOS frees the exited child's blocks; TSR (AH=31h) memory stays resident. */
             regs = sv->regs;
             sregs = sv->sregs;
             SET_SREG(cs, sv->int_cs);
@@ -581,7 +636,13 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
         /* Return from the interrupt. */
         SET_SREG(cs, int_cs);
         regs.rip = int_ip;
-        if (csip_ptr[2] & (1 << 9)) *(unsigned short*)&regs.rflags |= (1 << 9);  /* Set IF back to 1 if it was 1. */
+        if (int_num == 8 || int_num == 9) {
+          /* Hardware IRQs restore all saved flags. Leaking the guest ISR's
+           * ZF into a DOS key poll turns "no key" into a phantom key. */
+          regs.rflags = (regs.rflags & ~0xffffUL) | csip_ptr[2];
+        } else {
+          regs.rflags = (regs.rflags & ~(1u << 9)) | (csip_ptr[2] & (1u << 9));
+        }
         *(unsigned short*)&regs.rsp += 6;  /* pop ip, pop cs, pop flags. */
         /* New keys drained during a device-idle int (16h/17h/28h-style):
          * inject IRQ1 now — regs hold the real post-int state, so the ISR
@@ -659,7 +720,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
             /* PIT IRQ0 for guests halted in sti;hlt (see the TICK case):
              * protected-mode extenders such as Borland RTM sleep here waiting
              * for the timer tick delivered through their guest IDT. */
-            if (!(pic_isr & 1) && !(pic_imr & 1) && irq0_due(bda_ticks_now())) {
+            if (!(pic_isr & 1) && !(pic_imr & 1) && pit_irq_due()) {
               pic_isr |= 1;
               (void)hv_interrupt(hv, 0);
             }
@@ -696,7 +757,7 @@ unsigned char run_dos_prog(struct EmuState *emu0, const char *prog_filename, con
        * Delivered via the PIC model like IRQ1: skip while in service or
        * masked.  In real mode it lands on our int-8 stub harmlessly. */
       if (!(pic_isr & 1) && !(pic_imr & 1) && (regs.rflags & (1u << 9)) &&
-          irq0_due(bda_ticks_now())) {
+          pit_irq_due()) {
         pic_isr |= 1;
         (void)hv_interrupt(hv, 0);
       }

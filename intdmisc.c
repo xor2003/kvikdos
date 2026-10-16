@@ -175,21 +175,30 @@ int i21_misc(void) {
             const char *fn;
             if (al > 1) return dos_err_ax(0x57);
             fn = get_linux_filename(p);
+            if (DEBUG || DIAG_ON(DIAG_BIT_FS)) fprintf(g_diag_file, "debug: int21:43 dos_path=(%s) linux=(%s)\n", p, fn);
             if (al == 0) {  /* Get. */
               struct stat st;
-              if (stat(fn, &st) != 0) return dos_err_linux();
+              if (stat_with_case_fallback(fn, &st, 0) != 0) return dos_err_linux();
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
-              *(unsigned short*)&regs.rax = (st.st_mode & 0200) ? 0 : 1;  /* readonly */
+              *(unsigned short*)&regs.rcx = (st.st_mode & 0200) ? 0 : 1;  /* DOS returns the attributes in CX. */
             } else {  /* Set. */
               struct stat st;
               mode_t mode;
               unsigned short attr = *(unsigned short*)&regs.rcx;
-              if (stat(fn, &st) != 0) return dos_err_linux();
+              const char *cfn = fn;
+              if (stat(fn, &st) != 0) {
+                /* Retry through the case-insensitive resolver so chmod hits
+                 * the same file dos_open would (e.g. EGAME.EXE on disk). */
+                if (errno != ENOENT ||
+                    !resolve_case_fallback_path(fn, fnbuf2, sizeof(fnbuf2), 0) ||
+                    stat(fnbuf2, &st) != 0) return dos_err_linux();
+                cfn = fnbuf2;
+              }
               mode = st.st_mode;
               /* Accept DOS attribute bits: RO(1), H(2), S(4), A(0x20). */
               if (attr & 1) mode &= ~(S_IWUSR | S_IWGRP | S_IWOTH);
               else mode |= S_IWUSR;
-              if (chmod(fn, mode) != 0) return dos_err_linux();
+              if (chmod(cfn, mode) != 0) return dos_err_linux();
               *(unsigned short*)&regs.rflags &= ~(1 << 0);  /* CF=0. */
             }
   }   else if (ah == 0x33) {
